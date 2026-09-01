@@ -1,5 +1,5 @@
-import type { UniverseBucket } from "./buckets";
-import type { Features, Predictions, Regime, StrategyId } from "./types";
+import type { UniverseBucket } from "./buckets.ts";
+import type { Features, Predictions, Regime, StrategyId } from "./types.ts";
 
 export type StrategyDef = {
   id: StrategyId;
@@ -77,23 +77,40 @@ export function strategyForRegime(regime: Regime): StrategyDef {
 
 type Ctx = Features & Predictions;
 
-function read(ctx: Ctx, key: string): number | boolean | null {
-  const v = (ctx as unknown as Record<string, number | boolean | null | undefined>)[key];
-  return v == null ? null : v;
+const OPS: Record<string, (a: number | boolean, b: number | boolean) => boolean> = {
+  ">": (a, b) => Number(a) > Number(b),
+  ">=": (a, b) => Number(a) >= Number(b),
+  "<": (a, b) => Number(a) < Number(b),
+  "<=": (a, b) => Number(a) <= Number(b),
+  "==": (a, b) => a === b,
+  gt: (a, b) => Number(a) > Number(b),
+  gte: (a, b) => Number(a) >= Number(b),
+  lt: (a, b) => Number(a) < Number(b),
+  lte: (a, b) => Number(a) <= Number(b),
+};
+
+export function evaluateCondition(
+  condition: { feature: string; op: string; value: number | boolean },
+  features: Record<string, unknown>,
+): boolean | null {
+  if (!(condition.op in OPS)) throw new Error(`unsupported operator ${condition.op}`);
+  const value = features[condition.feature];
+  if (value == null) return null;
+  return OPS[condition.op](value as number | boolean, condition.value);
+}
+
+export function validateStrategyDef(def: StrategyDef) {
+  for (const c of [...def.gates, ...def.entry]) {
+    if (!(c.op in OPS)) throw new Error(`unsupported operator ${c.op}`);
+    if (!c.feature) throw new Error("invalid feature");
+  }
+  return true;
 }
 
 function pass(ctx: Ctx, rule: { feature: string; op: string; value: number | boolean }): boolean {
-  const v = read(ctx, rule.feature);
-  if (v == null) return false;
-  if (rule.op === "==") return v === rule.value;
-  const n = Number(v);
-  const t = Number(rule.value);
-  if (!Number.isFinite(n)) return false;
-  if (rule.op === "<") return n < t;
-  if (rule.op === ">") return n > t;
-  if (rule.op === "<=") return n <= t;
-  if (rule.op === ">=") return n >= t;
-  return false;
+  const hit = evaluateCondition(rule, ctx as unknown as Record<string, unknown>);
+  if (hit == null) return false;
+  return hit;
 }
 
 export function strategyMatches(def: StrategyDef, ctx: Ctx): boolean {

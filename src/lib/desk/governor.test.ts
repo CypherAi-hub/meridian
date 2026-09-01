@@ -126,7 +126,17 @@ test("unknown holders veto new launches", () => {
   const t = live({ top10Pct: emptyField(now, now, "solana") });
   const g = govern({ ...baseOpts, t });
   assert.equal(g.approved, false);
-  assert.equal(g.layers.find((l) => l.name === "Holder concentration")?.status, "UNKNOWN");
+  const layer = g.layers.find((l) => l.name === "Holder concentration");
+  assert.equal(layer?.status, "UNKNOWN");
+  assert.notEqual(layer?.status, "PASS");
+});
+
+test("FAIL governor gate vetoes the trade", () => {
+  const now = Date.now();
+  const t = live({ mintAuth: field(true, now, now, "solana") });
+  const g = govern({ ...baseOpts, t });
+  assert.equal(g.approved, false);
+  assert.equal(g.layers.find((l) => l.name === "Contract risk")?.status, "FAIL");
 });
 
 test("unknown holders on emerging cut size but can pass other gates", () => {
@@ -165,4 +175,32 @@ test("stressed exit above 7% is a veto", () => {
   const g = govern({ ...baseOpts, t });
   assert.equal(g.approved, false);
   assert.equal(g.layers.find((l) => l.name === "Price impact")?.status, "FAIL");
+});
+
+test("jupiter timeout is UNKNOWN not a fake no-route fail", () => {
+  const now = Date.now();
+  const t = live({
+    sellQuote: {
+      ...live().sellQuote!,
+      available: false,
+      routeState: "TIMEOUT",
+      failureReason: "QUOTE_TIMEOUT",
+      error: "timeout",
+    },
+  });
+  const g = govern({ ...baseOpts, t, now });
+  assert.equal(g.approved, false);
+  const layer = g.layers.find((l) => l.name === "Exit route");
+  assert.equal(layer?.status, "UNKNOWN");
+  assert.equal(layer?.reasonCode, "QUOTE_TIMEOUT");
+  assert.ok(g.reasonCodes.includes("QUOTE_TIMEOUT"));
+});
+
+test("hard fail overrides a strategy that would otherwise match", () => {
+  const now = Date.now();
+  const t = live({ liquidityUsd: field(8_000, now, now, "dexscreener") });
+  const g = govern({ ...baseOpts, t });
+  assert.equal(g.approved, false);
+  assert.equal(g.layers.find((l) => l.name === "Liquidity")?.status, "FAIL");
+  assert.ok(g.reasonCodes.includes("LIQUIDITY_TOO_LOW"));
 });

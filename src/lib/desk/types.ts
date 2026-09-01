@@ -7,6 +7,7 @@ import type {
   SourceHealth,
   TokenSnapshot,
 } from "./schema";
+import type { ResearchGrade } from "./quality-score";
 
 export type Regime = "meme_mania" | "trend" | "chop" | "risk_off";
 
@@ -69,6 +70,7 @@ export type Predictions = {
 export type GovernorVerdict = {
   approved: boolean;
   reasons: string[];
+  reasonCodes: string[];
   sizedUsd: number;
   stressedLoss: number;
   stressedExitPct: number;
@@ -121,7 +123,12 @@ export type PathTick = {
   px: number;
   liq: number;
   sell: 0 | 1;
+  entryQuote?: number | null;
+  exitQuote?: number | null;
 };
+
+export type BarrierConfidence = "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+export type BarrierOutcome = "UPPER_FIRST" | "LOWER_FIRST" | "NEITHER" | "AMBIGUOUS" | "INSUFFICIENT_DATA";
 
 export type LedgerRow = {
   decision_id: string;
@@ -156,14 +163,18 @@ export type LedgerRow = {
   regime: Regime;
   strategy_id: string;
   strategy_version: string;
+  feature_engine_version: string;
+  label_definition_version: string;
   governor_result: "authorized" | "vetoed";
   veto_reason: string;
+  veto_reason_code: string;
   proposed_size: number;
   proposed_entry: number | null;
   proposed_stop: number | null;
   trade_taken: boolean;
   trade_action: "take" | "veto" | "ignore";
   sell_quote_available: boolean;
+  route_status: string;
   feature_sources: FeatureMeta;
   features: Features;
   gates: GateResult[];
@@ -179,16 +190,35 @@ export type LedgerRow = {
   max_drawdown_5m: number | null;
   max_drawdown_15m: number | null;
   max_drawdown_1h: number | null;
+  mfe_1m: number | null;
+  mfe_30m: number | null;
+  mae_1m: number | null;
+  mae_30m: number | null;
   hit_plus_10_before_minus_10: boolean | null;
   hit_plus_20_before_minus_10: boolean | null;
+  barrier_10_outcome: BarrierOutcome | null;
+  barrier_20_outcome: BarrierOutcome | null;
+  barrier_label_confidence: BarrierConfidence | null;
+  max_path_gap_seconds: number | null;
+  avg_path_gap_seconds: number | null;
+  path_sample_count: number | null;
   liquidity_collapse: boolean | null;
   sell_route_lost: boolean | null;
+  first_sell_route_loss_at: number | null;
+  sell_route_restored_at: number | null;
   rug_detected: boolean | null;
   simulated_entry: number | null;
   simulated_exit: number | null;
+  theoretical_return: number | null;
   net_execution_return: number | null;
+  execution_adjusted_return: number | null;
+  research_quality_score: number | null;
+  research_grade: ResearchGrade | null;
+  provider_disagreement: boolean;
   labels_complete: boolean;
   outcome: string;
+  observation_id?: number | null;
+  feature_vector_id?: number | null;
 };
 
 export type SliceStats = {
@@ -228,6 +258,55 @@ export type WorkerHealth = {
   oldestPendingAt: number | null;
   providerErrors: number;
   lastError: string | null;
+  avgTickMs: number;
+  observationsWritten: number;
+  considerationsDropped: number;
+};
+
+export type RouteCoverage = {
+  checks: number;
+  routable: number;
+  noRoute: number;
+  timeout: number;
+  rateLimited: number;
+  errors: number;
+  notChecked: number;
+};
+
+export type DataQuality = {
+  tokensObserved: number;
+  rawObservations: number;
+  featureVectors: number;
+  pathSamples: number;
+  uniqueTokens: number;
+  avgObservationIntervalMs: number | null;
+  largestGapMs: number | null;
+  medianPathGapMs: number | null;
+  p95PathGapMs: number | null;
+  unknownHolderPct: number | null;
+  unknownContractPct: number | null;
+  jupiterRoutePct: number | null;
+  holderCoveragePct: number | null;
+  holderCoverageNewLaunchPct: number | null;
+  holderCoverageEarlyPct: number | null;
+  holderCoverageEmergingPct: number | null;
+  securityCoveragePct: number | null;
+  priceCoveragePct: number | null;
+  liquidityCoveragePct: number | null;
+  providerFailuresHour: number;
+  labelsCompletedPct: number | null;
+  avgPathIntervalMs: number | null;
+  avgTickMs: number | null;
+  highConfidencePct: number | null;
+  mediumConfidencePct: number | null;
+  lowConfidencePct: number | null;
+  unknownConfidencePct: number | null;
+  gradeA: number;
+  gradeB: number;
+  gradeC: number;
+  researchOnly: number;
+  routeCoverage: RouteCoverage;
+  disagreementsHour: number;
 };
 
 export type DeskSnapshot = {
@@ -265,7 +344,50 @@ export type DeskSnapshot = {
   lastConsidered: Record<string, number>;
   flushQueue: LedgerRow[];
   worker: WorkerHealth;
+  quality: DataQuality;
+  baseline?: unknown;
 };
 
+export function emptyRouteCoverage(): RouteCoverage {
+  return { checks: 0, routable: 0, noRoute: 0, timeout: 0, rateLimited: 0, errors: 0, notChecked: 0 };
+}
+
+export function emptyQuality(): DataQuality {
+  return {
+    tokensObserved: 0,
+    rawObservations: 0,
+    featureVectors: 0,
+    pathSamples: 0,
+    uniqueTokens: 0,
+    avgObservationIntervalMs: null,
+    largestGapMs: null,
+    medianPathGapMs: null,
+    p95PathGapMs: null,
+    unknownHolderPct: null,
+    unknownContractPct: null,
+    jupiterRoutePct: null,
+    holderCoveragePct: null,
+    holderCoverageNewLaunchPct: null,
+    holderCoverageEarlyPct: null,
+    holderCoverageEmergingPct: null,
+    securityCoveragePct: null,
+    priceCoveragePct: null,
+    liquidityCoveragePct: null,
+    providerFailuresHour: 0,
+    labelsCompletedPct: null,
+    avgPathIntervalMs: null,
+    avgTickMs: null,
+    highConfidencePct: null,
+    mediumConfidencePct: null,
+    lowConfidencePct: null,
+    unknownConfidencePct: null,
+    gradeA: 0,
+    gradeB: 0,
+    gradeC: 0,
+    researchOnly: 0,
+    routeCoverage: emptyRouteCoverage(),
+    disagreementsHour: 0,
+  };
+}
 
 export type { FieldObs, GateResult, MarketTape, QuoteObs, SourceHealth, TokenSnapshot, UniverseBucket };

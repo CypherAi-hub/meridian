@@ -1,5 +1,6 @@
-import { bucketOf } from "./buckets";
-import type { FeatureMeta, Features, Predictions, TokenLive } from "./types";
+import { bucketOf } from "./buckets.ts";
+import { asOfSnapshot } from "./leakage.ts";
+import type { FeatureMeta, Features, Predictions, TokenLive } from "./types.ts";
 
 export function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
@@ -10,22 +11,24 @@ function sigmoid(z: number) {
 }
 
 export function computeFeatures(t: TokenLive, now: number): { features: Features; meta: FeatureMeta } {
-  const h = t.history.length ? t.history : [t.priceUsd.value ?? 0];
-  const price = t.priceUsd.value ?? h[h.length - 1] ?? 0;
+  const snap = asOfSnapshot(t, now);
+  const live: TokenLive = { ...t, ...snap };
+  const h = t.history.length ? t.history : [live.priceUsd.value ?? 0];
+  const price = live.priceUsd.value ?? h[h.length - 1] ?? 0;
   const ago = h[Math.max(0, h.length - 8)] ?? price;
   const hi = Math.max(...h, price);
   const lo = Math.min(...h, price);
   const rets = h.slice(1).map((p, i) => Math.log(Math.max(p, 1e-12) / Math.max(h[i], 1e-12)));
   const mean = rets.reduce((a, b) => a + b, 0) / Math.max(rets.length, 1);
   const rv = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(rets.length, 1));
-  const buys = t.buys5m.value ?? 0;
-  const sells = t.sells5m.value ?? 0;
-  const vol5 = t.volume5mUsd.value ?? 0;
-  const liq = t.liquidityUsd.value ?? 0;
-  const mcap = t.mcapUsd.value ?? t.fdvUsd.value ?? 0;
-  const ageS = t.createdAt ? (now - t.createdAt) / 1000 : null;
-  const cross = t.priceCrossUsd.value;
-  const implied = t.sellQuote?.impliedPriceUsd ?? t.buyQuote?.impliedPriceUsd ?? null;
+  const buys = live.buys5m.value ?? 0;
+  const sells = live.sells5m.value ?? 0;
+  const vol5 = live.volume5mUsd.value ?? 0;
+  const liq = live.liquidityUsd.value ?? 0;
+  const mcap = live.mcapUsd.value ?? live.fdvUsd.value ?? 0;
+  const ageS = live.createdAt ? (now - live.createdAt) / 1000 : null;
+  const cross = live.priceCrossUsd.value;
+  const implied = live.sellQuote?.impliedPriceUsd ?? live.buyQuote?.impliedPriceUsd ?? null;
   const ref = implied ?? cross;
   const disagreement =
     ref != null && price > 0 ? Math.abs(ref - price) / Math.max((ref + price) / 2, 1e-12) : null;
@@ -37,42 +40,43 @@ export function computeFeatures(t: TokenLive, now: number): { features: Features
     rv5m: rv,
     volAccel: vol5 / Math.max(t.prevVolume5m, 50),
     usdImbalance: (buys - sells) / Math.max(buys + sells, 1),
-    holderGrowth5m: ((t.uniqueBuyers5m.value ?? 0) - t.prevBuyers) / Math.max(t.prevBuyers, 1),
-    top10Pct: t.top10Pct.value,
+    holderGrowth5m: ((live.uniqueBuyers5m.value ?? 0) - t.prevBuyers) / Math.max(t.prevBuyers, 1),
+    top10Pct: live.top10Pct.value,
     liqChange1m: (liq - t.prevLiq) / Math.max(t.prevLiq, 1),
     liqMcapRatio: liq / Math.max(mcap, 1),
     uniqueBuyerShare:
-      (t.uniqueBuyers5m.value ?? 0) / Math.max((t.uniqueBuyers5m.value ?? 0) + (t.uniqueSellers5m.value ?? 0), 1),
-    mintAuth: t.mintAuth.value == null ? null : t.mintAuth.value ? 1 : 0,
-    freezeAuth: t.freezeAuth.value == null ? null : t.freezeAuth.value ? 1 : 0,
-    sellQuoteAvailable: t.sellQuote?.available ? 1 : 0,
+      (live.uniqueBuyers5m.value ?? 0) /
+      Math.max((live.uniqueBuyers5m.value ?? 0) + (live.uniqueSellers5m.value ?? 0), 1),
+    mintAuth: live.mintAuth.value == null ? null : live.mintAuth.value ? 1 : 0,
+    freezeAuth: live.freezeAuth.value == null ? null : live.freezeAuth.value ? 1 : 0,
+    sellQuoteAvailable: live.sellQuote?.available ? 1 : 0,
     maxDd5m: (hi - lo) / Math.max(hi, 1e-12),
-    entryImpactPct: t.buyQuote?.priceImpactPct ?? null,
-    exitImpactPct: t.sellQuote?.priceImpactPct ?? null,
-    snapshotAgeMs: now - t.priceUsd.ingestedAt,
+    entryImpactPct: live.buyQuote?.priceImpactPct ?? null,
+    exitImpactPct: live.sellQuote?.priceImpactPct ?? null,
+    snapshotAgeMs: now - live.priceUsd.ingestedAt,
     priceDisagreement: disagreement,
   };
 
   const meta: FeatureMeta = {};
   const cells: [string, { source: string; eventTime: number; ingestedAt: number; lagMs: number }][] = [
-    ["price", t.priceUsd],
-    ["liquidity", t.liquidityUsd],
-    ["mcap", t.mcapUsd],
-    ["volume5m", t.volume5mUsd],
-    ["buys5m", t.buys5m],
-    ["uniqueBuyers", t.uniqueBuyers5m],
-    ["holders", t.holders],
-    ["top10", t.top10Pct],
-    ["mint", t.mintAuth],
-    ["freeze", t.freezeAuth],
+    ["price", live.priceUsd],
+    ["liquidity", live.liquidityUsd],
+    ["mcap", live.mcapUsd],
+    ["volume5m", live.volume5mUsd],
+    ["buys5m", live.buys5m],
+    ["uniqueBuyers", live.uniqueBuyers5m],
+    ["holders", live.holders],
+    ["top10", live.top10Pct],
+    ["mint", live.mintAuth],
+    ["freeze", live.freezeAuth],
   ];
   for (const [k, c] of cells) meta[k] = c;
-  if (t.sellQuote) {
+  if (live.sellQuote) {
     meta.exitQuote = {
-      source: t.sellQuote.source,
-      eventTime: t.sellQuote.eventTime,
-      ingestedAt: t.sellQuote.ingestedAt,
-      lagMs: t.sellQuote.latencyMs,
+      source: live.sellQuote.source,
+      eventTime: live.sellQuote.eventTime,
+      ingestedAt: live.sellQuote.ingestedAt,
+      lagMs: live.sellQuote.latencyMs,
     };
   }
 

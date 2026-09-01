@@ -1,11 +1,14 @@
 import { USDC, WSOL, type QuoteObs } from "../schema";
 import { blankQuote } from "./normalize";
+import { breakerFor } from "../circuit";
+import { classifyRouteFailure, routeStateFromFailure } from "../routes";
 
 type JupQuote = {
   inAmount?: string;
   outAmount?: string;
   priceImpactPct?: string | number;
   routePlan?: { swapInfo?: { label?: string } }[];
+  error?: string;
 };
 
 const ENDPOINTS = [
@@ -46,6 +49,22 @@ function impliedPrice(opts: {
   return null;
 }
 
+function failedQuote(
+  opts: { inputMint: string; outputMint: string; amount: string; notionalUsd: number },
+  message: string,
+  latencyMs: number,
+  httpStatus?: number,
+): QuoteObs {
+  const reason = classifyRouteFailure(message, httpStatus);
+  const state = routeStateFromFailure(reason);
+  const q = blankQuote(opts.inputMint, opts.outputMint, opts.amount, opts.notionalUsd, message, latencyMs);
+  q.available = false;
+  q.routeState = state;
+  q.failureReason = reason;
+  q.error = message;
+  return q;
+}
+
 async function quoteOnce(opts: {
   inputMint: string;
   outputMint: string;
@@ -57,7 +76,12 @@ async function quoteOnce(opts: {
 }): Promise<QuoteObs> {
   const t0 = Date.now();
   const ingestedAt = t0;
+  const circuit = breakerFor("jupiter");
+  if (!circuit.canCall()) {
+    return failedQuote(opts, "circuit open", 0);
+  }
   let last = "quote failed";
+  let lastStatus: number | undefined;
   for (const base of ENDPOINTS) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
@@ -69,16 +93,25 @@ async function quoteOnce(opts: {
       const eventTime = Date.now();
       if (!r.ok) {
         last = `http ${r.status}`;
+        lastStatus = r.status;
+        if (r.status === 429) {
+          circuit.failure("rate limit");
+          return failedQuote(opts, last, latencyMs, r.status);
+        }
         continue;
       }
       const body = (await r.json()) as JupQuote;
-      const labels = (body.routePlan ?? [])
-        .map((x) => x.swapInfo?.label)
-        .filter((x): x is string => Boolean(x));
+      const labels = (body.routePlan ?? []).map((x) => x.swapInfo?.label).filter((x): x is string => Boolean(x));
       const inAmount = body.inAmount ?? opts.amount;
       const outAmount = body.outAmount ?? "0";
+      const ok = Boolean(outAmount && Number(outAmount) > 0);
+      if (!ok) {
+        circuit.failure("no route");
+        return failedQuote(opts, body.error ?? "no route", latencyMs);
+      }
+      circuit.success();
       return {
-        available: Boolean(outAmount && Number(outAmount) > 0),
+        available: true,
         inMint: opts.inputMint,
         outMint: opts.outputMint,
         inAmount,
@@ -99,12 +132,15 @@ async function quoteOnce(opts: {
         eventTime,
         ingestedAt,
         source: "jupiter",
+        routeState: "ROUTABLE",
+        failureReason: null,
       };
     } catch (e) {
       last = e instanceof Error ? e.message : "quote failed";
     }
   }
-  return blankQuote(opts.inputMint, opts.outputMint, opts.amount, opts.notionalUsd, last, Date.now() - t0);
+  circuit.failure(last);
+  return failedQuote(opts, last, Date.now() - t0, lastStatus);
 }
 
 export async function quoteToken(opts: {
@@ -144,7 +180,7 @@ export async function quoteToken(opts: {
           solPriceUsd: opts.solPriceUsd,
           notionalUsd: opts.notionalUsd,
         })
-      : Promise.resolve(blankQuote(opts.mint, WSOL, "0", opts.notionalUsd, "no token size")),
+      : Promise.resolve(failedQuote({ inputMint: opts.mint, outputMint: WSOL, amount: "0", notionalUsd: opts.notionalUsd }, "no token size", 0)),
   ]);
 
   return { buy, sell, lagMs: Date.now() - t0 };

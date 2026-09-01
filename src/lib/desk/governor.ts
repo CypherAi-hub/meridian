@@ -1,7 +1,8 @@
-import { bucketOf } from "./buckets";
-import { MAX_STRESSED_EXIT_PCT, MIN_LIQ_USD, STALE_MS } from "./schema";
-import type { Features, GovernorVerdict, Predictions, QuoteObs, Regime, TokenLive } from "./types";
-import type { GateResult } from "./schema";
+import { bucketOf } from "./buckets.ts";
+import { MAX_STRESSED_EXIT_PCT, MIN_LIQ_USD, STALE_MS } from "./schema.ts";
+import { governorRoutePolicy, routeStateOf } from "./routes.ts";
+import type { Features, GovernorVerdict, Predictions, QuoteObs, Regime, TokenLive } from "./types.ts";
+import type { GateResult } from "./schema.ts";
 
 function asFrac(n: number | null | undefined) {
   if (n == null) return null;
@@ -50,15 +51,17 @@ export function govern(opts: {
       name: "Contract risk",
       status: "UNKNOWN",
       reason: "Mint/freeze authority unknown — veto until verified",
+      reasonCode: "CONTRACT_UNKNOWN",
     });
   } else if (t.mintAuth.value || t.freezeAuth.value) {
     layers.push({
       name: "Contract risk",
       status: "FAIL",
       reason: t.mintAuth.value ? "Mint authority active" : "Freeze authority active",
+      reasonCode: t.mintAuth.value ? "MINT_AUTHORITY_ACTIVE" : "FREEZE_AUTHORITY_ACTIVE",
     });
   } else {
-    layers.push({ name: "Contract risk", status: "PASS", reason: "Mint and freeze revoked" });
+    layers.push({ name: "Contract risk", status: "PASS", reason: "Mint and freeze revoked", reasonCode: "CONTRACT_OK" });
   }
 
   if (t.top10Pct.value == null) {
@@ -68,6 +71,7 @@ export function govern(opts: {
         name: "Holder concentration",
         status: "UNKNOWN",
         reason: "Concentration unverified — veto on new/early names",
+        reasonCode: "HOLDER_UNKNOWN",
       });
     } else {
       sizeMul = Math.min(sizeMul, 0.2);
@@ -75,6 +79,7 @@ export function govern(opts: {
         name: "Holder concentration",
         status: "UNKNOWN",
         reason: "Concentration unverified — size cut to 20%",
+        reasonCode: "HOLDER_UNKNOWN",
       });
     }
   } else if (t.top10Pct.value >= 0.42) {
@@ -82,68 +87,81 @@ export function govern(opts: {
       name: "Holder concentration",
       status: "FAIL",
       reason: `Top 10 holds ${(t.top10Pct.value * 100).toFixed(0)}%`,
+      reasonCode: "TOP10_TOO_CONCENTRATED",
     });
   } else {
     layers.push({
       name: "Holder concentration",
       status: "PASS",
       reason: `Top 10 ${(t.top10Pct.value * 100).toFixed(0)}%`,
+      reasonCode: "HOLDER_OK",
     });
   }
 
   if (!liqKnown) {
-    layers.push({ name: "Liquidity", status: "UNKNOWN", reason: "Liquidity missing — cannot size an exit" });
+    layers.push({ name: "Liquidity", status: "UNKNOWN", reason: "Liquidity missing — cannot size an exit", reasonCode: "LIQUIDITY_UNKNOWN" });
   } else if (liq < MIN_LIQ_USD) {
     layers.push({
       name: "Liquidity",
       status: "FAIL",
       reason: `Liq $${Math.round(liq).toLocaleString()} below $35k`,
+      reasonCode: "LIQUIDITY_TOO_LOW",
     });
   } else {
     layers.push({
       name: "Liquidity",
       status: "PASS",
       reason: `Liq $${Math.round(liq).toLocaleString()}`,
+      reasonCode: "LIQUIDITY_OK",
     });
   }
 
-  if (!t.sellQuote) {
+  const routeState = t.sellQuote
+    ? routeStateOf({ available: t.sellQuote.available, routeState: t.sellQuote.routeState, error: t.sellQuote.error })
+    : "UNKNOWN";
+  const routePolicy = governorRoutePolicy(routeState);
+  if (routePolicy === "UNKNOWN") {
     layers.push({
       name: "Exit route",
       status: "UNKNOWN",
-      reason: "No Jupiter quote yet — cannot verify exit",
+      reason: t.sellQuote?.error ?? t.sellQuote?.failureReason ?? `Route ${routeState}`,
+      reasonCode: routeState === "TIMEOUT" ? "QUOTE_TIMEOUT" : "SELL_ROUTE_UNKNOWN",
     });
-  } else if (!t.sellQuote.available) {
+  } else if (routePolicy === "FAIL") {
     layers.push({
       name: "Exit route",
       status: "FAIL",
-      reason: t.sellQuote.error ?? "Sell quote unavailable",
+      reason: t.sellQuote?.error ?? "Sell quote unavailable",
+      reasonCode: "NO_SELL_ROUTE",
     });
   } else {
     layers.push({
       name: "Exit route",
       status: "PASS",
-      reason: t.sellQuote.routeLabels[0] ?? "Jupiter route",
+      reason: t.sellQuote?.routeLabels[0] ?? "Jupiter route",
+      reasonCode: "ROUTE_OK",
     });
   }
 
   const age = now - t.priceUsd.ingestedAt;
   if (!t.priceUsd.value) {
-    layers.push({ name: "Data freshness", status: "UNKNOWN", reason: "No price on snapshot" });
+    layers.push({ name: "Data freshness", status: "UNKNOWN", reason: "No price on snapshot", reasonCode: "PRICE_UNKNOWN" });
   } else if (age > STALE_MS) {
     layers.push({
       name: "Data freshness",
       status: "FAIL",
       reason: `Snapshot age ${(age / 1000).toFixed(0)}s`,
+      reasonCode: "DATA_STALE",
     });
   } else if (f.priceDisagreement != null && f.priceDisagreement > 0.18) {
     layers.push({
       name: "Data freshness",
       status: "FAIL",
       reason: `Sources disagree ${(f.priceDisagreement * 100).toFixed(0)}%`,
+      reasonCode: "PROVIDER_DISAGREEMENT",
     });
   } else {
-    layers.push({ name: "Data freshness", status: "PASS", reason: `Age ${(age / 1000).toFixed(1)}s` });
+    layers.push({ name: "Data freshness", status: "PASS", reason: `Age ${(age / 1000).toFixed(1)}s`, reasonCode: "FRESH" });
   }
 
   sized *= sizeMul;
@@ -157,43 +175,45 @@ export function govern(opts: {
           name: "Price impact",
           status: "FAIL",
           reason: `Estimated stressed exit impact = ${(stressedExit * 100).toFixed(1)}%. Maximum permitted = ${(MAX_STRESSED_EXIT_PCT * 100).toFixed(1)}%`,
+          reasonCode: "PRICE_IMPACT_TOO_HIGH",
         }
-      : { name: "Price impact", status: "PASS", reason: `Stressed exit ${(stressedExit * 100).toFixed(1)}%` },
+      : { name: "Price impact", status: "PASS", reason: `Stressed exit ${(stressedExit * 100).toFixed(1)}%`, reasonCode: "IMPACT_OK" },
   );
 
   layers.push(
     openCount >= maxPositions
-      ? { name: "Portfolio exposure", status: "FAIL", reason: "Position cap" }
-      : { name: "Portfolio exposure", status: "PASS", reason: `${openCount}/${maxPositions} names` },
+      ? { name: "Portfolio exposure", status: "FAIL", reason: "Position cap", reasonCode: "MAX_POSITION_LIMIT" }
+      : { name: "Portfolio exposure", status: "PASS", reason: `${openCount}/${maxPositions} names`, reasonCode: "BOOK_OK" },
   );
 
   layers.push(
     dayDd > 0.12
-      ? { name: "Daily drawdown", status: "FAIL", reason: `Intraday ${(dayDd * 100).toFixed(1)}%` }
-      : { name: "Daily drawdown", status: "PASS", reason: `Intraday ${(dayDd * 100).toFixed(1)}%` },
+      ? { name: "Daily drawdown", status: "FAIL", reason: `Intraday ${(dayDd * 100).toFixed(1)}%`, reasonCode: "DAILY_DRAWDOWN_LIMIT" }
+      : { name: "Daily drawdown", status: "PASS", reason: `Intraday ${(dayDd * 100).toFixed(1)}%`, reasonCode: "DD_OK" },
   );
 
   layers.push(
     regime === "risk_off" || strategyId === "flat"
-      ? { name: "Regime risk", status: "FAIL", reason: "Stand-down regime" }
-      : { name: "Regime risk", status: "PASS", reason: `${regime.replaceAll("_", " ")} · ${bucket.replaceAll("_", " ")}` },
+      ? { name: "Regime risk", status: "FAIL", reason: "Stand-down regime", reasonCode: "REGIME_DISALLOWED" }
+      : { name: "Regime risk", status: "PASS", reason: `${regime.replaceAll("_", " ")} · ${bucket.replaceAll("_", " ")}`, reasonCode: "REGIME_OK" },
   );
 
   const quoteLag = t.sellQuote?.latencyMs ?? t.buyQuote?.latencyMs ?? 0;
   if (!t.buyQuote || !t.sellQuote) {
-    layers.push({ name: "Execution conditions", status: "UNKNOWN", reason: "Quote incomplete" });
+    layers.push({ name: "Execution conditions", status: "UNKNOWN", reason: "Quote incomplete", reasonCode: "QUOTE_INCOMPLETE" });
   } else if (quoteLag > 2500) {
     layers.push({
       name: "Execution conditions",
       status: "FAIL",
       reason: `Quote latency ${quoteLag}ms`,
+      reasonCode: "QUOTE_TIMEOUT",
     });
   } else {
-    layers.push({ name: "Execution conditions", status: "PASS", reason: `Quote ${quoteLag}ms` });
+    layers.push({ name: "Execution conditions", status: "PASS", reason: `Quote ${quoteLag}ms`, reasonCode: "EXEC_OK" });
   }
 
   if (liqKnown && sized < 40) {
-    layers.push({ name: "Liquidity", status: "FAIL", reason: "Sized below $40 minimum" });
+    layers.push({ name: "Liquidity", status: "FAIL", reason: "Sized below $40 minimum", reasonCode: "LIQUIDITY_TOO_LOW" });
   }
 
   const fails = layers.filter((l) => l.status === "FAIL");
@@ -208,10 +228,15 @@ export function govern(opts: {
     ...blockingUnknown.map((l) => l.reason),
   ];
   if (!approved && !reasons.length && holderUnknown) reasons.push(holderUnknown.reason);
+  const reasonCodes = [
+    ...fails.map((l) => l.reasonCode ?? "FAIL"),
+    ...blockingUnknown.map((l) => l.reasonCode ?? "UNKNOWN"),
+  ];
 
   return {
     approved,
     reasons,
+    reasonCodes,
     sizedUsd: sized,
     stressedLoss: sized * Math.max(d, stressedExit),
     stressedExitPct: stressedExit,

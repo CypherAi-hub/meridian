@@ -1,10 +1,11 @@
-import { isResearchBucket } from "./buckets";
-import { computeFeatures, predict } from "./features";
-import { govern, paperFillFromQuote } from "./governor";
-import { labelPending } from "./labels";
-import { emptyResearch, intentToLedger, mergeRecent, noteRow } from "./ledger";
-import { CONSIDER_COOLDOWN_MS, LEDGER_PENDING_MAX, START_EQUITY } from "./schema";
-import { strategyForRegime, strategyMatches } from "./strategies";
+import { isResearchBucket } from "./buckets.ts";
+import { computeFeatures, predict } from "./features.ts";
+import { govern, paperFillFromQuote } from "./governor.ts";
+import { labelPending } from "./labels.ts";
+import { emptyResearch, intentToLedger, mergeRecent, noteRow } from "./ledger.ts";
+import { CONSIDER_COOLDOWN_MS, LEDGER_PENDING_MAX, START_EQUITY } from "./schema.ts";
+import { strategyForRegime, strategyMatches } from "./strategies.ts";
+import { emptyQuality } from "./types.ts";
 import type {
   DeskSnapshot,
   Intent,
@@ -98,7 +99,11 @@ export function emptyDesk(): DeskSnapshot {
       oldestPendingAt: null,
       providerErrors: 0,
       lastError: null,
+      avgTickMs: 0,
+      observationsWritten: 0,
+      considerationsDropped: 0,
     },
+    quality: emptyQuality(),
   };
 }
 
@@ -112,8 +117,8 @@ export function createDesk(): DeskSnapshot {
         id: uid(),
         ts: now,
         kind: "feed",
-        title: "Paper desk · persistent engine",
-        detail: "Worker writes the warehouse. Closing this page does not stop collection. No wallet.",
+        title: "Paper desk · coverage engine",
+        detail: "Two-speed collector. Observations independent of considerations. Paper only. No wallet.",
       },
     ],
   };
@@ -339,7 +344,8 @@ function decide(prev: DeskSnapshot): DeskSnapshot {
     if (!matched && gov.approved) {
       gov.approved = false;
       gov.reasons = ["Strategy filters"];
-      gov.layers = [...gov.layers, { name: "Regime risk", status: "FAIL", reason: "Strategy filters" }];
+      gov.reasonCodes = ["STRATEGY_FILTERS"];
+      gov.layers = [...gov.layers, { name: "Regime risk", status: "FAIL", reason: "Strategy filters", reasonCode: "STRATEGY_FILTERS" }];
     }
     const intent: Intent = {
       intentId: uid(),
@@ -438,6 +444,7 @@ export function inspect(s: DeskSnapshot, address: string | null) {
         ...gov,
         approved: false,
         reasons: [...gov.reasons, "Strategy filters"],
+        reasonCodes: [...(gov.reasonCodes ?? []), "STRATEGY_FILTERS"],
         layers: gov.layers.map((l) =>
           l.name === "Regime risk" && l.status === "PASS"
             ? { ...l, status: "FAIL" as const, reason: "Strategy filters" }

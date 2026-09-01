@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiControlRouteImport } from './routes/api/control'
 import { Route as ApiDeskRouteImport } from './routes/api/desk'
+import { Route as ApiHealthRouteImport } from './routes/api/health'
 import { Route as ApiQuoteRouteImport } from './routes/api/quote'
 import { Route as ApiResearchRouteImport } from './routes/api/research'
 import { Route as ApiTapeRouteImport } from './routes/api/tape'
@@ -30,6 +31,11 @@ const ApiControlRoute = ApiControlRouteImport.update({
 const ApiDeskRoute = ApiDeskRouteImport.update({
   id: '/api/desk',
   path: '/api/desk',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiHealthRoute = ApiHealthRouteImport.update({
+  id: '/api/health',
+  path: '/api/health',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiQuoteRoute = ApiQuoteRouteImport.update({
@@ -57,6 +63,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
+  '/api/health': typeof ApiHealthRoute
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
@@ -66,6 +73,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
+  '/api/health': typeof ApiHealthRoute
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
@@ -76,6 +84,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
+  '/api/health': typeof ApiHealthRoute
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
@@ -87,6 +96,7 @@ export interface FileRouteTypes {
     | '/'
     | '/api/control'
     | '/api/desk'
+    | '/api/health'
     | '/api/quote'
     | '/api/research'
     | '/api/tape'
@@ -96,6 +106,7 @@ export interface FileRouteTypes {
     | '/'
     | '/api/control'
     | '/api/desk'
+    | '/api/health'
     | '/api/quote'
     | '/api/research'
     | '/api/tape'
@@ -105,6 +116,7 @@ export interface FileRouteTypes {
     | '/'
     | '/api/control'
     | '/api/desk'
+    | '/api/health'
     | '/api/quote'
     | '/api/research'
     | '/api/tape'
@@ -115,6 +127,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiControlRoute: typeof ApiControlRoute
   ApiDeskRoute: typeof ApiDeskRoute
+  ApiHealthRoute: typeof ApiHealthRoute
   ApiQuoteRoute: typeof ApiQuoteRoute
   ApiResearchRoute: typeof ApiResearchRoute
   ApiTapeRoute: typeof ApiTapeRoute
@@ -142,6 +155,13 @@ declare module '@tanstack/react-router' {
       path: '/api/desk'
       fullPath: '/api/desk'
       preLoaderRoute: typeof ApiDeskRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/health': {
+      id: '/api/health'
+      path: '/api/health'
+      fullPath: '/api/health'
+      preLoaderRoute: typeof ApiHealthRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/quote': {
@@ -179,6 +199,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiControlRoute: ApiControlRoute,
   ApiDeskRoute: ApiDeskRoute,
+  ApiHealthRoute: ApiHealthRoute,
   ApiQuoteRoute: ApiQuoteRoute,
   ApiResearchRoute: ApiResearchRoute,
   ApiTapeRoute: ApiTapeRoute,

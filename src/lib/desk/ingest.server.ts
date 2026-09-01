@@ -1,6 +1,7 @@
 import { bucketOf, bucketRank } from "./buckets";
 import { discoverDexScreener, enrichDexScreener, fetchSolPriceDex, lookupDexTokens } from "./providers/dexscreener";
 import { fetchGeckoPools } from "./providers/gecko";
+import { enrichHolders } from "./providers/holders";
 import { quoteSolUsdc, quoteToken } from "./providers/jupiter";
 import { mergeSnap } from "./providers/normalize";
 import { enrichSolana } from "./providers/solana";
@@ -35,23 +36,77 @@ export async function ingestTape(opts?: {
 }): Promise<MarketTape> {
   const key = `${[...(opts?.held ?? [])].sort().join(",")}|${opts?.focus ?? ""}|${[...(opts?.watch ?? [])].sort().join(",")}`;
   if (cache && cache.key === key && Date.now() - cache.at < TTL && cache.tape.tokens.length) return cache.tape;
-  const tape = await ingestOnce(opts);
-  if (tape.tokens.length) {
-    cache = { at: Date.now(), key, tape };
-    lastGood = tape;
+  try {
+    const tape = await ingestOnce(opts);
+    if (tape.tokens.length) {
+      cache = { at: Date.now(), key, tape };
+      lastGood = tape;
+      return tape;
+    }
+    if (lastGood?.tokens.length) {
+      return {
+        ...lastGood,
+        fetchMs: tape.fetchMs,
+        sources: tape.sources.map((s) =>
+          s.status === "live"
+            ? { ...s, status: "degraded" as const, detail: `${s.detail} · last-good tape` }
+            : s,
+        ),
+      };
+    }
     return tape;
+  } catch (e) {
+    if (lastGood?.tokens.length) {
+      return {
+        ...lastGood,
+        sources: lastGood.sources.map((s) => ({
+          ...s,
+          status: s.status === "live" ? ("degraded" as const) : s.status,
+          detail: `${s.detail} · ${e instanceof Error ? e.message : "ingest failed"}`,
+        })),
+      };
+    }
+    throw e;
   }
-  if (lastGood?.tokens.length) {
-    return {
-      ...lastGood,
-      ingestedAt: Date.now(),
-      fetchMs: tape.fetchMs,
-      sources: tape.sources.map((s) =>
-        s.status === "live" ? s : { ...s, status: s.status === "offline" ? "degraded" : s.status, detail: `${s.detail} · serving last good tape` },
-      ),
-    };
-  }
-  return tape;
+}
+
+export async function ingestActive(opts: {
+  tape: MarketTape;
+  mints: string[];
+}): Promise<MarketTape> {
+  const t0 = Date.now();
+  const want = new Set(opts.mints);
+  const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, 12);
+  if (!targets.length || !opts.tape.solPriceUsd) return opts.tape;
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      try {
+        const q = await quoteToken({
+          mint: t.address,
+          decimals: t.decimals,
+          priceUsd: t.priceUsd.value,
+          solPriceUsd: opts.tape.solPriceUsd!,
+          notionalUsd: 120,
+        });
+        return { addr: t.address, q };
+      } catch {
+        return { addr: t.address, q: null };
+      }
+    }),
+  );
+  const byBuy = new Map(results.map((r) => [r.addr, r.q?.buy]));
+  const bySell = new Map(results.map((r) => [r.addr, r.q?.sell]));
+  const tokens = opts.tape.tokens.map((t) => ({
+    ...t,
+    buyQuote: byBuy.get(t.address) ?? t.buyQuote,
+    sellQuote: bySell.get(t.address) ?? t.sellQuote,
+  }));
+  return {
+    ...opts.tape,
+    tokens,
+    ingestedAt: Date.now(),
+    fetchMs: Date.now() - t0,
+  };
 }
 
 function vol(t: TokenSnapshot) {
@@ -119,7 +174,8 @@ async function ingestOnce(opts?: {
   }
 
   const sol = await enrichSolana(dex.tokens);
-  const enriched = sol.tokens;
+  const holders = await enrichHolders(sol.tokens);
+  const enriched = holders.tokens;
 
   const focusSet = new Set<string>(pin);
   const young = enriched.filter((t) => {
@@ -130,7 +186,7 @@ async function ingestOnce(opts?: {
     ...enriched.filter((t) => focusSet.has(t.address)),
     ...young.filter((t) => !focusSet.has(t.address)),
     ...enriched.filter((t) => !focusSet.has(t.address) && !young.includes(t)),
-  ].slice(0, 10);
+  ].slice(0, 16);
 
   const quoteMap = new Map<string, TokenSnapshot["buyQuote"]>();
   const sellMap = new Map<string, TokenSnapshot["sellQuote"]>();
@@ -163,6 +219,9 @@ async function ingestOnce(opts?: {
   const jupLag = quoted.find((t) => t.sellQuote)?.sellQuote?.latencyMs ?? jupProbe.latencyMs;
   const geckoOk = gecko.tokens.length > 0 && !gecko.error;
   const geckoDegraded = Boolean(gecko.error) && gecko.tokens.length > 0;
+  const holderSources = holders.sources;
+  const solLive = !sol.error && quoted.some((t) => t.mintAuth.value != null);
+  const rpcHolders = holderSources.find((s) => s.id === "solana");
 
   const sources: SourceHealth[] = [
     health(
@@ -182,10 +241,11 @@ async function ingestOnce(opts?: {
     health("jupiter", jupOk, jupLag, jupOk ? "read-only quotes" : jupProbe.error ?? "no route"),
     health(
       "solana",
-      !sol.error && quoted.some((t) => t.mintAuth.value != null),
-      sol.lagMs,
-      sol.error ?? "mint / freeze",
+      solLive || Boolean(rpcHolders?.status === "live"),
+      sol.lagMs ?? rpcHolders?.lagMs ?? null,
+      sol.error ?? rpcHolders?.detail ?? "mint / freeze",
     ),
+    ...(holderSources.filter((s) => s.id !== "solana") as SourceHealth[]),
   ];
 
   return {

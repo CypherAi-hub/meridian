@@ -12,6 +12,7 @@ export function field<T>(
     ingestedAt,
     source,
     lagMs: Math.max(0, ingestedAt - eventTime),
+    status: value == null ? "UNKNOWN" : "VALID",
   };
 }
 
@@ -58,6 +59,8 @@ export function blankSnapshot(
     uniqueSellers5m: emptyField(eventTime, ingestedAt, "geckoterminal"),
     holders: emptyField(eventTime, ingestedAt, "solana"),
     top10Pct: emptyField(eventTime, ingestedAt, "solana"),
+    top20Pct: emptyField(eventTime, ingestedAt, "solana"),
+    largestHolderPct: emptyField(eventTime, ingestedAt, "solana"),
     mintAuth: emptyField(eventTime, ingestedAt, "solana"),
     freezeAuth: emptyField(eventTime, ingestedAt, "solana"),
     buyQuote: null,
@@ -87,6 +90,8 @@ export function mergeSnap(a: TokenSnapshot, b: TokenSnapshot): TokenSnapshot {
     uniqueSellers5m: prefer(a.uniqueSellers5m, b.uniqueSellers5m),
     holders: prefer(a.holders, b.holders),
     top10Pct: prefer(a.top10Pct, b.top10Pct),
+    top20Pct: prefer(a.top20Pct ?? emptyField(0, 0, "solana"), b.top20Pct ?? emptyField(0, 0, "solana")),
+    largestHolderPct: prefer(a.largestHolderPct ?? emptyField(0, 0, "solana"), b.largestHolderPct ?? emptyField(0, 0, "solana")),
     mintAuth: prefer(a.mintAuth, b.mintAuth),
     freezeAuth: prefer(a.freezeAuth, b.freezeAuth),
     buyQuote: a.buyQuote ?? b.buyQuote,
@@ -123,5 +128,7 @@ export function blankQuote(
     ingestedAt: now,
     source: "jupiter",
     error,
+    routeState: "UNKNOWN",
+    failureReason: error,
   };
 }

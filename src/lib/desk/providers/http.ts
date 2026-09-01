@@ -1,6 +1,6 @@
 export const UA = {
   accept: "application/json",
-  "user-agent": "MeridianPaperDesk/3.2 (research; paper-only)",
+  "user-agent": "MeridianPaperDesk/3.25 (research; paper-only)",
 };
 
 export function getJson(url: string, ms = 8000) {

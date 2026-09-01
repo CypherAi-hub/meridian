@@ -1,6 +1,8 @@
-import { bucketOf, type UniverseBucket } from "./buckets";
-import { paperFillFromQuote } from "./governor";
-import { LEDGER_ARCHIVE_MAX, LEDGER_MEMORY, STRATEGY_VERSION } from "./schema";
+import { bucketOf, type UniverseBucket } from "./buckets.ts";
+import { paperFillFromQuote } from "./governor.ts";
+import { LEDGER_ARCHIVE_MAX, LEDGER_MEMORY, STRATEGY_VERSION } from "./schema.ts";
+import { FEATURE_ENGINE_VERSION, LABEL_DEFINITION_VERSION } from "./versions.ts";
+import { stampResearchQuality } from "./labels.ts";
 import type {
   Intent,
   LedgerRow,
@@ -68,7 +70,7 @@ export function intentToLedger(intent: Intent, taken: boolean, slipBps: number):
       ? paperFillFromQuote(mid, s.buyQuote, slipBps, "buy", intent.governor.entryImpactPct)
       : null;
   const bucket = f.bucket ?? bucketOf(f.tokenAgeS);
-  return {
+  const row: LedgerRow = {
     decision_id: intent.intentId,
     event_time: s.priceUsd.eventTime,
     ingested_at: s.priceUsd.ingestedAt,
@@ -109,6 +111,19 @@ export function intentToLedger(intent: Intent, taken: boolean, slipBps: number):
     trade_taken: taken,
     trade_action: taken ? "take" : intent.governor.approved ? "ignore" : "veto",
     sell_quote_available: Boolean(s.sellQuote?.available),
+    route_status: s.sellQuote?.routeState ?? (s.sellQuote?.available ? "ROUTABLE" : s.sellQuote ? "NO_ROUTE" : "UNKNOWN"),
+    feature_engine_version: FEATURE_ENGINE_VERSION,
+    label_definition_version: LABEL_DEFINITION_VERSION,
+    veto_reason_code: intent.governor.reasonCodes[0] ?? (intent.governor.approved ? "TRADE_AUTHORIZED" : "VETO"),
+    research_quality_score: null,
+    research_grade: null,
+    provider_disagreement: Boolean(f.priceDisagreement != null && f.priceDisagreement > 0.03),
+    barrier_10_outcome: null,
+    barrier_20_outcome: null,
+    barrier_label_confidence: null,
+    max_path_gap_seconds: null,
+    avg_path_gap_seconds: null,
+    path_sample_count: null,
     feature_sources: intent.featureMeta,
     features: f,
     gates: intent.governor.layers,
@@ -141,10 +156,20 @@ export function intentToLedger(intent: Intent, taken: boolean, slipBps: number):
     rug_detected: null,
     simulated_entry: simEntry,
     simulated_exit: null,
+    theoretical_return: null,
     net_execution_return: null,
+    execution_adjusted_return: null,
+    mfe_1m: null,
+    mfe_30m: null,
+    mae_1m: null,
+    mae_30m: null,
+    first_sell_route_loss_at: null,
+    sell_route_restored_at: null,
     labels_complete: false,
     outcome: taken ? "open" : "not_taken",
   };
+  stampResearchQuality(row);
+  return row;
 }
 
 export function noteRow(summary: ResearchSummary, row: LedgerRow, prev?: LedgerRow | null) {
@@ -389,6 +414,19 @@ function emptyRowStub(): Partial<LedgerRow> {
     exit_impact: null,
     stressed_exit: 0,
     sell_quote_available: false,
+    route_status: "UNKNOWN",
+    feature_engine_version: FEATURE_ENGINE_VERSION,
+    label_definition_version: LABEL_DEFINITION_VERSION,
+    veto_reason_code: "",
+    research_quality_score: null,
+    research_grade: null,
+    provider_disagreement: false,
+    barrier_10_outcome: null,
+    barrier_20_outcome: null,
+    barrier_label_confidence: null,
+    max_path_gap_seconds: null,
+    avg_path_gap_seconds: null,
+    path_sample_count: null,
     feature_sources: {},
     gates: [],
     path: [],
@@ -410,7 +448,15 @@ function emptyRowStub(): Partial<LedgerRow> {
     rug_detected: null,
     simulated_entry: null,
     simulated_exit: null,
+    theoretical_return: null,
     net_execution_return: null,
+    execution_adjusted_return: null,
+    mfe_1m: null,
+    mfe_30m: null,
+    mae_1m: null,
+    mae_30m: null,
+    first_sell_route_loss_at: null,
+    sell_route_restored_at: null,
     labels_complete: false,
   };
 }

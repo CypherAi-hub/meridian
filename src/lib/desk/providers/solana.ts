@@ -1,14 +1,20 @@
 import type { TokenSnapshot } from "../schema";
 import { field } from "./normalize";
+import { deskSettings } from "../config";
 
 type RpcError = { message?: string };
 type AccountValue = { data?: [string, string]; owner?: string } | null;
 
-const RPCS = ["https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"];
+const PUBLIC_RPCS = ["https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"];
 
-async function rpc<T>(payload: unknown): Promise<T> {
+function rpcUrls(): string[] {
+  const custom = deskSettings().solanaRpcUrl;
+  return custom ? [custom, ...PUBLIC_RPCS] : PUBLIC_RPCS;
+}
+
+export async function solanaRpc<T>(payload: unknown): Promise<T> {
   let last = "solana rpc failed";
-  for (const url of RPCS) {
+  for (const url of rpcUrls()) {
     try {
       const r = await fetch(url, {
         method: "POST",
@@ -60,7 +66,7 @@ export async function enrichSolana(tokens: TokenSnapshot[]): Promise<{
 
   try {
     const mints = slice.map((t) => t.address);
-    const info = await rpc<{
+    const info = await solanaRpc<{
       result?: { value: AccountValue[] };
       error?: RpcError;
     }>({

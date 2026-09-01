@@ -21,7 +21,9 @@ import { ageLabel, clock, compact, pct, regimeLabel, shortAddr, usd } from "@/li
 import { meanOf } from "@/lib/desk/ledger";
 import { STRATEGIES } from "@/lib/desk/strategies";
 import { startDeskLoop, stopDeskLoop, useDesk } from "@/lib/desk/store";
-import type { FeatureMeta, GateResult, LedgerRow, Regime, ResearchSummary, SourceHealth, UniverseBucket, WorkerHealth } from "@/lib/desk/types";
+import type { DataQuality, FeatureMeta, GateResult, LedgerRow, Regime, ResearchSummary, SourceHealth, UniverseBucket, WorkerHealth } from "@/lib/desk/types";
+import type { MonotonicityReport } from "@/lib/desk/baseline";
+import { emptyQuality } from "@/lib/desk/types";
 import { cn } from "@/lib/utils";
 
 const TABS = ["scan", "inspect", "book", "journal", "research"] as const;
@@ -59,7 +61,7 @@ export function DeskApp() {
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
           <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
-          <p className="hidden text-xs text-muted lg:block">V3.2.5 · persistent engine</p>
+          <p className="hidden text-xs text-muted lg:block">V3.3 · replay engine</p>
         </div>
         <Badge variant={desk.worker.status === "live" ? "up" : desk.worker.status === "starting" ? "warn" : "down"}>
           {desk.worker.status === "live"
@@ -388,6 +390,7 @@ export function DeskApp() {
           summary={desk.research}
           rows={desk.ledger}
           worker={desk.worker}
+          quality={desk.quality ?? emptyQuality()}
           onExport={(format) => {
             void desk.dumpResearch(format).then((payload) => {
               const blob =
@@ -623,13 +626,28 @@ function ResearchPanel({
   summary,
   rows,
   worker,
+  quality,
   onExport,
 }: {
   summary: ResearchSummary;
   rows: LedgerRow[];
   worker: WorkerHealth;
+  quality: DataQuality;
   onExport: (format: "json" | "csv") => void;
 }) {
+  const [edge, setEdge] = useState<MonotonicityReport | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void fetch("/api/research?view=edge", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload: MonotonicityReport | null) => {
+        if (alive && payload && typeof payload.verdict === "string") setEdge(payload);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
   const slice = useMemo(() => rows.slice(0, 40), [rows]);
   const net = meanOf(
     summary.byRegime.meme_mania.sumNet +
@@ -698,6 +716,142 @@ function ResearchPanel({
           {worker.oldestPendingAt ? ` · oldest ${clock(worker.oldestPendingAt)}` : ""}
           {worker.lastError ? ` · ${worker.lastError}` : ""}
         </p>
+      </div>
+      <div className="border-b border-border px-4 py-3 sm:px-5">
+        <p className="mb-2 text-xs uppercase tracking-wider text-subtle">Data quality</p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+          <QualityRow label="tokens observed" value={compact(quality.tokensObserved)} />
+          <QualityRow label="raw observations" value={compact(quality.rawObservations)} />
+          <QualityRow label="feature vectors" value={compact(quality.featureVectors)} />
+          <QualityRow label="path samples" value={compact(quality.pathSamples)} />
+          <QualityRow
+            label="avg obs interval"
+            value={quality.avgObservationIntervalMs == null ? "—" : `${(quality.avgObservationIntervalMs / 1000).toFixed(0)}s`}
+          />
+          <QualityRow
+            label="largest gap"
+            value={quality.largestGapMs == null ? "—" : `${(quality.largestGapMs / 1000).toFixed(0)}s`}
+          />
+          <QualityRow
+            label="unknown holder"
+            value={quality.unknownHolderPct == null ? "—" : pct(quality.unknownHolderPct, 0)}
+          />
+          <QualityRow
+            label="holder coverage"
+            value={quality.holderCoveragePct == null ? "—" : pct(quality.holderCoveragePct, 0)}
+          />
+          <QualityRow
+            label="unknown contract"
+            value={quality.unknownContractPct == null ? "—" : pct(quality.unknownContractPct, 0)}
+          />
+          <QualityRow
+            label="jupiter routes"
+            value={quality.jupiterRoutePct == null ? "—" : pct(quality.jupiterRoutePct, 0)}
+          />
+          <QualityRow
+            label="labels complete"
+            value={quality.labelsCompletedPct == null ? "—" : pct(quality.labelsCompletedPct, 0)}
+          />
+          <QualityRow label="unique tokens" value={compact(quality.uniqueTokens ?? quality.tokensObserved)} />
+          <QualityRow
+            label="holder new"
+            value={quality.holderCoverageNewLaunchPct == null ? "—" : pct(quality.holderCoverageNewLaunchPct, 0)}
+          />
+          <QualityRow
+            label="holder early"
+            value={quality.holderCoverageEarlyPct == null ? "—" : pct(quality.holderCoverageEarlyPct, 0)}
+          />
+          <QualityRow
+            label="holder emerging"
+            value={quality.holderCoverageEmergingPct == null ? "—" : pct(quality.holderCoverageEmergingPct, 0)}
+          />
+          <QualityRow
+            label="security"
+            value={quality.securityCoveragePct == null ? "—" : pct(quality.securityCoveragePct, 0)}
+          />
+          <QualityRow
+            label="price coverage"
+            value={quality.priceCoveragePct == null ? "—" : pct(quality.priceCoveragePct, 0)}
+          />
+          <QualityRow
+            label="HIGH conf"
+            value={quality.highConfidencePct == null ? "—" : pct(quality.highConfidencePct, 0)}
+          />
+          <QualityRow
+            label="MED conf"
+            value={quality.mediumConfidencePct == null ? "—" : pct(quality.mediumConfidencePct, 0)}
+          />
+          <QualityRow
+            label="LOW conf"
+            value={quality.lowConfidencePct == null ? "—" : pct(quality.lowConfidencePct, 0)}
+          />
+          <QualityRow
+            label="UNK conf"
+            value={quality.unknownConfidencePct == null ? "—" : pct(quality.unknownConfidencePct, 0)}
+          />
+          <QualityRow label="grade A/B" value={`${quality.gradeA + quality.gradeB}`} />
+          <QualityRow label="grade C" value={`${quality.gradeC}`} />
+          <QualityRow label="research-only" value={`${quality.researchOnly}`} />
+          <QualityRow
+            label="jup routable"
+            value={compact(quality.routeCoverage?.routable ?? 0)}
+          />
+          <QualityRow
+            label="jup no-route"
+            value={compact(quality.routeCoverage?.noRoute ?? 0)}
+          />
+          <QualityRow
+            label="jup timeout"
+            value={compact(quality.routeCoverage?.timeout ?? 0)}
+          />
+          <QualityRow
+            label="not checked"
+            value={compact(quality.routeCoverage?.notChecked ?? 0)}
+          />
+          <QualityRow
+            label="p95 path gap"
+            value={quality.p95PathGapMs == null ? "—" : `${(quality.p95PathGapMs / 1000).toFixed(0)}s`}
+          />
+          <QualityRow label="disagreements / h" value={compact(quality.disagreementsHour)} />
+          <QualityRow label="provider fails / h" value={compact(quality.providerFailuresHour)} />
+        </div>
+      </div>
+      <div className="border-b border-border px-4 py-3 sm:px-5">
+        <p className="mb-2 text-xs uppercase tracking-wider text-subtle">Edge score monotonicity · replay diagnostic</p>
+        {edge ? (
+          <div>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+              <QualityRow label="verdict" value={edge.verdict.replaceAll("_", " ")} />
+              <QualityRow label="labeled pairs" value={compact(edge.n)} />
+              <QualityRow label="unique tokens" value={compact(edge.uniqueTokens)} />
+              <QualityRow
+                label="spearman 15m"
+                value={edge.spearman15m == null ? "—" : edge.spearman15m.toFixed(2)}
+              />
+              <QualityRow
+                label="kendall 15m"
+                value={edge.kendall15m == null ? "—" : edge.kendall15m.toFixed(2)}
+              />
+              <QualityRow
+                label="spearman exec"
+                value={edge.spearmanExec == null ? "—" : edge.spearmanExec.toFixed(2)}
+              />
+            </div>
+            <div className="mt-2 grid max-w-xl grid-cols-5 gap-2 font-mono text-xs">
+              {edge.bucketMedians15m.map((b) => (
+                <div key={b.bucket}>
+                  <div className="text-subtle">{b.bucket}</div>
+                  <div className="tabular-nums text-muted">
+                    {b.median == null ? "—" : pct(b.median)} · n {b.n}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <p className="mt-2 text-xs text-subtle">{edge.note}</p>
+          </div>
+        ) : (
+          <p className="text-xs text-subtle">Computing edge ordering from labeled warehouse rows…</p>
+        )}
       </div>
       <div className="grid gap-4 border-b border-border px-4 py-3 sm:grid-cols-2 sm:px-5">
         <div>
@@ -791,6 +945,15 @@ function StatBox({ label, value }: { label: string; value: string }) {
     <div className="bg-bg px-3 py-2">
       <div className="text-xs uppercase tracking-wider text-subtle">{label}</div>
       <div className="font-mono text-sm tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+function QualityRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-2">
+      <span className="text-subtle">{label}</span>
+      <span className="tabular-nums text-muted">{value}</span>
     </div>
   );
 }
