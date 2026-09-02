@@ -1,4 +1,5 @@
 export type CircuitState = "HEALTHY" | "DEGRADED" | "OPEN_CIRCUIT" | "OFFLINE";
+export type CircuitPhase = "CLOSED" | "OPEN" | "HALF_OPEN";
 
 export class CircuitBreaker {
   failureThreshold: number;
@@ -6,17 +7,25 @@ export class CircuitBreaker {
   failures = 0;
   openedAt: number | null = null;
   lastError: string | null = null;
+  halfOpenProbes = 0;
+  maxHalfOpenProbes = 1;
 
   constructor(failureThreshold = 5, resetMs = 60_000) {
     this.failureThreshold = failureThreshold;
     this.resetMs = resetMs;
   }
 
+  phase(now = Date.now()): CircuitPhase {
+    if (this.openedAt == null) return "CLOSED";
+    if (now - this.openedAt < this.resetMs) return "OPEN";
+    return "HALF_OPEN";
+  }
+
   canCall(now = Date.now()): boolean {
     if (this.openedAt == null) return true;
-    if (now - this.openedAt >= this.resetMs) {
-      this.failures = 0;
-      this.openedAt = null;
+    if (now - this.openedAt < this.resetMs) return false;
+    if (this.halfOpenProbes < this.maxHalfOpenProbes) {
+      this.halfOpenProbes += 1;
       return true;
     }
     return false;
@@ -30,12 +39,21 @@ export class CircuitBreaker {
     this.failures = 0;
     this.openedAt = null;
     this.lastError = null;
+    this.halfOpenProbes = 0;
   }
 
   failure(message?: string, now = Date.now()) {
     this.failures += 1;
     this.lastError = message ?? this.lastError;
-    if (this.failures >= this.failureThreshold) this.openedAt = now;
+    if (this.openedAt != null) {
+      this.openedAt = now;
+      this.halfOpenProbes = 0;
+      return;
+    }
+    if (this.failures >= this.failureThreshold) {
+      this.openedAt = now;
+      this.halfOpenProbes = 0;
+    }
   }
 
   state(): CircuitState {

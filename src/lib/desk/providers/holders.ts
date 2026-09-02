@@ -4,6 +4,7 @@ import { solanaRpc } from "./solana.ts";
 import { deskSettings } from "../config.ts";
 import { breakerFor } from "../circuit.ts";
 import { bucketOf, type UniverseBucket } from "../buckets.ts";
+import { makeHolderJob, takeHolderJobs, type HolderLookupJob } from "../holder-queue.ts";
 
 export type HolderObs = {
   holders: number | null;
@@ -60,6 +61,18 @@ function asPct(n: number | null | undefined) {
 
 function valid(obs: HolderObs | null): obs is HolderObs {
   return Boolean(obs && (obs.top10Pct != null || obs.holders != null) && obs.status === "VALID");
+}
+
+export function unknownHolderObs(errors: HolderObs["errors"] = []): HolderObs {
+  return {
+    holders: null,
+    top10Pct: null,
+    top20Pct: null,
+    largestPct: null,
+    source: "solana",
+    status: "UNKNOWN",
+    errors,
+  };
 }
 
 export function parseRugcheckReport(body: {
@@ -227,7 +240,7 @@ async function rugcheckHolders(mint: string): Promise<HolderObs | null> {
   const circuit = breakerFor("rugcheck:holders");
   if (!circuit.canCall()) throw new Error("circuit open");
   const r = await fetch(`https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mint)}/report`, {
-    headers: { accept: "application/json", "user-agent": "meridian-research/3.3a1" },
+    headers: { accept: "application/json", "user-agent": "meridian-research/3.3a2" },
     signal: AbortSignal.timeout(8000),
   });
   if (!r.ok) {
@@ -284,22 +297,14 @@ export async function getHolderConcentration(
     return staleFallback;
   }
 
-  const unknown: HolderObs = {
-    holders: null,
-    top10Pct: null,
-    top20Pct: null,
-    largestPct: null,
-    source: "solana",
-    status: "UNKNOWN",
-    errors,
-  };
+  const unknown: HolderObs = unknownHolderObs(errors);
   cache.set(mint, { at: Date.now(), ttl: UNKNOWN_TTL, value: unknown });
   return unknown;
 }
 
 export async function enrichHolders(
   tokens: TokenSnapshot[],
-  opts?: { priority?: string[] },
+  opts?: { priority?: string[]; jobs?: HolderLookupJob[] },
 ): Promise<{
   tokens: TokenSnapshot[];
   sources: SourceHealth[];
@@ -307,13 +312,19 @@ export async function enrichHolders(
 }> {
   const t0 = Date.now();
   const settings = deskSettings();
+  const jobs =
+    opts?.jobs ??
+    tokens.map((t) =>
+      makeHolderJob(t.address, {
+        ageS: t.createdAt ? (Date.now() - t.createdAt) / 1000 : null,
+      }),
+    );
   const pri = new Set(opts?.priority ?? []);
-  const ordered = [...tokens.filter((t) => pri.has(t.address)), ...tokens.filter((t) => !pri.has(t.address))];
-  const targets = ordered.slice(0, MAX_PER_TICK);
+  const boosted = jobs.map((j) => (pri.has(j.mint) ? { ...j, priority: Math.min(j.priority, 1) } : j));
+  const targets = takeHolderJobs(boosted, MAX_PER_TICK);
   const results = await Promise.all(
-    targets.map(async (t) => {
-      const ageS = t.createdAt ? (Date.now() - t.createdAt) / 1000 : null;
-      return { address: t.address, h: await getHolderConcentration(t.address, { bucket: bucketOf(ageS) }) };
+    targets.map(async (job) => {
+      return { address: job.mint, h: await getHolderConcentration(job.mint, { bucket: job.bucket }) };
     }),
   );
   const by = new Map(results.map((r) => [r.address, r.h]));

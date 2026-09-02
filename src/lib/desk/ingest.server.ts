@@ -2,10 +2,14 @@ import { bucketOf, bucketRank } from "./buckets";
 import { discoverDexScreener, enrichDexScreener, fetchSolPriceDex, lookupDexTokens } from "./providers/dexscreener";
 import { fetchGeckoPools } from "./providers/gecko";
 import { enrichHolders } from "./providers/holders";
-import { quoteSolUsdc, quoteToken } from "./providers/jupiter";
+import { quoteSolUsdc, quoteToken, cachedQuoteAge } from "./providers/jupiter";
 import { mergeSnap } from "./providers/normalize";
 import { enrichSolana } from "./providers/solana";
 import type { MarketTape, SourceHealth, TokenSnapshot } from "./schema";
+import { makeHolderJob } from "./holder-queue";
+import { routePriority, selectRouteJobs, shouldRefreshRoute } from "./route-priority";
+import { deskSettings } from "./config";
+import { budgetFor } from "./rate-budget";
 
 function health(
   id: SourceHealth["id"],
@@ -33,6 +37,7 @@ export async function ingestTape(opts?: {
   held?: string[];
   focus?: string | null;
   watch?: string[];
+  pending?: string[];
 }): Promise<MarketTape> {
   const key = `${[...(opts?.held ?? [])].sort().join(",")}|${opts?.focus ?? ""}|${[...(opts?.watch ?? [])].sort().join(",")}`;
   if (cache && cache.key === key && Date.now() - cache.at < TTL && cache.tape.tokens.length) return cache.tape;
@@ -70,61 +75,126 @@ export async function ingestTape(opts?: {
   }
 }
 
-export async function ingestActive(opts: {
+export async function ingestFastPath(opts: {
   tape: MarketTape;
   mints: string[];
 }): Promise<MarketTape> {
   const t0 = Date.now();
   const want = new Set(opts.mints);
-  const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, 12);
-  if (!targets.length || !opts.tape.solPriceUsd) return opts.tape;
+  const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, deskSettings().maxActiveWatches);
+  if (!targets.length) return opts.tape;
   const dex = await enrichDexScreener(targets);
-  const holders = await enrichHolders(dex.tokens, { priority: opts.mints });
-  const quoted = holders.tokens;
-  const results = await Promise.all(
-    quoted.map(async (t) => {
-      try {
-        const q = await quoteToken({
-          mint: t.address,
-          decimals: t.decimals,
-          priceUsd: t.priceUsd.value,
-          solPriceUsd: opts.tape.solPriceUsd!,
-          notionalUsd: 120,
-        });
-        return { addr: t.address, q };
-      } catch {
-        return { addr: t.address, q: null };
-      }
-    }),
-  );
-  const byBuy = new Map(results.map((r) => [r.addr, r.q?.buy]));
-  const bySell = new Map(results.map((r) => [r.addr, r.q?.sell]));
-  const byFresh = new Map(quoted.map((t) => [t.address, t]));
-  const tokens = opts.tape.tokens.map((t) => {
-    const fresh = byFresh.get(t.address);
-    const base = fresh ?? t;
-    return {
-      ...base,
-      buyQuote: byBuy.get(t.address) ?? base.buyQuote,
-      sellQuote: bySell.get(t.address) ?? base.sellQuote,
-    };
-  });
+  const byFresh = new Map(dex.tokens.map((t) => [t.address, t]));
+  const tokens = opts.tape.tokens.map((t) => byFresh.get(t.address) ?? t);
   return {
     ...opts.tape,
     tokens,
     ingestedAt: Date.now(),
+    eventTime: Date.now(),
     fetchMs: Date.now() - t0,
   };
+}
+
+export async function ingestSlowEnrichment(opts: {
+  tape: MarketTape;
+  mints: string[];
+  held?: string[];
+  pending?: string[];
+}): Promise<MarketTape> {
+  const t0 = Date.now();
+  const want = new Set(opts.mints);
+  const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, deskSettings().maxActiveWatches);
+  if (!targets.length) return opts.tape;
+  const held = new Set(opts.held ?? []);
+  const pending = new Set(opts.pending ?? []);
+  const jobs = targets.map((t) =>
+    makeHolderJob(t.address, {
+      held: held.has(t.address),
+      candidate: pending.has(t.address),
+      ageS: t.createdAt ? (Date.now() - t.createdAt) / 1000 : null,
+    }),
+  );
+  const holders = await enrichHolders(targets, { jobs, priority: opts.mints });
+  const quoted = await quotePriorityTargets(holders.tokens, opts.tape.solPriceUsd, {
+    held,
+    pending,
+    focus: want,
+  });
+  const by = new Map(quoted.map((t) => [t.address, t]));
+  return {
+    ...opts.tape,
+    tokens: opts.tape.tokens.map((t) => by.get(t.address) ?? t),
+    ingestedAt: Date.now(),
+    fetchMs: Date.now() - t0,
+    sources: [...opts.tape.sources.filter((s) => s.id !== "rugcheck" && s.id !== "birdeye" && s.id !== "helius"), ...holders.sources],
+  };
+}
+
+/** @deprecated slow path — prefer ingestFastPath for 3s ticks */
+export async function ingestActive(opts: { tape: MarketTape; mints: string[] }): Promise<MarketTape> {
+  return ingestFastPath(opts);
 }
 
 function vol(t: TokenSnapshot) {
   return t.volume1hUsd.value ?? t.volume5mUsd.value ?? 0;
 }
 
+async function quotePriorityTargets(
+  tokens: TokenSnapshot[],
+  solPriceUsd: number | null,
+  ctx: { held: Set<string>; pending: Set<string>; focus: Set<string> },
+): Promise<TokenSnapshot[]> {
+  if (!solPriceUsd) return tokens;
+  const settings = deskSettings();
+  const limit = settings.jupiterApiKey ? 8 : 3;
+  const now = Date.now();
+  const jobs = tokens.map((t) => {
+    const reason = ctx.held.has(t.address)
+      ? ("OPEN_POSITION" as const)
+      : ctx.pending.has(t.address)
+        ? ("CANDIDATE" as const)
+        : ctx.focus.has(t.address)
+          ? ("NEAR_THRESHOLD" as const)
+          : ("RESEARCH" as const);
+    return { mint: t.address, priority: routePriority(reason), reason };
+  });
+  const selected = selectRouteJobs(
+    jobs.filter((j) => shouldRefreshRoute({ lastQuotedAt: cachedQuoteAge(j.mint), now, priority: j.priority })),
+    limit,
+  );
+  const budget = budgetFor("jupiter");
+  const quoteMap = new Map<string, TokenSnapshot["buyQuote"]>();
+  const sellMap = new Map<string, TokenSnapshot["sellQuote"]>();
+  for (const job of selected) {
+    if (!budget.take()) break;
+    const t = tokens.find((x) => x.address === job.mint);
+    if (!t) continue;
+    try {
+      const q = await quoteToken({
+        mint: t.address,
+        decimals: t.decimals,
+        priceUsd: t.priceUsd.value,
+        solPriceUsd,
+        notionalUsd: 120,
+      });
+      quoteMap.set(t.address, q.buy);
+      sellMap.set(t.address, q.sell);
+    } catch {
+      /* keep last quote */
+    }
+  }
+  return tokens.map((t) => ({
+    ...t,
+    buyQuote: quoteMap.get(t.address) ?? t.buyQuote,
+    sellQuote: sellMap.get(t.address) ?? t.sellQuote,
+  }));
+}
+
 async function ingestOnce(opts?: {
   held?: string[];
   focus?: string | null;
   watch?: string[];
+  pending?: string[];
 }): Promise<MarketTape> {
   const t0 = Date.now();
   const pin = [...new Set([...(opts?.held ?? []), ...(opts?.focus ? [opts.focus] : []), ...(opts?.watch ?? [])])].slice(
@@ -176,55 +246,34 @@ async function ingestOnce(opts?: {
   const dex = await enrichDexScreener(selected);
   let solPrice = gecko.solPrice ?? (await fetchSolPriceDex());
 
-  const jupProbe = await quoteSolUsdc();
-  if (jupProbe.available && Number(jupProbe.outAmount) > 0) {
-    solPrice = Number(jupProbe.outAmount) / 1e6 / 0.01;
-  }
-
-  const sol = await enrichSolana(dex.tokens);
-  const holders = await enrichHolders(sol.tokens, { priority: pin });
-  const enriched = holders.tokens;
-
-  const focusSet = new Set<string>(pin);
-  const young = enriched.filter((t) => {
-    const b = bucketOf(t.createdAt ? (now - t.createdAt) / 1000 : null);
-    return b === "new_launch" || b === "early" || b === "emerging";
-  });
-  const quoteTargets = [
-    ...enriched.filter((t) => focusSet.has(t.address)),
-    ...young.filter((t) => !focusSet.has(t.address)),
-    ...enriched.filter((t) => !focusSet.has(t.address) && !young.includes(t)),
-  ].slice(0, 16);
-
-  const quoteMap = new Map<string, TokenSnapshot["buyQuote"]>();
-  const sellMap = new Map<string, TokenSnapshot["sellQuote"]>();
-  if (solPrice) {
-    const results = await Promise.all(
-      quoteTargets.map(async (t) => {
-        const q = await quoteToken({
-          mint: t.address,
-          decimals: t.decimals,
-          priceUsd: t.priceUsd.value,
-          solPriceUsd: solPrice,
-          notionalUsd: 120,
-        });
-        return { addr: t.address, q };
-      }),
-    );
-    for (const r of results) {
-      quoteMap.set(r.addr, r.q.buy);
-      sellMap.set(r.addr, r.q.sell);
+  const jupBudget = budgetFor("jupiter");
+  let jupProbe = null as Awaited<ReturnType<typeof quoteSolUsdc>> | null;
+  if (jupBudget.take()) {
+    jupProbe = await quoteSolUsdc();
+    if (jupProbe.available && Number(jupProbe.outAmount) > 0) {
+      solPrice = Number(jupProbe.outAmount) / 1e6 / 0.01;
     }
   }
 
-  const quoted: TokenSnapshot[] = enriched.map((t) => ({
-    ...t,
-    buyQuote: quoteMap.get(t.address) ?? t.buyQuote,
-    sellQuote: sellMap.get(t.address) ?? t.sellQuote,
-  }));
+  const sol = await enrichSolana(dex.tokens);
+  const held = new Set(opts?.held ?? []);
+  const pending = new Set(opts?.pending ?? pin);
+  const jobs = sol.tokens.map((t) =>
+    makeHolderJob(t.address, {
+      held: held.has(t.address),
+      candidate: pending.has(t.address),
+      ageS: t.createdAt ? (now - t.createdAt) / 1000 : null,
+    }),
+  );
+  const holders = await enrichHolders(sol.tokens, { jobs, priority: pin });
+  const quoted = await quotePriorityTargets(holders.tokens, solPrice, {
+    held,
+    pending,
+    focus: new Set(pin),
+  });
 
-  const jupOk = jupProbe.available || quoted.some((t) => t.sellQuote?.available);
-  const jupLag = quoted.find((t) => t.sellQuote)?.sellQuote?.latencyMs ?? jupProbe.latencyMs;
+  const jupOk = Boolean(jupProbe?.available) || quoted.some((t) => t.sellQuote?.available);
+  const jupLag = quoted.find((t) => t.sellQuote)?.sellQuote?.latencyMs ?? jupProbe?.latencyMs ?? null;
   const geckoOk = gecko.tokens.length > 0 && !gecko.error;
   const geckoDegraded = Boolean(gecko.error) && gecko.tokens.length > 0;
   const holderSources = holders.sources;
@@ -246,7 +295,7 @@ async function ingestOnce(opts?: {
       dsDisc.lagMs,
       dsDisc.error ?? `${dsDisc.tokens.length} discovered`,
     ),
-    health("jupiter", jupOk, jupLag, jupOk ? "read-only quotes" : jupProbe.error ?? "no route"),
+    health("jupiter", jupOk, jupLag, jupOk ? "read-only quotes" : jupProbe?.error ?? "deferred"),
     health(
       "solana",
       solLive || Boolean(rpcHolders?.status === "live"),

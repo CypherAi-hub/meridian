@@ -62,8 +62,11 @@ export function DeskApp() {
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
           <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
-          <p className="hidden text-xs text-muted lg:block">V3.3A.1 · training-grade memory</p>
+          <p className="hidden text-xs text-muted lg:block">V3.3A.2 · data factory</p>
         </div>
+        <Badge variant={desk.worker.db === "neon" ? "up" : "warn"}>
+          {(desk.quality?.environment ?? "preview").toUpperCase()} / {(desk.worker.db ?? "pglite").toUpperCase()}
+        </Badge>
         <Badge variant={desk.worker.status === "live" ? "up" : desk.worker.status === "starting" ? "warn" : "down"}>
           {desk.worker.status === "live"
             ? "Worker live"
@@ -110,6 +113,7 @@ export function DeskApp() {
         error={desk.feedError}
         worker={desk.worker}
       />
+      <ConfigStrip />
 
       <div className="flex items-center gap-1 overflow-x-auto border-b border-border px-2 sm:hidden">
         {TABS.map((id) => (
@@ -631,6 +635,44 @@ function SourceStrip({
   );
 }
 
+function ConfigStrip() {
+  const [cfg, setCfg] = useState<{
+    environment?: string;
+    collectionEpoch?: string;
+    configured?: {
+      birdeye?: boolean;
+      helius?: boolean;
+      jupiterMode?: string;
+      rpc?: string;
+      database?: string;
+    };
+  } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void fetch("/api/health", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload) => {
+        if (alive && payload?.public) setCfg(payload.public);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+  if (!cfg) return null;
+  const c = cfg.configured ?? {};
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-4 py-1.5 font-mono text-[10px] uppercase tracking-wider text-muted sm:px-6">
+      <span>birdeye {c.birdeye ? "configured" : "unconfigured"}</span>
+      <span>helius {c.helius ? "configured" : "unconfigured"}</span>
+      <span>jupiter {c.jupiterMode ?? "keyless"}</span>
+      <span>rpc {c.rpc ?? "public"}</span>
+      <span>db {c.database ?? "PGLITE"}</span>
+      <span>epoch {cfg.collectionEpoch ?? "—"}</span>
+    </div>
+  );
+}
+
 function ResearchPanel({
   summary,
   rows,
@@ -734,6 +776,36 @@ function ResearchPanel({
           {rh.blockers.length ? ` · ${rh.blockers[0]}` : ""}
           {rh.blockers.length > 1 ? ` · +${rh.blockers.length - 1} more` : ""}
         </p>
+        <p className="mb-2 font-mono text-xs text-subtle">
+          epoch {quality.collectionEpoch ?? "—"} · env {quality.environment ?? "preview"} · soak{" "}
+          {quality.productionSoakStartedAtMs ? "production" : "preview-not-counted"}
+        </p>
+        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">Current collection epoch</p>
+        <div className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+          <QualityRow label="epoch tokens" value={compact(quality.epochUniqueTokens ?? 0)} />
+          <QualityRow label="epoch A/B" value={`${(quality.epochGradeA ?? 0) + (quality.epochGradeB ?? 0)}`} />
+          <QualityRow
+            label="epoch HIGH+MED"
+            value={
+              quality.epochHighConfidencePct == null && quality.epochMediumConfidencePct == null
+                ? "—"
+                : pct((quality.epochHighConfidencePct ?? 0) + (quality.epochMediumConfidencePct ?? 0), 0)
+            }
+          />
+          <QualityRow
+            label="holder @ decision"
+            value={quality.holderCoverageAtDecisionPct == null ? "—" : pct(quality.holderCoverageAtDecisionPct, 0)}
+          />
+          <QualityRow
+            label="active miss"
+            value={quality.activeDeadlineMissPct == null ? "—" : pct(quality.activeDeadlineMissPct, 0)}
+          />
+          <QualityRow label="veto holder unk" value={compact(quality.vetoHolderUnknown ?? 0)} />
+          <QualityRow label="veto holder conc" value={compact(quality.vetoHolderConcentration ?? 0)} />
+          <QualityRow label="veto route" value={compact(quality.vetoRoute ?? 0)} />
+          <QualityRow label="veto security" value={compact(quality.vetoSecurity ?? 0)} />
+        </div>
+        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">Lifetime corpus</p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
           <QualityRow label="tokens observed" value={compact(quality.tokensObserved)} />
           <QualityRow label="raw observations" value={compact(quality.rawObservations)} />

@@ -4,6 +4,9 @@ import { emptyQuality, type DataQuality } from "./types";
 import { configuredProviders, publicConfig } from "./config";
 import { breakerFor } from "./circuit";
 import { researchHealth } from "./research-health";
+import { currentEpochName, meridianEnvironment, officialSoakAllowed } from "./env";
+import { classifyVeto } from "./veto-report";
+import { providerCounters } from "./providers/jupiter";
 
 function num(v: unknown, d = 0) {
   const n = typeof v === "number" ? v : Number(v);
@@ -270,9 +273,11 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   )[0];
   quality.universeAvgGapMs = universeGap?.avg_ms == null ? quality.avgObservationIntervalMs : num(universeGap.avg_ms);
   const activeGap = (
-    await q<{ avg_ms: number | null; p95_ms: number | null }>(
+    await q<{ avg_ms: number | null; p95_ms: number | null; med_ms: number | null }>(
       db,
-      `select avg(delta)::float as avg_ms, percentile_cont(0.95) within group (order by delta)::float as p95_ms
+      `select avg(delta)::float as avg_ms,
+              percentile_cont(0.95) within group (order by delta)::float as p95_ms,
+              percentile_cont(0.5) within group (order by delta)::float as med_ms
        from (
          select p.event_time_ms - lag(p.event_time_ms) over (partition by p.token_mint order by p.event_time_ms) as delta
          from token_path_samples p
@@ -284,8 +289,134 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   )[0];
   quality.activeAvgGapMs = activeGap?.avg_ms == null ? quality.avgPathIntervalMs : num(activeGap.avg_ms);
   quality.activeP95GapMs = activeGap?.p95_ms == null ? quality.p95PathGapMs : num(activeGap.p95_ms);
+  quality.activeMedianGapMs = activeGap?.med_ms == null ? quality.activeAvgGapMs : num(activeGap.med_ms);
   const soak = (await q<{ soak_started_at_ms: number | null }>(db, `select soak_started_at_ms from desk_state where id = 1`))[0];
   quality.soakStartedAtMs = soak?.soak_started_at_ms == null ? null : num(soak.soak_started_at_ms);
+  quality.environment = meridianEnvironment();
+  quality.collectionEpoch = currentEpochName();
+  const epochName = currentEpochName();
+  const epochGrades = (
+    await q<{ a: number; b: number; c: number; r: number; tokens: number }>(
+      db,
+      `select
+         count(*) filter (where coalesce(research_grade_v2, research_grade) = 'TRAINING_GRADE_A')::int as a,
+         count(*) filter (where coalesce(research_grade_v2, research_grade) = 'TRAINING_GRADE_B')::int as b,
+         count(*) filter (where coalesce(research_grade_v2, research_grade) = 'TRAINING_GRADE_C')::int as c,
+         count(*) filter (where coalesce(research_grade_v2, research_grade) = 'RESEARCH_ONLY')::int as r,
+         count(distinct mint)::int as tokens
+       from candidate_considerations
+       where collection_epoch_id = $1`,
+      [epochName],
+    )
+  )[0];
+  quality.epochGradeA = num(epochGrades?.a);
+  quality.epochGradeB = num(epochGrades?.b);
+  quality.epochGradeC = num(epochGrades?.c);
+  quality.epochResearchOnly = num(epochGrades?.r);
+  quality.epochUniqueTokens = num(epochGrades?.tokens);
+  const epochConf = (
+    await q<{ high: number | null; med: number | null }>(
+      db,
+      `select
+         avg(case when o.barrier_label_confidence = 'HIGH' then 1.0 else 0.0 end)::float as high,
+         avg(case when o.barrier_label_confidence = 'MEDIUM' then 1.0 else 0.0 end)::float as med
+       from outcome_labels o
+       join candidate_considerations c on c.decision_id = o.decision_id
+       where c.collection_epoch_id = $1 and o.labels_complete`,
+      [epochName],
+    )
+  )[0];
+  quality.epochHighConfidencePct = epochConf?.high == null ? null : num(epochConf.high);
+  quality.epochMediumConfidencePct = epochConf?.med == null ? null : num(epochConf.med);
+  const atDecision = (
+    await q<{ pct: number | null }>(
+      db,
+      `select avg(case when holder_concentration is not null then 1.0 else 0.0 end)::float as pct
+       from candidate_considerations
+       where collection_epoch_id = $1`,
+      [epochName],
+    )
+  )[0];
+  quality.holderCoverageAtDecisionPct = atDecision?.pct == null ? null : num(atDecision.pct);
+  quality.epochHolderCoveragePct = quality.holderCoverageAtDecisionPct;
+  const activeHolders = (
+    await q<{ pct: number | null }>(
+      db,
+      `select avg(case when o.top_10_holder_pct is not null then 1.0 else 0.0 end)::float as pct
+       from market_observations o
+       join token_watch_state w on w.token_mint = o.mint
+       where w.tier = 'active' and coalesce(o.ingested_at_ms, o.observed_at_ms) > $1`,
+      [since],
+    )
+  )[0];
+  quality.holderCoverageActiveWatchPct = activeHolders?.pct == null ? null : num(activeHolders.pct);
+  const candHolders = (
+    await q<{ pct: number | null }>(
+      db,
+      `select avg(case when holder_concentration is not null then 1.0 else 0.0 end)::float as pct
+       from candidate_considerations where governor_result is not null`,
+    )
+  )[0];
+  quality.holderCoverageCandidatesPct = candHolders?.pct == null ? null : num(candHolders.pct);
+  const miss = (
+    await q<{ pct: number | null; med: number | null }>(
+      db,
+      `select avg(case when deadline_missed then 1.0 else 0.0 end)::float as pct,
+              percentile_cont(0.5) within group (order by total_delay_ms)::float as med
+       from watch_execution_stats
+       where tier = 'active' and created_at_ms > $1`,
+      [since],
+    )
+  )[0];
+  quality.activeDeadlineMissPct = miss?.pct == null ? null : num(miss.pct);
+  const vetoRows = await q<{ code: string | null; n: number }>(
+    db,
+    `select veto_reason_code as code, count(*)::int as n
+     from candidate_considerations
+     where governor_result = 'vetoed'
+     group by veto_reason_code`,
+  );
+  quality.vetoHolderUnknown = 0;
+  quality.vetoHolderConcentration = 0;
+  quality.vetoSecurity = 0;
+  quality.vetoRoute = 0;
+  quality.vetoLiquidity = 0;
+  quality.vetoRegime = 0;
+  quality.vetoFreshness = 0;
+  quality.vetoOther = 0;
+  for (const row of vetoRows) {
+    const bucket = classifyVeto(row.code);
+    const n = num(row.n);
+    if (bucket === "HOLDER_UNKNOWN") quality.vetoHolderUnknown += n;
+    else if (bucket === "HOLDER_CONCENTRATION") quality.vetoHolderConcentration += n;
+    else if (bucket === "SECURITY") quality.vetoSecurity += n;
+    else if (bucket === "ROUTE") quality.vetoRoute += n;
+    else if (bucket === "LIQUIDITY") quality.vetoLiquidity += n;
+    else if (bucket === "REGIME") quality.vetoRegime += n;
+    else if (bucket === "FRESHNESS") quality.vetoFreshness += n;
+    else quality.vetoOther += n;
+  }
+  const prodSoak = (
+    await q<{ value: unknown }>(db, `select value from warehouse_metadata where key = 'production_soak_started_at'`)
+  )[0];
+  if (prodSoak?.value && typeof prodSoak.value === "object" && prodSoak.value && "ms" in (prodSoak.value as object)) {
+    quality.productionSoakStartedAtMs = num((prodSoak.value as { ms: number }).ms);
+  } else if (!officialSoakAllowed()) {
+    quality.productionSoakStartedAtMs = null;
+  }
+  const epochRoute = (
+    await q<{ checks: number; notchecked: number }>(
+      db,
+      `select count(*)::int as checks,
+              count(*) filter (where route_status is null or route_status = 'UNKNOWN' or route_failure_reason = 'NOT_CHECKED')::int as notchecked
+       from market_observations
+       where collection_epoch_id = $1`,
+      [epochName],
+    )
+  )[0];
+  if (epochRoute?.checks) {
+    quality.epochRouteCheckCoveragePct = (epochRoute.checks - num(epochRoute.notchecked)) / epochRoute.checks;
+  }
   return quality;
 }
 
@@ -403,6 +534,10 @@ export async function loadHealthPayload() {
   const rh = researchHealth(quality);
   const soakHours =
     quality.soakStartedAtMs == null ? 0 : Math.max(0, (Date.now() - quality.soakStartedAtMs) / 3_600_000);
+  const prodSoakHours =
+    quality.productionSoakStartedAtMs == null
+      ? 0
+      : Math.max(0, (Date.now() - quality.productionSoakStartedAtMs) / 3_600_000);
   return {
     status: status === "live" ? "ok" : "degraded",
     worker: {
@@ -438,7 +573,9 @@ export async function loadHealthPayload() {
     research: {
       status: rh.status,
       blockers: rh.blockers,
+      blockingReasons: rh.blockingReasons,
       holderCoverage: quality.holderCoveragePct,
+      holderCoverageAtDecision: quality.holderCoverageAtDecisionPct,
       routeCheckCoverage: quality.routeCheckCoveragePct,
       highMediumBarrierCoverage: (quality.highConfidencePct ?? 0) + (quality.mediumConfidencePct ?? 0),
       gradeABCoverage: (() => {
@@ -447,9 +584,42 @@ export async function loadHealthPayload() {
       })(),
       uniqueTokens: quality.uniqueTokens,
       soakHours,
-      soak: soakHours >= 72 ? "COMPLETE" : quality.soakStartedAtMs ? "RUNNING" : "NOT STARTED",
+      soak: officialSoakAllowed()
+        ? prodSoakHours >= 72
+          ? "COMPLETE"
+          : quality.productionSoakStartedAtMs
+            ? "RUNNING"
+            : "NOT STARTED"
+        : "PREVIEW_NOT_COUNTED",
+      productionSoakHours: prodSoakHours,
       worker: status,
       database: "HEALTHY",
+      epoch: quality.collectionEpoch,
+      environment: quality.environment,
+      jupiter429s: providerCounters.jupiter429,
+      lifetime: {
+        uniqueTokens: quality.uniqueTokens,
+        gradeAB: (() => {
+          const n = quality.gradeA + quality.gradeB + quality.gradeC + quality.researchOnly;
+          return n ? (quality.gradeA + quality.gradeB) / n : 0;
+        })(),
+        highMedium: (quality.highConfidencePct ?? 0) + (quality.mediumConfidencePct ?? 0),
+        holder: quality.holderCoveragePct,
+      },
+      currentEpoch: {
+        uniqueTokens: quality.epochUniqueTokens ?? 0,
+        gradeAB: (() => {
+          const n =
+            (quality.epochGradeA ?? 0) +
+            (quality.epochGradeB ?? 0) +
+            (quality.epochGradeC ?? 0) +
+            (quality.epochResearchOnly ?? 0);
+          return n ? ((quality.epochGradeA ?? 0) + (quality.epochGradeB ?? 0)) / n : 0;
+        })(),
+        highMedium: (quality.epochHighConfidencePct ?? 0) + (quality.epochMediumConfidencePct ?? 0),
+        holderAtDecision: quality.holderCoverageAtDecisionPct,
+        routeCheck: quality.epochRouteCheckCoveragePct,
+      },
     },
   };
 }

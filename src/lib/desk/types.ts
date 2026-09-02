@@ -214,6 +214,12 @@ export type LedgerRow = {
   execution_adjusted_return: number | null;
   research_quality_score: number | null;
   research_grade: ResearchGrade | null;
+  input_quality_score?: number | null;
+  label_quality_score?: number | null;
+  research_quality_v2?: number | null;
+  research_grade_v2?: ResearchGrade | null;
+  holder_age_at_decision_ms?: number | null;
+  first_sample_delay_seconds?: number | null;
   provider_disagreement: boolean;
   labels_complete: boolean;
   outcome: string;
@@ -312,6 +318,31 @@ export type DataQuality = {
   activeP95GapMs: number | null;
   routeCheckCoveragePct: number | null;
   soakStartedAtMs: number | null;
+  holderCoverageAtDecisionPct: number | null;
+  holderCoverageActiveWatchPct: number | null;
+  holderCoverageCandidatesPct: number | null;
+  activeDeadlineMissPct: number | null;
+  activeMedianGapMs: number | null;
+  environment?: string;
+  collectionEpoch?: string;
+  epochUniqueTokens?: number;
+  epochGradeA?: number;
+  epochGradeB?: number;
+  epochGradeC?: number;
+  epochResearchOnly?: number;
+  epochHighConfidencePct?: number | null;
+  epochMediumConfidencePct?: number | null;
+  epochHolderCoveragePct?: number | null;
+  epochRouteCheckCoveragePct?: number | null;
+  vetoHolderUnknown?: number;
+  vetoHolderConcentration?: number;
+  vetoSecurity?: number;
+  vetoRoute?: number;
+  vetoLiquidity?: number;
+  vetoRegime?: number;
+  vetoFreshness?: number;
+  vetoOther?: number;
+  productionSoakStartedAtMs?: number | null;
 };
 
 export type DeskSnapshot = {
@@ -397,6 +428,31 @@ export function emptyQuality(): DataQuality {
     activeP95GapMs: null,
     routeCheckCoveragePct: null,
     soakStartedAtMs: null,
+    holderCoverageAtDecisionPct: null,
+    holderCoverageActiveWatchPct: null,
+    holderCoverageCandidatesPct: null,
+    activeDeadlineMissPct: null,
+    activeMedianGapMs: null,
+    environment: undefined,
+    collectionEpoch: undefined,
+    epochUniqueTokens: 0,
+    epochGradeA: 0,
+    epochGradeB: 0,
+    epochGradeC: 0,
+    epochResearchOnly: 0,
+    epochHighConfidencePct: null,
+    epochMediumConfidencePct: null,
+    epochHolderCoveragePct: null,
+    epochRouteCheckCoveragePct: null,
+    vetoHolderUnknown: 0,
+    vetoHolderConcentration: 0,
+    vetoSecurity: 0,
+    vetoRoute: 0,
+    vetoLiquidity: 0,
+    vetoRegime: 0,
+    vetoFreshness: 0,
+    vetoOther: 0,
+    productionSoakStartedAtMs: null,
   };
 }
 

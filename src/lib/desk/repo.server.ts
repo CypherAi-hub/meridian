@@ -9,8 +9,14 @@ import { loadQuality } from "./quality.server";
 import { FEATURE_ENGINE_VERSION, FEATURE_SCHEMA, FEATURE_SCHEMA_HASH, LABEL_DEFINITION, LABEL_DEFINITION_VERSION, EXECUTION_ASSUMPTION, EXECUTION_ASSUMPTION_VERSION } from "./versions";
 import { STRATEGIES } from "./strategies";
 import { requestFingerprint, observationFingerprint } from "./fingerprint";
-import { shouldPromote, ACTIVE_INTERVAL_MS, UNIVERSE_INTERVAL_MS } from "./watch";
+import { ACTIVE_INTERVAL_MS, UNIVERSE_INTERVAL_MS, researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES } from "./watch";
 import { stampResearchQuality } from "./labels";
+import { deskSettings } from "./config";
+import { currentEpochName, officialSoakAllowed, makeSoakIncident } from "./env";
+import { decideLease, PRIMARY_LEASE, LEASE_TTL_MS } from "./lease";
+import { toFastPathSample, watchDeadline } from "./fast-path";
+import { bucketOf } from "./buckets";
+import type { TokenSnapshot } from "./schema";
 import type {
   DeskSnapshot,
   Intent,
@@ -462,8 +468,16 @@ export async function persistDesk(next: DeskSnapshot, prev?: DeskSnapshot) {
       `update desk_state set soak_started_at_ms = coalesce(soak_started_at_ms, $1), code_version = $2 where id = 1`,
       [now, STRATEGY_VERSION],
     );
+    await ensureCollectionEpoch(sql, now);
+    if (officialSoakAllowed()) {
+      await sql.query(
+        `insert into warehouse_metadata (key, value, updated_at_ms) values ('production_soak_started_at', $1::jsonb, $2)
+         on conflict (key) do nothing`,
+        [JSON.stringify({ ms: now }), now],
+      );
+    }
   } catch {
-    /* 0005 */
+    /* 0005/0006 */
   }
 
   await sql.query("delete from paper_positions");
@@ -681,6 +695,14 @@ async function persistTokenObservation(sql: Sql, t: TokenLive, next: DeskSnapsho
     } catch {
       /* 0005 */
     }
+    try {
+      await sql.query(
+        `update market_observations set collection_epoch_id = coalesce(collection_epoch_id, $3) where mint = $1 and observed_at_ms = $2`,
+        [t.address, ingestedAt, currentEpochName()],
+      );
+    } catch {
+      /* 0006 */
+    }
     let obsId = inserted[0]?.id ?? null;
     if (obsId == null) {
       const found = await sql.query<{ id: number }>(
@@ -714,6 +736,14 @@ async function persistTokenObservation(sql: Sql, t: TokenLive, next: DeskSnapsho
       );
     } catch {
       /* 0004 */
+    }
+    try {
+      await sql.query(
+        `update feature_vectors set collection_epoch_id = coalesce(collection_epoch_id, $2) where observation_id = $1`,
+        [obsId, currentEpochName()],
+      );
+    } catch {
+      /* 0006 */
     }
   } catch (err) {
     console.error("[meridian] observation/feature persist", err instanceof Error ? err.message : err);
@@ -761,6 +791,14 @@ async function persistPathSample(
         Date.now(),
       ],
     );
+    try {
+      await sql.query(
+        `update token_path_samples set collection_epoch_id = $2, sample_kind = 'shared' where sample_fingerprint = $1`,
+        [fingerprint, currentEpochName()],
+      );
+    } catch {
+      /* 0006 */
+    }
   } catch {
     /* 0005 */
   }
@@ -845,6 +883,27 @@ async function insertConsideration(sql: Sql, row: LedgerRow, desk: DeskSnapshot)
     );
   } catch {
     /* 0004 */
+  }
+  try {
+    await sql.query(
+      `update candidate_considerations set
+         collection_epoch_id = $2, input_quality_score = $3, label_quality_score = $4,
+         research_quality_v2 = $5, research_grade_v2 = $6, holder_age_at_decision_ms = $7,
+         first_sample_delay_seconds = $8
+       where decision_id = $1`,
+      [
+        row.decision_id,
+        currentEpochName(),
+        row.input_quality_score ?? null,
+        row.label_quality_score ?? null,
+        row.research_quality_v2 ?? null,
+        row.research_grade_v2 ?? null,
+        row.holder_age_at_decision_ms ?? null,
+        row.first_sample_delay_seconds ?? null,
+      ],
+    );
+  } catch {
+    /* 0006 */
   }
   const frozen = { ...row, path: (row.path ?? []).slice(0, 1) };
   await sql.query(
@@ -1004,6 +1063,29 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
     );
   } catch {
     /* 0004 */
+  }
+  try {
+    await sql.query(
+      `update outcome_labels set
+         collection_epoch_id = coalesce(collection_epoch_id, $2),
+         sample_count = $3,
+         max_gap_seconds = $4,
+         median_gap_seconds = $5,
+         p95_gap_seconds = $6,
+         first_sample_delay_seconds = $7
+       where decision_id = $1`,
+      [
+        row.decision_id,
+        currentEpochName(),
+        row.path_sample_count ?? null,
+        row.max_path_gap_seconds ?? null,
+        row.avg_path_gap_seconds ?? null,
+        row.max_path_gap_seconds ?? null,
+        row.first_sample_delay_seconds ?? null,
+      ],
+    );
+  } catch {
+    /* 0006 */
   }
 }
 
@@ -1176,12 +1258,27 @@ async function persistWatches(sql: Sql, next: DeskSnapshot, now: number) {
   try {
     const pending = new Set(next.pending.filter((r) => !r.labels_complete).map((r) => r.tokenAddress));
     const held = new Set(next.positions.map((p) => p.tokenAddress));
-    for (const t of next.tokens) {
+    const ranked = next.tokens.map((t) => {
       const considered = pending.has(t.address) || held.has(t.address);
       const edge = next.lastIntent?.tokenAddress === t.address ? next.lastIntent.predictions.edgeScore : 0;
-      const active = considered || shouldPromote({ considered, edgeScore: edge });
-      const tier = active ? "active" : "universe";
+      const ageS = t.createdAt ? (now - t.createdAt) / 1000 : null;
+      const urgency = researchUrgency({
+        hasOpenPaperPosition: held.has(t.address),
+        hasPendingLabel: pending.has(t.address),
+        wasJustConsidered: considered,
+        isNewLaunch: bucketOf(ageS) === "new_launch",
+        edgeScore: edge,
+      });
+      return { mint: t.address, urgency, considered, edge };
+    });
+    const { keep, demote } = selectActiveWatches(ranked, deskSettings().maxActiveWatches ?? MAX_ACTIVE_WATCHES);
+    const keepSet = new Set(keep);
+    for (const t of next.tokens) {
+      const meta = ranked.find((r) => r.mint === t.address);
+      const considered = Boolean(meta?.considered);
+      const active = keepSet.has(t.address);
       const interval = active ? ACTIVE_INTERVAL_MS : UNIVERSE_INTERVAL_MS;
+      const demoted = demote.includes(t.address);
       await sql.query(
         `insert into token_watch_state (
            token_mint, tier, next_due_at_ms, promoted_at_ms, expires_at_ms, reason, updated_at_ms
@@ -1195,14 +1292,22 @@ async function persistWatches(sql: Sql, next: DeskSnapshot, now: number) {
            updated_at_ms = excluded.updated_at_ms`,
         [
           t.address,
-          tier,
+          active ? "active" : "universe",
           now + interval,
           active ? now : null,
           active ? now + 60 * 60_000 : null,
-          considered ? "considered" : active ? "promoted" : "universe",
+          demoted ? "capacity_demote" : considered ? "considered" : active ? "promoted" : "universe",
           now,
         ],
       );
+      try {
+        await sql.query(
+          `update token_watch_state set phase = $2, urgency = $3, demotion_reason = $4 where token_mint = $1`,
+          [t.address, active ? "ACTIVE" : demoted ? "UNIVERSE" : "UNIVERSE", meta?.urgency ?? 0, demoted ? "capacity" : null],
+        );
+      } catch {
+        /* 0006 */
+      }
     }
   } catch {
     /* 0004 */
@@ -1216,6 +1321,14 @@ export async function startWorkerTick(tickId: string, startedAt: number) {
       `insert into worker_ticks (tick_id, started_at_ms, status) values ($1,$2,'RUNNING') on conflict do nothing`,
       [tickId, startedAt],
     );
+    try {
+      await sql.query(
+        `update worker_ticks set collection_epoch_id = coalesce(collection_epoch_id, $2) where tick_id = $1`,
+        [tickId, currentEpochName()],
+      );
+    } catch {
+      /* 0006 */
+    }
   } catch {
     /* 0004 */
   }
@@ -1254,3 +1367,178 @@ export async function finishWorkerTick(
     /* 0004 */
   }
 }
+
+let epochEnsured = false;
+
+async function ensureCollectionEpoch(sql: Sql, now: number) {
+  const name = currentEpochName();
+  try {
+    await sql.query(
+      `insert into collection_epochs (id, name, started_at_ms, config, code_version, notes, created_at_ms)
+       values ($1,$2,$3,$4::jsonb,$5,$6,$7) on conflict (name) do nothing`,
+      [name, name, now, JSON.stringify({ environment: deskSettings().environment }), STRATEGY_VERSION, "v33a2 collection", now],
+    );
+    await sql.query(
+      `insert into warehouse_metadata (key, value, updated_at_ms) values ('collection_epoch', $1::jsonb, $2)
+       on conflict (key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+      [JSON.stringify({ name, driver: deskSettings().databaseDriver }), now],
+    );
+    await sql.query(
+      `insert into warehouse_metadata (key, value, updated_at_ms) values ('canonical_database', $1::jsonb, $2)
+       on conflict (key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+      [JSON.stringify({ driver: deskSettings().databaseDriver }), now],
+    );
+    epochEnsured = true;
+  } catch {
+    epochEnsured = false;
+  }
+}
+
+export async function acquirePrimaryLease(instanceId: string): Promise<"acquired" | "renewed" | "conflict"> {
+  try {
+    const sql = await getSql();
+    const now = Date.now();
+    const row = (
+      await sql.query<{
+        lease_name: string;
+        worker_instance_id: string;
+        acquired_at_ms: number;
+        renewed_at_ms: number;
+        expires_at_ms: number;
+      }>(`select * from worker_leases where lease_name = $1`, [PRIMARY_LEASE])
+    )[0];
+    const existing = row
+      ? {
+          leaseName: row.lease_name,
+          workerInstanceId: row.worker_instance_id,
+          acquiredAt: Number(row.acquired_at_ms),
+          renewedAt: Number(row.renewed_at_ms),
+          expiresAt: Number(row.expires_at_ms),
+        }
+      : null;
+    const { decision, next } = decideLease(existing, instanceId, now, LEASE_TTL_MS);
+    if (decision === "conflict") return "conflict";
+    await sql.query(
+      `insert into worker_leases (lease_name, worker_instance_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+       values ($1,$2,$3,$4,$5)
+       on conflict (lease_name) do update set
+         worker_instance_id = excluded.worker_instance_id,
+         acquired_at_ms = excluded.acquired_at_ms,
+         renewed_at_ms = excluded.renewed_at_ms,
+         expires_at_ms = excluded.expires_at_ms`,
+      [next.leaseName, next.workerInstanceId, next.acquiredAt, next.renewedAt, next.expiresAt],
+    );
+    return decision;
+  } catch {
+    return "acquired";
+  }
+}
+
+export async function renewPrimaryLease(instanceId: string): Promise<boolean> {
+  const d = await acquirePrimaryLease(instanceId);
+  return d !== "conflict";
+}
+
+export async function persistFastPath(opts: {
+  tokens: TokenSnapshot[];
+  mints: string[];
+  scheduledAt: number;
+  startedAt: number;
+  providerDelayMs: number;
+  deadlineMs: number;
+}) {
+  const sql = await getSql();
+  const completedAt = Date.now();
+  const db0 = Date.now();
+  for (const t of opts.tokens) {
+    const sample = toFastPathSample(t);
+    try {
+      await sql.query(
+        `insert into token_path_samples (
+           token_mint, event_time_ms, ingested_at_ms, price_usd, liquidity_usd,
+           sell_route_state, provider_snapshot, sample_fingerprint, created_at_ms
+         ) values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+         on conflict (sample_fingerprint) do nothing`,
+        [
+          sample.mint,
+          sample.eventTime,
+          sample.ingestedAt,
+          sample.priceUsd,
+          sample.liquidityUsd,
+          sample.routeState ?? "UNKNOWN",
+          JSON.stringify({ source: sample.source, kind: "fast" }),
+          sample.sampleFingerprint,
+          completedAt,
+        ],
+      );
+      await sql.query(
+        `update token_path_samples set collection_epoch_id = $2, sample_kind = 'fast' where sample_fingerprint = $1`,
+        [sample.sampleFingerprint, currentEpochName()],
+      );
+    } catch {
+      /* 0005/0006 */
+    }
+  }
+  const databaseDelayMs = Date.now() - db0;
+  for (const mint of opts.mints) {
+    const d = watchDeadline({
+      scheduledAt: opts.scheduledAt,
+      startedAt: opts.startedAt,
+      completedAt,
+      deadlineMs: opts.deadlineMs,
+    });
+    try {
+      await sql.query(
+        `insert into watch_execution_stats (
+           token_mint, tier, scheduled_at_ms, started_at_ms, completed_at_ms,
+           queue_delay_ms, provider_delay_ms, database_delay_ms, total_delay_ms,
+           deadline_ms, deadline_missed, created_at_ms
+         ) values ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [
+          mint,
+          opts.scheduledAt,
+          opts.startedAt,
+          completedAt,
+          d.queueDelayMs,
+          opts.providerDelayMs,
+          databaseDelayMs,
+          d.totalDelayMs,
+          opts.deadlineMs,
+          d.deadlineMissed,
+          completedAt,
+        ],
+      );
+    } catch {
+      /* 0006 */
+    }
+  }
+}
+
+export async function recordSoakIncident(opts: {
+  type: string;
+  severity?: string;
+  durationSeconds?: number | null;
+  metadata?: Record<string, unknown>;
+}) {
+  try {
+    const sql = await getSql();
+    const row = makeSoakIncident(opts);
+    await sql.query(
+      `insert into soak_incidents (id, occurred_at_ms, severity, incident_type, duration_seconds, metadata, created_at_ms)
+       values ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+      [
+        row.id,
+        row.occurredAtMs,
+        row.severity,
+        row.incidentType,
+        row.durationSeconds,
+        JSON.stringify(row.metadata),
+        row.createdAtMs,
+      ],
+    );
+  } catch {
+    /* 0006 */
+  }
+}
+
+void epochEnsured;

@@ -3,6 +3,7 @@ import { blankQuote } from "./normalize";
 import { breakerFor } from "../circuit";
 import { classifyRouteFailure, routeStateFromFailure } from "../routes";
 import { deskSettings } from "../config";
+import { budgetFor } from "../rate-budget";
 
 type JupQuote = {
   inAmount?: string;
@@ -17,6 +18,23 @@ const ENDPOINTS = [
   "https://public.jupiterapi.com/quote",
   "https://quote-api.jup.ag/v6/quote",
 ];
+
+export const providerCounters = {
+  jupiter429: 0,
+  gecko429: 0,
+};
+
+type QuoteCacheEntry = { at: number; buy: QuoteObs; sell: QuoteObs };
+const quoteCache = new Map<string, QuoteCacheEntry>();
+
+export function cachedQuoteAge(mint: string): number | null {
+  const hit = quoteCache.get(mint);
+  return hit ? hit.at : null;
+}
+
+export function cachedQuote(mint: string): QuoteCacheEntry | null {
+  return quoteCache.get(mint) ?? null;
+}
 
 function impactOf(body: JupQuote) {
   if (body.priceImpactPct == null) return null;
@@ -78,6 +96,7 @@ async function quoteOnce(opts: {
   const t0 = Date.now();
   const ingestedAt = t0;
   const circuit = breakerFor("jupiter");
+  const budget = budgetFor("jupiter", deskSettings().jupiterApiKey ? { rate: 1.5, min: 0.2, max: 4 } : { rate: 0.35, min: 0.05, max: 1 });
   if (!circuit.canCall()) {
     return failedQuote(opts, "circuit open", 0);
   }
@@ -99,7 +118,9 @@ async function quoteOnce(opts: {
         last = `http ${r.status}`;
         lastStatus = r.status;
         if (r.status === 429) {
+          providerCounters.jupiter429 += 1;
           circuit.failure("rate limit");
+          budget.onRateLimit();
           return failedQuote(opts, last, latencyMs, r.status);
         }
         continue;
@@ -114,6 +135,7 @@ async function quoteOnce(opts: {
         return failedQuote(opts, body.error ?? "no route", latencyMs);
       }
       circuit.success();
+      budget.onHealthyWindow();
       return {
         available: true,
         inMint: opts.inputMint,
@@ -187,6 +209,7 @@ export async function quoteToken(opts: {
       : Promise.resolve(failedQuote({ inputMint: opts.mint, outputMint: WSOL, amount: "0", notionalUsd: opts.notionalUsd }, "no token size", 0)),
   ]);
 
+  quoteCache.set(opts.mint, { at: Date.now(), buy, sell });
   return { buy, sell, lagMs: Date.now() - t0 };
 }
 

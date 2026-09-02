@@ -1,6 +1,15 @@
 import { LIQ_COLLAPSE_THRESHOLD, PATH_MIN_INTERVAL_MS } from "./schema.ts";
 import { LABEL_DEFINITION_VERSION } from "./versions.ts";
 import { pathQualityFromGaps, researchQualityScore, gradeFromScore, freshnessQuality } from "./quality-score.ts";
+import {
+  inputQualityScore,
+  labelQualityScore,
+  lateWatchPenalty,
+  overallQualityV2,
+  gradeFromV2,
+  pathDensityFromGaps,
+  RESEARCH_QUALITY_V2,
+} from "./quality-v2.ts";
 import { STALE_MS } from "./schema.ts";
 import type { BarrierConfidence, BarrierOutcome, LedgerRow, PathTick, TokenLive } from "./types.ts";
 
@@ -130,6 +139,11 @@ export function stampResearchQuality(next: LedgerRow) {
   next.max_path_gap_seconds = Number.isFinite(gaps.max) ? gaps.max : null;
   next.avg_path_gap_seconds = Number.isFinite(gaps.avg) ? gaps.avg : null;
   next.barrier_label_confidence = labelConfidence(Number.isFinite(gaps.max) ? gaps.max : 999, gaps.count);
+  const firstDelay =
+    next.path.length && next.decision_time
+      ? Math.max(0, (next.path[0].ts - next.decision_time) / 1000)
+      : null;
+  next.first_sample_delay_seconds = firstDelay;
   const score = researchQualityScore({
     priceOk: next.price != null,
     liquidityOk: next.liquidity != null && next.liquidity > 0,
@@ -142,6 +156,29 @@ export function stampResearchQuality(next: LedgerRow) {
   next.research_quality_score = score;
   next.research_grade = gradeFromScore(score);
   next.label_definition_version = LABEL_DEFINITION_VERSION;
+  const input = inputQualityScore({
+    priceOk: next.price != null,
+    liquidityOk: next.liquidity != null && next.liquidity > 0,
+    flowOk: next.volume_acceleration != null,
+    holderOk: next.holder_concentration != null,
+    securityOk: next.mint_auth != null && next.freeze_auth != null,
+    routeOk: next.route_status === "ROUTABLE" || next.route_status === "QUOTE_ONLY" || next.sell_quote_available,
+    freshness: freshnessQuality(next.ingested_at && next.decision_time ? next.decision_time - next.ingested_at : 0, STALE_MS),
+  });
+  const label = labelQualityScore({
+    pathDensity: pathDensityFromGaps(next.max_path_gap_seconds, next.path_sample_count ?? 0),
+    routePath: next.path.some((p) => p.sell === 1),
+    liqPath: next.path.some((p) => p.liq > 0),
+    lateWatchPenalty: lateWatchPenalty(firstDelay),
+  });
+  const holderOk = next.holder_concentration != null;
+  next.input_quality_score = input;
+  next.label_quality_score = label;
+  next.research_quality_v2 = overallQualityV2(input, label, holderOk);
+  next.research_grade_v2 = gradeFromV2(next.research_quality_v2, holderOk);
+  next.holder_age_at_decision_ms =
+    next.ingested_at && next.decision_time ? Math.max(0, next.decision_time - next.ingested_at) : null;
+  void RESEARCH_QUALITY_V2;
 }
 
 export function appendOutcomeTick(row: LedgerRow, t: TokenLive, now: number): LedgerRow {
