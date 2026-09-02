@@ -1,5 +1,6 @@
 import { getSql } from "@/lib/db";
 import { analyzeEdgeMonotonicity, buildBaselineReport } from "./baseline";
+import { analyzeWasserstein } from "./wasserstein";
 import { replayStrategy, type ReplayObservation } from "./replay";
 import { STRATEGIES } from "./strategies";
 import { exportRows } from "./repo.server";
@@ -82,6 +83,7 @@ export async function runWarehouseReplay() {
   const rows = await exportRows();
   const baseline = buildBaselineReport(rows);
   const monotonicity = analyzeEdgeMonotonicity(rows);
+  const wasserstein = analyzeWasserstein(rows);
   return {
     replay: {
       from: run.from,
@@ -93,7 +95,8 @@ export async function runWarehouseReplay() {
       leakageViolations: run.leakageViolations,
       note: run.note,
     },
-    monotonicity,
+    monotonicity: { ...monotonicity, wasserstein },
+    wasserstein,
     baseline: {
       labeled: baseline.labeled,
       uniqueTokens: baseline.uniqueTokens,

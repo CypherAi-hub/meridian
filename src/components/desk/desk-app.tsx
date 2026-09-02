@@ -837,6 +837,34 @@ function ResearchPanel({
                 value={edge.spearmanExec == null ? "—" : edge.spearmanExec.toFixed(2)}
               />
             </div>
+            {edge.wasserstein ? (
+              <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+                <QualityRow
+                  label="W1 token 20-40 vs 40-60"
+                  value={edge.wasserstein.tokenLowVsMid.w1Body == null ? "—" : edge.wasserstein.tokenLowVsMid.w1Body.toFixed(4)}
+                />
+                <QualityRow
+                  label="W1 permutation p"
+                  value={edge.wasserstein.tokenLowVsMid.permutationPBody == null ? "—" : edge.wasserstein.tokenLowVsMid.permutationPBody.toFixed(3)}
+                />
+                <QualityRow
+                  label="W1 / IQR (body)"
+                  value={edge.wasserstein.tokenLowVsMid.w1OverIqr == null ? "—" : edge.wasserstein.tokenLowVsMid.w1OverIqr.toFixed(2)}
+                />
+                <QualityRow
+                  label="W1 train vs holdout"
+                  value={edge.wasserstein.trainVsHoldout.w1Body == null ? "—" : edge.wasserstein.trainVsHoldout.w1Body.toFixed(4)}
+                />
+                <QualityRow
+                  label="holdout p"
+                  value={edge.wasserstein.trainVsHoldout.permutationPBody == null ? "—" : edge.wasserstein.trainVsHoldout.permutationPBody.toFixed(3)}
+                />
+                <QualityRow
+                  label="exec gap |theo-net|"
+                  value={edge.wasserstein.executionGapMeanAbs == null ? "—" : pct(edge.wasserstein.executionGapMeanAbs)}
+                />
+              </div>
+            ) : null}
             <div className="mt-2 grid max-w-xl grid-cols-5 gap-2 font-mono text-xs">
               {edge.bucketMedians15m.map((b) => (
                 <div key={b.bucket}>
@@ -848,6 +876,7 @@ function ResearchPanel({
               ))}
             </div>
             <p className="mt-2 text-xs text-subtle">{edge.note}</p>
+            {edge.wasserstein ? <p className="mt-1 text-xs text-subtle">{edge.wasserstein.note}</p> : null}
           </div>
         ) : (
           <p className="text-xs text-subtle">Computing edge ordering from labeled warehouse rows…</p>

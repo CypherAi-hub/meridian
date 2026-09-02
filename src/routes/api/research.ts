@@ -11,12 +11,19 @@ export const Route = createFileRoute("/api/research")({
           const { loadHealthPayload } = await import("@/lib/desk/quality.server");
           return Response.json(await loadHealthPayload());
         }
-        if (view === "baseline" || view === "edge") {
+        if (view === "baseline" || view === "edge" || view === "wasserstein") {
           const { exportRows } = await import("@/lib/desk/repo.server");
           const { buildBaselineReport, analyzeEdgeMonotonicity } = await import("@/lib/desk/baseline");
+          const { analyzeWasserstein } = await import("@/lib/desk/wasserstein");
           const rows = await exportRows();
-          if (view === "edge") return Response.json(analyzeEdgeMonotonicity(rows));
-          return Response.json(buildBaselineReport(rows));
+          if (view === "wasserstein") return Response.json(analyzeWasserstein(rows));
+          if (view === "edge") {
+            const mono = analyzeEdgeMonotonicity(rows);
+            return Response.json({ ...mono, wasserstein: analyzeWasserstein(rows) });
+          }
+          const report = buildBaselineReport(rows);
+          report.monotonicity = { ...report.monotonicity, wasserstein: analyzeWasserstein(rows) };
+          return Response.json(report);
         }
         if (view === "replay") {
           const { runWarehouseReplay } = await import("@/lib/desk/replay.server");

@@ -1,4 +1,5 @@
 import type { LedgerRow } from "./types.ts";
+import type { WassersteinReport } from "./wasserstein.ts";
 
 export type EdgeBucket = "0-20" | "20-40" | "40-60" | "60-80" | "80-100";
 
@@ -30,6 +31,7 @@ export type MonotonicityReport = {
   strictlyIncreasingMedians: boolean | null;
   verdict: "monotonic" | "not_monotonic" | "insufficient";
   note: string;
+  wasserstein?: WassersteinReport;
 };
 
 export type BaselineReport = {
