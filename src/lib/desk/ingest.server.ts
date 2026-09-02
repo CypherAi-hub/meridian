@@ -78,8 +78,11 @@ export async function ingestActive(opts: {
   const want = new Set(opts.mints);
   const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, 12);
   if (!targets.length || !opts.tape.solPriceUsd) return opts.tape;
+  const dex = await enrichDexScreener(targets);
+  const holders = await enrichHolders(dex.tokens, { priority: opts.mints });
+  const quoted = holders.tokens;
   const results = await Promise.all(
-    targets.map(async (t) => {
+    quoted.map(async (t) => {
       try {
         const q = await quoteToken({
           mint: t.address,
@@ -96,11 +99,16 @@ export async function ingestActive(opts: {
   );
   const byBuy = new Map(results.map((r) => [r.addr, r.q?.buy]));
   const bySell = new Map(results.map((r) => [r.addr, r.q?.sell]));
-  const tokens = opts.tape.tokens.map((t) => ({
-    ...t,
-    buyQuote: byBuy.get(t.address) ?? t.buyQuote,
-    sellQuote: bySell.get(t.address) ?? t.sellQuote,
-  }));
+  const byFresh = new Map(quoted.map((t) => [t.address, t]));
+  const tokens = opts.tape.tokens.map((t) => {
+    const fresh = byFresh.get(t.address);
+    const base = fresh ?? t;
+    return {
+      ...base,
+      buyQuote: byBuy.get(t.address) ?? base.buyQuote,
+      sellQuote: bySell.get(t.address) ?? base.sellQuote,
+    };
+  });
   return {
     ...opts.tape,
     tokens,
@@ -174,7 +182,7 @@ async function ingestOnce(opts?: {
   }
 
   const sol = await enrichSolana(dex.tokens);
-  const holders = await enrichHolders(sol.tokens);
+  const holders = await enrichHolders(sol.tokens, { priority: pin });
   const enriched = holders.tokens;
 
   const focusSet = new Set<string>(pin);

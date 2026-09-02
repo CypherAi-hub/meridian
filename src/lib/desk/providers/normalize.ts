@@ -1,10 +1,11 @@
-import type { FieldObs, QuoteObs, SourceId, TokenSnapshot } from "../schema";
+import type { DataStatus, FieldObs, QuoteObs, SourceId, TokenSnapshot } from "../schema";
 
 export function field<T>(
   value: T | null,
   eventTime: number,
   ingestedAt: number,
   source: SourceId | "derived",
+  status?: DataStatus,
 ): FieldObs<T> {
   return {
     value,
@@ -12,7 +13,7 @@ export function field<T>(
     ingestedAt,
     source,
     lagMs: Math.max(0, ingestedAt - eventTime),
-    status: value == null ? "UNKNOWN" : "VALID",
+    status: status ?? (value == null ? "UNKNOWN" : "VALID"),
   };
 }
 
@@ -90,8 +91,14 @@ export function mergeSnap(a: TokenSnapshot, b: TokenSnapshot): TokenSnapshot {
     uniqueSellers5m: prefer(a.uniqueSellers5m, b.uniqueSellers5m),
     holders: prefer(a.holders, b.holders),
     top10Pct: prefer(a.top10Pct, b.top10Pct),
-    top20Pct: prefer(a.top20Pct ?? emptyField(0, 0, "solana"), b.top20Pct ?? emptyField(0, 0, "solana")),
-    largestHolderPct: prefer(a.largestHolderPct ?? emptyField(0, 0, "solana"), b.largestHolderPct ?? emptyField(0, 0, "solana")),
+    top20Pct: prefer(
+      a.top20Pct ?? emptyField(a.priceUsd.eventTime, a.priceUsd.ingestedAt, "solana"),
+      b.top20Pct ?? emptyField(b.priceUsd.eventTime, b.priceUsd.ingestedAt, "solana"),
+    ),
+    largestHolderPct: prefer(
+      a.largestHolderPct ?? emptyField(a.priceUsd.eventTime, a.priceUsd.ingestedAt, "solana"),
+      b.largestHolderPct ?? emptyField(b.priceUsd.eventTime, b.priceUsd.ingestedAt, "solana"),
+    ),
     mintAuth: prefer(a.mintAuth, b.mintAuth),
     freezeAuth: prefer(a.freezeAuth, b.freezeAuth),
     buyQuote: a.buyQuote ?? b.buyQuote,
@@ -128,7 +135,5 @@ export function blankQuote(
     ingestedAt: now,
     source: "jupiter",
     error,
-    routeState: "UNKNOWN",
-    failureReason: error,
   };
 }

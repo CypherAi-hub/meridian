@@ -3,10 +3,11 @@ import { ingestActive, ingestTape } from "./ingest.server";
 import { persistDesk, loadDesk, recordError, startWorkerTick, finishWorkerTick } from "./repo.server";
 import { writeHeartbeat } from "./quality.server";
 import { shouldPromote } from "./watch";
+import { assertPaperMode } from "./config";
 import type { DeskSnapshot } from "./types";
 
 const TICK_MS = 12_000;
-const ACTIVE_MS = 4_000;
+const ACTIVE_MS = 3_000;
 const STARTED_AT = Date.now();
 
 const g = globalThis as typeof globalThis & {
@@ -153,6 +154,7 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
 }
 
 export function ensureWorker() {
+  assertPaperMode();
   if (g.__meridianTickTimer__ == null) {
     g.__meridianTickTimer__ = setInterval(() => {
       void runTick();

@@ -24,6 +24,7 @@ import { startDeskLoop, stopDeskLoop, useDesk } from "@/lib/desk/store";
 import type { DataQuality, FeatureMeta, GateResult, LedgerRow, Regime, ResearchSummary, SourceHealth, UniverseBucket, WorkerHealth } from "@/lib/desk/types";
 import type { MonotonicityReport } from "@/lib/desk/baseline";
 import { emptyQuality } from "@/lib/desk/types";
+import { researchHealth } from "@/lib/desk/research-health";
 import { cn } from "@/lib/utils";
 
 const TABS = ["scan", "inspect", "book", "journal", "research"] as const;
@@ -61,7 +62,7 @@ export function DeskApp() {
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
           <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
-          <p className="hidden text-xs text-muted lg:block">V3.3 · replay engine</p>
+          <p className="hidden text-xs text-muted lg:block">V3.3A.1 · training-grade memory</p>
         </div>
         <Badge variant={desk.worker.status === "live" ? "up" : desk.worker.status === "starting" ? "warn" : "down"}>
           {desk.worker.status === "live"
@@ -70,6 +71,14 @@ export function DeskApp() {
               ? "Worker starting"
               : "Worker OFFLINE"}
         </Badge>
+        {(() => {
+          const rh = researchHealth(desk.quality ?? emptyQuality());
+          return (
+            <Badge variant={rh.status === "HEALTHY" ? "up" : "warn"} title={rh.blockers.join(" · ")}>
+              Research {rh.status}
+            </Badge>
+          );
+        })()}
         <Badge variant={desk.realData ? "up" : "warn"}>
           {desk.realData ? "Real data / paper" : "No tape / paper"}
         </Badge>
@@ -662,6 +671,7 @@ function ResearchPanel({
   const buckets: UniverseBucket[] = ["new_launch", "early", "emerging", "established", "mature", "unknown"];
   const regimes: Regime[] = ["meme_mania", "trend", "chop", "risk_off"];
   const researchBuckets: UniverseBucket[] = ["new_launch", "early", "emerging"];
+  const rh = researchHealth(quality);
   return (
     <div>
       <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-5">
@@ -719,6 +729,11 @@ function ResearchPanel({
       </div>
       <div className="border-b border-border px-4 py-3 sm:px-5">
         <p className="mb-2 text-xs uppercase tracking-wider text-subtle">Data quality</p>
+        <p className="mb-2 font-mono text-xs text-muted">
+          Research {rh.status}
+          {rh.blockers.length ? ` · ${rh.blockers[0]}` : ""}
+          {rh.blockers.length > 1 ? ` · +${rh.blockers.length - 1} more` : ""}
+        </p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
           <QualityRow label="tokens observed" value={compact(quality.tokensObserved)} />
           <QualityRow label="raw observations" value={compact(quality.rawObservations)} />
@@ -727,6 +742,18 @@ function ResearchPanel({
           <QualityRow
             label="avg obs interval"
             value={quality.avgObservationIntervalMs == null ? "—" : `${(quality.avgObservationIntervalMs / 1000).toFixed(0)}s`}
+          />
+          <QualityRow
+            label="universe avg gap"
+            value={quality.universeAvgGapMs == null ? "—" : `${(quality.universeAvgGapMs / 1000).toFixed(0)}s`}
+          />
+          <QualityRow
+            label="active avg gap"
+            value={quality.activeAvgGapMs == null ? "—" : `${(quality.activeAvgGapMs / 1000).toFixed(1)}s`}
+          />
+          <QualityRow
+            label="active p95 gap"
+            value={quality.activeP95GapMs == null ? "—" : `${(quality.activeP95GapMs / 1000).toFixed(0)}s`}
           />
           <QualityRow
             label="largest gap"

@@ -5,34 +5,22 @@ export const Route = createFileRoute("/api/health")({
     handlers: {
       GET: async ({ request }) => {
         const { ensureWorker } = await import("@/lib/desk/worker.server");
-        const { loadHealthPayload } = await import("@/lib/desk/quality.server");
+        const { liveHealth, loadHealthPayload, readyHealth, researchHealthPayload } = await import(
+          "@/lib/desk/quality.server"
+        );
         const view = new URL(request.url).searchParams.get("view");
         if (view === "live") {
-          return Response.json({ status: "LIVE" });
+          return Response.json(await liveHealth());
         }
         ensureWorker();
-        const payload = await loadHealthPayload();
         if (view === "ready") {
-          const providers: Record<string, string> = {};
-          for (const p of payload.providers) providers[String(p.id)] = String(p.status).toUpperCase();
-          return Response.json({
-            worker: String(payload.worker.status).toUpperCase(),
-            database: "HEALTHY",
-            providers,
-            holder_coverage_pct: payload.quality.holderCoveragePct,
-            route_coverage_pct: payload.quality.jupiterRoutePct,
-            label_completion_pct: payload.quality.labelsCompletedPct,
-            configured: payload.configured,
-          });
+          const ready = await readyHealth();
+          return Response.json(ready.body, { status: ready.status });
         }
         if (view === "research") {
-          return Response.json({
-            worker: payload.worker,
-            corpus: payload.corpus,
-            quality: payload.quality,
-          });
+          return Response.json(await researchHealthPayload());
         }
-        return Response.json(payload);
+        return Response.json(await loadHealthPayload());
       },
     },
   },

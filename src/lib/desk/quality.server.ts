@@ -1,8 +1,9 @@
 import { dbSource, getSql, type Sql } from "@/lib/db";
 import { workerStatusFromHeartbeat } from "./leakage";
 import { emptyQuality, type DataQuality } from "./types";
-import { configuredProviders } from "./config";
+import { configuredProviders, publicConfig } from "./config";
 import { breakerFor } from "./circuit";
+import { researchHealth } from "./research-health";
 
 function num(v: unknown, d = 0) {
   const n = typeof v === "number" ? v : Number(v);
@@ -33,6 +34,7 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
     await q<{ names: string }>(db, `select string_agg(name, ',') as names from _migrations`)
   )[0];
   const paths = (await q<{ n: number }>(db, `select count(*)::int as n from consideration_paths`))[0];
+  const sharedPaths = (await q<{ n: number }>(db, `select count(*)::int as n from token_path_samples`))[0];
   const gaps = (
     await q<{ avg_ms: number | null; max_ms: number | null }>(
       db,
@@ -110,7 +112,7 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   if (!featTable?.n) {
     console.error("[meridian] feature_vectors missing; migrations", migs?.names);
   }
-  quality.pathSamples = num(paths?.n);
+  quality.pathSamples = num(sharedPaths?.n) > 0 ? num(sharedPaths?.n) : num(paths?.n);
   quality.avgObservationIntervalMs = gaps?.avg_ms == null ? null : num(gaps.avg_ms);
   quality.largestGapMs = gaps?.max_ms == null ? null : num(gaps.max_ms);
   quality.unknownHolderPct = holder?.unknown_pct == null ? null : num(holder.unknown_pct);
@@ -166,12 +168,12 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
       db,
       `select
          count(*)::int as checks,
-         count(*) filter (where route_status = 'ROUTABLE' or jupiter_sell_route)::int as routable,
+         count(*) filter (where route_status in ('ROUTABLE','QUOTE_ONLY') or jupiter_sell_route)::int as routable,
          count(*) filter (where route_status = 'NO_ROUTE')::int as noroute,
          count(*) filter (where route_status = 'TIMEOUT')::int as timeout,
          count(*) filter (where route_status = 'RATE_LIMITED')::int as rl,
          count(*) filter (where route_status = 'ERROR')::int as errors,
-         count(*) filter (where route_status is null or route_status = 'UNKNOWN')::int as notchecked
+         count(*) filter (where route_status is null or route_status = 'UNKNOWN' or route_failure_reason = 'NOT_CHECKED')::int as notchecked
        from market_observations
        where coalesce(ingested_at_ms, observed_at_ms) > $1`,
       [since],
@@ -244,6 +246,46 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   )[0];
   quality.medianPathGapMs = pathPct?.med == null ? null : num(pathPct.med);
   quality.p95PathGapMs = pathPct?.p95 == null ? null : num(pathPct.p95);
+  const checked = quality.routeCoverage.checks - quality.routeCoverage.notChecked;
+  quality.routeCheckCoveragePct = quality.routeCoverage.checks
+    ? checked / quality.routeCoverage.checks
+    : null;
+  if (checked > 0) {
+    quality.jupiterRoutePct = quality.routeCoverage.routable / checked;
+  }
+  const universeGap = (
+    await q<{ avg_ms: number | null }>(
+      db,
+      `select avg(delta)::float as avg_ms from (
+         select coalesce(o.ingested_at_ms, o.observed_at_ms)
+              - lag(coalesce(o.ingested_at_ms, o.observed_at_ms))
+                over (partition by o.mint order by coalesce(o.ingested_at_ms, o.observed_at_ms)) as delta
+         from market_observations o
+         left join token_watch_state w on w.token_mint = o.mint
+         where coalesce(o.ingested_at_ms, o.observed_at_ms) > $1
+           and (w.tier is null or w.tier = 'universe')
+       ) s where delta is not null and delta > 0 and delta < 600000`,
+      [since],
+    )
+  )[0];
+  quality.universeAvgGapMs = universeGap?.avg_ms == null ? quality.avgObservationIntervalMs : num(universeGap.avg_ms);
+  const activeGap = (
+    await q<{ avg_ms: number | null; p95_ms: number | null }>(
+      db,
+      `select avg(delta)::float as avg_ms, percentile_cont(0.95) within group (order by delta)::float as p95_ms
+       from (
+         select p.event_time_ms - lag(p.event_time_ms) over (partition by p.token_mint order by p.event_time_ms) as delta
+         from token_path_samples p
+         inner join token_watch_state w on w.token_mint = p.token_mint
+         where w.tier = 'active' and p.event_time_ms > $1
+       ) s where delta is not null and delta > 0 and delta < 120000`,
+      [since],
+    )
+  )[0];
+  quality.activeAvgGapMs = activeGap?.avg_ms == null ? quality.avgPathIntervalMs : num(activeGap.avg_ms);
+  quality.activeP95GapMs = activeGap?.p95_ms == null ? quality.p95PathGapMs : num(activeGap.p95_ms);
+  const soak = (await q<{ soak_started_at_ms: number | null }>(db, `select soak_started_at_ms from desk_state where id = 1`))[0];
+  quality.soakStartedAtMs = soak?.soak_started_at_ms == null ? null : num(soak.soak_started_at_ms);
   return quality;
 }
 
@@ -356,6 +398,11 @@ export async function loadHealthPayload() {
   };
   ensure("birdeye", cfg.birdeye ? "offline" : "unconfigured", cfg.birdeye ? "no tick yet" : "UNCONFIGURED");
   ensure("helius", cfg.helius ? "offline" : "unconfigured", cfg.helius ? "no tick yet" : "UNCONFIGURED");
+  ensure("jupiter", cfg.jupiter ? "offline" : "degraded", cfg.jupiter ? "no tick yet" : "keyless prototyping");
+  ensure("rugcheck", "offline", "public holder fallback");
+  const rh = researchHealth(quality);
+  const soakHours =
+    quality.soakStartedAtMs == null ? 0 : Math.max(0, (Date.now() - quality.soakStartedAtMs) / 3_600_000);
   return {
     status: status === "live" ? "ok" : "degraded",
     worker: {
@@ -377,11 +424,8 @@ export async function loadHealthPayload() {
       detail: p.detail,
       circuit: breakerFor(String(p.id)).state(),
     })),
-    configured: {
-      birdeye: cfg.birdeye,
-      helius: cfg.helius,
-      solanaRpc: cfg.solanaRpc,
-    },
+    configured: publicConfig().configured,
+    public: publicConfig(),
     corpus: {
       considered: num(corpus?.considered),
       authorized: num(corpus?.authorized),
@@ -391,5 +435,55 @@ export async function loadHealthPayload() {
       pending: num(corpus?.pending),
     },
     quality,
+    research: {
+      status: rh.status,
+      blockers: rh.blockers,
+      holderCoverage: quality.holderCoveragePct,
+      routeCheckCoverage: quality.routeCheckCoveragePct,
+      highMediumBarrierCoverage: (quality.highConfidencePct ?? 0) + (quality.mediumConfidencePct ?? 0),
+      gradeABCoverage: (() => {
+        const n = quality.gradeA + quality.gradeB + quality.gradeC + quality.researchOnly;
+        return n ? (quality.gradeA + quality.gradeB) / n : 0;
+      })(),
+      uniqueTokens: quality.uniqueTokens,
+      soakHours,
+      soak: soakHours >= 72 ? "COMPLETE" : quality.soakStartedAtMs ? "RUNNING" : "NOT STARTED",
+      worker: status,
+      database: "HEALTHY",
+    },
+  };
+}
+
+export async function liveHealth() {
+  return { status: "LIVE" as const, process: "LIVE" as const };
+}
+
+export async function readyHealth() {
+  const payload = await loadHealthPayload();
+  const workerLive = payload.worker.status === "live";
+  const ok = workerLive;
+  return {
+    ok,
+    status: ok ? 200 : 503,
+    body: {
+      database: "HEALTHY",
+      worker: String(payload.worker.status).toUpperCase(),
+      providers: Object.fromEntries(payload.providers.map((p) => [String(p.id), String(p.status).toUpperCase()])),
+      holder_coverage_pct: payload.quality.holderCoveragePct,
+      route_check_coverage_pct: payload.quality.routeCheckCoveragePct,
+      route_coverage_pct: payload.quality.jupiterRoutePct,
+      label_completion_pct: payload.quality.labelsCompletedPct,
+      configured: payload.configured,
+    },
+  };
+}
+
+export async function researchHealthPayload() {
+  const payload = await loadHealthPayload();
+  return {
+    ...payload.research,
+    corpus: payload.corpus,
+    quality: payload.quality,
+    worker: payload.worker,
   };
 }

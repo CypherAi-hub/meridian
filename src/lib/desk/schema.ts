@@ -4,7 +4,8 @@ export type SourceId =
   | "jupiter"
   | "solana"
   | "helius"
-  | "birdeye";
+  | "birdeye"
+  | "rugcheck";
 
 export type SourceStatus = "live" | "degraded" | "offline" | "unconfigured";
 
@@ -30,7 +31,7 @@ export type FieldObs<T> = {
   errorCode?: string | null;
 };
 
-export type RouteState = "ROUTABLE" | "NO_ROUTE" | "UNKNOWN" | "TIMEOUT" | "RATE_LIMITED" | "ERROR";
+export type RouteState = "ROUTABLE" | "QUOTE_ONLY" | "NO_ROUTE" | "UNKNOWN" | "TIMEOUT" | "RATE_LIMITED" | "ERROR";
 
 export type QuoteObs = {
   available: boolean;

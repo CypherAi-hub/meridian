@@ -14,3 +14,20 @@ export function requestFingerprint(
   };
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
+
+export function observationFingerprint(input: {
+  mint: string;
+  eventTime: number;
+  price: number | null;
+  liquidity: number | null;
+  provider: string;
+}): string {
+  const payload = {
+    mint: input.mint,
+    t: Math.floor(input.eventTime / 1000),
+    p: input.price,
+    l: input.liquidity,
+    s: input.provider,
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}

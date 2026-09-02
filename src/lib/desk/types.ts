@@ -307,6 +307,11 @@ export type DataQuality = {
   researchOnly: number;
   routeCoverage: RouteCoverage;
   disagreementsHour: number;
+  universeAvgGapMs: number | null;
+  activeAvgGapMs: number | null;
+  activeP95GapMs: number | null;
+  routeCheckCoveragePct: number | null;
+  soakStartedAtMs: number | null;
 };
 
 export type DeskSnapshot = {
@@ -387,6 +392,11 @@ export function emptyQuality(): DataQuality {
     researchOnly: 0,
     routeCoverage: emptyRouteCoverage(),
     disagreementsHour: 0,
+    universeAvgGapMs: null,
+    activeAvgGapMs: null,
+    activeP95GapMs: null,
+    routeCheckCoveragePct: null,
+    soakStartedAtMs: null,
   };
 }
 

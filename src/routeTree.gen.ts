@@ -17,6 +17,9 @@ import { Route as ApiQuoteRouteImport } from './routes/api/quote'
 import { Route as ApiResearchRouteImport } from './routes/api/research'
 import { Route as ApiTapeRouteImport } from './routes/api/tape'
 import { Route as ApiTickRouteImport } from './routes/api/tick'
+import { Route as ApiHealthLiveRouteImport } from './routes/api/health.live'
+import { Route as ApiHealthReadyRouteImport } from './routes/api/health.ready'
+import { Route as ApiHealthResearchRouteImport } from './routes/api/health.research'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -58,37 +61,61 @@ const ApiTickRoute = ApiTickRouteImport.update({
   path: '/api/tick',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiHealthLiveRoute = ApiHealthLiveRouteImport.update({
+  id: '/live',
+  path: '/live',
+  getParentRoute: () => ApiHealthRoute,
+} as any)
+const ApiHealthReadyRoute = ApiHealthReadyRouteImport.update({
+  id: '/ready',
+  path: '/ready',
+  getParentRoute: () => ApiHealthRoute,
+} as any)
+const ApiHealthResearchRoute = ApiHealthResearchRouteImport.update({
+  id: '/research',
+  path: '/research',
+  getParentRoute: () => ApiHealthRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
-  '/api/health': typeof ApiHealthRoute
+  '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
+  '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/ready': typeof ApiHealthReadyRoute
+  '/api/health/research': typeof ApiHealthResearchRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
-  '/api/health': typeof ApiHealthRoute
+  '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
+  '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/ready': typeof ApiHealthReadyRoute
+  '/api/health/research': typeof ApiHealthResearchRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
-  '/api/health': typeof ApiHealthRoute
+  '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
+  '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/ready': typeof ApiHealthReadyRoute
+  '/api/health/research': typeof ApiHealthResearchRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -101,6 +128,9 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/tape'
     | '/api/tick'
+    | '/api/health/live'
+    | '/api/health/ready'
+    | '/api/health/research'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -111,6 +141,9 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/tape'
     | '/api/tick'
+    | '/api/health/live'
+    | '/api/health/ready'
+    | '/api/health/research'
   id:
     | '__root__'
     | '/'
@@ -121,13 +154,16 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/tape'
     | '/api/tick'
+    | '/api/health/live'
+    | '/api/health/ready'
+    | '/api/health/research'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiControlRoute: typeof ApiControlRoute
   ApiDeskRoute: typeof ApiDeskRoute
-  ApiHealthRoute: typeof ApiHealthRoute
+  ApiHealthRoute: typeof ApiHealthRouteWithChildren
   ApiQuoteRoute: typeof ApiQuoteRoute
   ApiResearchRoute: typeof ApiResearchRoute
   ApiTapeRoute: typeof ApiTapeRoute
@@ -192,14 +228,51 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiTickRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/health/live': {
+      id: '/api/health/live'
+      path: '/live'
+      fullPath: '/api/health/live'
+      preLoaderRoute: typeof ApiHealthLiveRouteImport
+      parentRoute: typeof ApiHealthRoute
+    }
+    '/api/health/ready': {
+      id: '/api/health/ready'
+      path: '/ready'
+      fullPath: '/api/health/ready'
+      preLoaderRoute: typeof ApiHealthReadyRouteImport
+      parentRoute: typeof ApiHealthRoute
+    }
+    '/api/health/research': {
+      id: '/api/health/research'
+      path: '/research'
+      fullPath: '/api/health/research'
+      preLoaderRoute: typeof ApiHealthResearchRouteImport
+      parentRoute: typeof ApiHealthRoute
+    }
   }
 }
+
+interface ApiHealthRouteChildren {
+  ApiHealthLiveRoute: typeof ApiHealthLiveRoute
+  ApiHealthReadyRoute: typeof ApiHealthReadyRoute
+  ApiHealthResearchRoute: typeof ApiHealthResearchRoute
+}
+
+const ApiHealthRouteChildren: ApiHealthRouteChildren = {
+  ApiHealthLiveRoute: ApiHealthLiveRoute,
+  ApiHealthReadyRoute: ApiHealthReadyRoute,
+  ApiHealthResearchRoute: ApiHealthResearchRoute,
+}
+
+const ApiHealthRouteWithChildren = ApiHealthRoute._addFileChildren(
+  ApiHealthRouteChildren,
+)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiControlRoute: ApiControlRoute,
   ApiDeskRoute: ApiDeskRoute,
-  ApiHealthRoute: ApiHealthRoute,
+  ApiHealthRoute: ApiHealthRouteWithChildren,
   ApiQuoteRoute: ApiQuoteRoute,
   ApiResearchRoute: ApiResearchRoute,
   ApiTapeRoute: ApiTapeRoute,

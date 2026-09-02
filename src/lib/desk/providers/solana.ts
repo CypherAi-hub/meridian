@@ -1,6 +1,6 @@
-import type { TokenSnapshot } from "../schema";
-import { field } from "./normalize";
-import { deskSettings } from "../config";
+import type { TokenSnapshot } from "../schema.ts";
+import { field } from "./normalize.ts";
+import { deskSettings } from "../config.ts";
 
 type RpcError = { message?: string };
 type AccountValue = { data?: [string, string]; owner?: string } | null;

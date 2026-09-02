@@ -8,8 +8,8 @@ import { rebuildSummary } from "./ledger";
 import { loadQuality } from "./quality.server";
 import { FEATURE_ENGINE_VERSION, FEATURE_SCHEMA, FEATURE_SCHEMA_HASH, LABEL_DEFINITION, LABEL_DEFINITION_VERSION, EXECUTION_ASSUMPTION, EXECUTION_ASSUMPTION_VERSION } from "./versions";
 import { STRATEGIES } from "./strategies";
-import { shouldPromote } from "./watch";
-import { requestFingerprint } from "./fingerprint";
+import { requestFingerprint, observationFingerprint } from "./fingerprint";
+import { shouldPromote, ACTIVE_INTERVAL_MS, UNIVERSE_INTERVAL_MS } from "./watch";
 import { stampResearchQuality } from "./labels";
 import type {
   DeskSnapshot,
@@ -457,6 +457,14 @@ export async function persistDesk(next: DeskSnapshot, prev?: DeskSnapshot) {
   } catch {
     /* 0003 */
   }
+  try {
+    await sql.query(
+      `update desk_state set soak_started_at_ms = coalesce(soak_started_at_ms, $1), code_version = $2 where id = 1`,
+      [now, STRATEGY_VERSION],
+    );
+  } catch {
+    /* 0005 */
+  }
 
   await sql.query("delete from paper_positions");
   for (const p of next.positions) {
@@ -656,6 +664,23 @@ async function persistTokenObservation(sql: Sql, t: TokenLive, next: DeskSnapsho
     } catch {
       /* 0004 */
     }
+    try {
+      const fp = observationFingerprint({
+        mint: t.address,
+        eventTime,
+        price: t.priceUsd.value,
+        liquidity: t.liquidityUsd.value,
+        provider: String(t.priceUsd.source),
+      });
+      await sql.query(
+        `update market_observations set holder_source = $3, observation_fingerprint = $4
+         where mint = $1 and observed_at_ms = $2`,
+        [t.address, ingestedAt, t.top10Pct.value != null ? t.top10Pct.source : null, fp],
+      );
+      await persistPathSample(sql, t, eventTime, ingestedAt, fp);
+    } catch {
+      /* 0005 */
+    }
     let obsId = inserted[0]?.id ?? null;
     if (obsId == null) {
       const found = await sql.query<{ id: number }>(
@@ -701,6 +726,43 @@ async function persistTokenObservation(sql: Sql, t: TokenLive, next: DeskSnapsho
         JSON.stringify({ price: t.priceUsd, liquidity: t.liquidityUsd, sell: t.sellQuote }),
       ],
     );
+  }
+}
+
+async function persistPathSample(
+  sql: Sql,
+  t: TokenLive,
+  eventTime: number,
+  ingestedAt: number,
+  fingerprint: string,
+) {
+  try {
+    await sql.query(
+      `insert into token_path_samples (
+         token_mint, event_time_ms, ingested_at_ms, price_usd, liquidity_usd,
+         sell_route_state, exit_quote_out_amount, provider_snapshot, sample_fingerprint, created_at_ms
+       ) values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)
+       on conflict (sample_fingerprint) do nothing`,
+      [
+        t.address,
+        eventTime,
+        ingestedAt,
+        t.priceUsd.value,
+        t.liquidityUsd.value,
+        t.sellQuote?.routeState ?? (t.sellQuote?.available ? "QUOTE_ONLY" : t.sellQuote ? "NO_ROUTE" : "UNKNOWN"),
+        t.sellQuote?.outAmount ?? null,
+        JSON.stringify({
+          price: t.priceUsd.value,
+          liq: t.liquidityUsd.value,
+          route: t.sellQuote?.routeState ?? null,
+          source: t.priceUsd.source,
+        }),
+        fingerprint,
+        Date.now(),
+      ],
+    );
+  } catch {
+    /* 0005 */
   }
 }
 
@@ -1119,7 +1181,7 @@ async function persistWatches(sql: Sql, next: DeskSnapshot, now: number) {
       const edge = next.lastIntent?.tokenAddress === t.address ? next.lastIntent.predictions.edgeScore : 0;
       const active = considered || shouldPromote({ considered, edgeScore: edge });
       const tier = active ? "active" : "universe";
-      const interval = active ? 4_000 : 15_000;
+      const interval = active ? ACTIVE_INTERVAL_MS : UNIVERSE_INTERVAL_MS;
       await sql.query(
         `insert into token_watch_state (
            token_mint, tier, next_due_at_ms, promoted_at_ms, expires_at_ms, reason, updated_at_ms

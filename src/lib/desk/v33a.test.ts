@@ -53,7 +53,7 @@ test("high-resolution watch promotion", () => {
   assert.equal(shouldPromote({ edgeScore: 70 }), true);
   assert.equal(shouldPromote({ volAccel: 2.5 }), true);
   assert.equal(shouldPromote({ edgeScore: 10, volAccel: 1 }), false);
-  assert.equal(desiredIntervalMs("active"), 4_000);
+  assert.equal(desiredIntervalMs("active"), 3_000);
   assert.equal(desiredIntervalMs("universe"), 15_000);
 });
 

@@ -134,7 +134,7 @@ export function stampResearchQuality(next: LedgerRow) {
     priceOk: next.price != null,
     liquidityOk: next.liquidity != null && next.liquidity > 0,
     holderOk: next.holder_concentration != null,
-    routeOk: next.route_status === "ROUTABLE" || next.sell_quote_available,
+    routeOk: next.route_status === "ROUTABLE" || next.route_status === "QUOTE_ONLY" || next.sell_quote_available,
     securityOk: next.mint_auth != null && next.freeze_auth != null,
     pathQuality: pathQualityFromGaps(next.max_path_gap_seconds, next.path_sample_count ?? 0),
     freshnessQuality: freshnessQuality(next.ingested_at && next.decision_time ? next.decision_time - next.ingested_at : 0, STALE_MS),

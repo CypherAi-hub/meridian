@@ -1,7 +1,7 @@
 export type WatchTier = "universe" | "active";
 
 export const UNIVERSE_INTERVAL_MS = 15_000;
-export const ACTIVE_INTERVAL_MS = 4_000;
+export const ACTIVE_INTERVAL_MS = 3_000;
 export const ACTIVE_HOLD_MS = 60 * 60_000;
 
 export type WatchState = {

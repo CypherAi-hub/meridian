@@ -6,7 +6,8 @@ Real data. Paper fills only. No wallet. No live broadcast. No autonomous trading
 
 The worker writes a durable warehouse:
 
-- `market_observations` — what the market looked like
+- `market_observations` — what the market looked like, with observation fingerprints
+- `token_path_samples` — shared high-resolution price/liquidity/route path (not duplicated per consideration)
 - `feature_vectors` — scores at that observation
 - `candidate_considerations` — what a strategy thought
 - `decision_snapshots` — frozen, never rewritten
@@ -16,7 +17,9 @@ A decision at T may only use fields with `ingested_at <= T`. Replay reconstructs
 
 ## Status
 
-V3.3 replay engine. Holder concentration is UNKNOWN without Birdeye/Helius keys; new/early names are vetoed until that is real. That is honest, not a silent pass.
+V3.3A.1 training-grade memory. Holder concentration uses Birdeye → Helius → Solana RPC → Rugcheck, then honest UNKNOWN. Quote-only Jupiter responses are PASS for paper, never a fake no-route. Research health can be DEGRADED while the worker is LIVE.
+
+Ready for baseline ML only when GO gates pass. They currently do not.
 
 ## Paper only
 

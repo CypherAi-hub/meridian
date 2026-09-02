@@ -22,6 +22,10 @@ export class CircuitBreaker {
     return false;
   }
 
+  canRequest(now = Date.now()): boolean {
+    return this.canCall(now);
+  }
+
   success() {
     this.failures = 0;
     this.openedAt = null;

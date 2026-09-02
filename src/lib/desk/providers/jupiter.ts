@@ -2,6 +2,7 @@ import { USDC, WSOL, type QuoteObs } from "../schema";
 import { blankQuote } from "./normalize";
 import { breakerFor } from "../circuit";
 import { classifyRouteFailure, routeStateFromFailure } from "../routes";
+import { deskSettings } from "../config";
 
 type JupQuote = {
   inAmount?: string;
@@ -85,8 +86,11 @@ async function quoteOnce(opts: {
   for (const base of ENDPOINTS) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
+      const headers: Record<string, string> = { accept: "application/json" };
+      const key = deskSettings().jupiterApiKey;
+      if (key) headers["x-api-key"] = key;
       const r = await fetch(url, {
-        headers: { accept: "application/json" },
+        headers,
         signal: AbortSignal.timeout(7000),
       });
       const latencyMs = Date.now() - t0;
@@ -132,7 +136,7 @@ async function quoteOnce(opts: {
         eventTime,
         ingestedAt,
         source: "jupiter",
-        routeState: "ROUTABLE",
+        routeState: "QUOTE_ONLY",
         failureReason: null,
       };
     } catch (e) {

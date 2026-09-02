@@ -1,4 +1,4 @@
-export type RouteState = "ROUTABLE" | "NO_ROUTE" | "UNKNOWN" | "TIMEOUT" | "RATE_LIMITED" | "ERROR";
+export type RouteState = "ROUTABLE" | "QUOTE_ONLY" | "NO_ROUTE" | "UNKNOWN" | "TIMEOUT" | "RATE_LIMITED" | "ERROR";
 
 export type RouteFailureReason =
   | "NO_ROUTE"
@@ -54,7 +54,7 @@ export function routeStateFromFailure(reason: RouteFailureReason): RouteState {
 }
 
 export function governorRoutePolicy(state: RouteState | null | undefined): "PASS" | "FAIL" | "UNKNOWN" {
-  if (state === "ROUTABLE") return "PASS";
+  if (state === "ROUTABLE" || state === "QUOTE_ONLY") return "PASS";
   if (state === "NO_ROUTE") return "FAIL";
   return "UNKNOWN";
 }
