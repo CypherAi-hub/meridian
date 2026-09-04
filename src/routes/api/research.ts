@@ -33,7 +33,7 @@ export const Route = createFileRoute("/api/research")({
           const { runDeterministicBaselines } = await import("@/lib/desk/replay.server");
           return Response.json(await runDeterministicBaselines());
         }
-        if (view === "v34-prep" || view === "intelligence") {
+        if (view === "v34-prep" || view === "intelligence" || view === "certify") {
           const { exportRows } = await import("@/lib/desk/repo.server");
           const { loadHealthPayload } = await import("@/lib/desk/quality.server");
           const { buildDataset } = await import("@/lib/desk/v34-dataset");
@@ -42,6 +42,11 @@ export const Route = createFileRoute("/api/research")({
           const { evaluateProductionAlerts } = await import("@/lib/desk/v34-alerts");
           const { ML_TRAINING_LOCKED, canTrain, trainingUnlockReasons, PRODUCTION_EPOCH } = await import(
             "@/lib/desk/v34-lock"
+          );
+          const { certifyCorpus } = await import("@/lib/desk/v34-certify");
+          const { freezeTrainingManifest } = await import("@/lib/desk/v34-manifest");
+          const { missingnessAudit, featureDistributionAudit, targetBalanceAudit, splitReport } = await import(
+            "@/lib/desk/v34-audit"
           );
           const health = await loadHealthPayload();
           const rows = await exportRows();
@@ -60,12 +65,41 @@ export const Route = createFileRoute("/api/research")({
             routeCheckPct: q.epochRouteCheckCoveragePct ?? q.routeCheckCoveragePct,
             activeMedianGapMs: q.activeMedianGapMs,
           });
+          const certification = certifyCorpus(q, {
+            leakedTokens: splits.leakedTokens.length,
+            eligibleRows: built.rows.length,
+            uniqueTokens: q.epochUniqueTokens ?? built.manifest.uniqueTokens,
+            manifest: built.manifest,
+          });
+          const frozen = freezeTrainingManifest({
+            rows: built.rows,
+            dataset: built.manifest,
+            splits,
+            trainEnd,
+            validationEnd,
+            certification,
+          });
           return Response.json({
             training: "LOCKED",
             trainingAllowed: canTrain(q),
             unlockReasons: trainingUnlockReasons(q),
             locked: ML_TRAINING_LOCKED,
             epoch: PRODUCTION_EPOCH,
+            certification,
+            frozen: {
+              id: frozen.id,
+              hash: frozen.hash,
+              certified: frozen.certified,
+              trainingAllowed: frozen.trainingAllowed,
+              observationCount: frozen.observationIds.length,
+              tokenCount: frozen.tokenIds.length,
+            },
+            audits: {
+              missingness: missingnessAudit(matrix.rows),
+              distribution: featureDistributionAudit(matrix.rows),
+              targets: targetBalanceAudit(matrix.rows),
+              splits: splitReport(splits, { trainEnd }),
+            },
             dataset: built.manifest,
             splits: {
               train: splits.train.length,

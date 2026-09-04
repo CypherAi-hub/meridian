@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { sanitizeTrainingRows, corpusIndependence, type DatasetRow } from "./dataset.ts";
 import { FEATURE_ENGINE_VERSION, LABEL_DEFINITION_VERSION } from "./versions.ts";
 import { PRODUCTION_EPOCH, ML_TRAINING_LOCKED } from "./v34-lock.ts";
+import { rejectLeakedRows } from "./v34-leakage.ts";
 import type { LedgerRow } from "./types.ts";
 import type { ResearchGrade } from "./quality-score.ts";
 
@@ -23,7 +24,10 @@ export type DatasetDropReason =
   | "wrongEpoch"
   | "wrongFeatureVersion"
   | "wrongLabelVersion"
-  | "lowQuality";
+  | "lowQuality"
+  | "futureLeak"
+  | "postDecisionHolder"
+  | "badTimestamp";
 
 export type DatasetManifest = {
   id: string;
@@ -63,9 +67,18 @@ export function buildDataset(
     wrongFeatureVersion: 0,
     wrongLabelVersion: 0,
     lowQuality: 0,
+    futureLeak: 0,
+    postDecisionHolder: 0,
+    badTimestamp: 0,
   };
+  const { clean, rejected } = rejectLeakedRows(rows);
+  for (const r of rejected) {
+    if (r.leaks.includes("bad_timestamp")) dropped.badTimestamp += 1;
+    if (r.leaks.includes("future_field")) dropped.futureLeak += 1;
+    if (r.leaks.includes("post_decision_holder")) dropped.postDecisionHolder += 1;
+  }
   const filtered: DatasetSourceRow[] = [];
-  for (const row of rows) {
+  for (const row of clean) {
     if (!row.labels_complete) {
       dropped.incomplete += 1;
       continue;

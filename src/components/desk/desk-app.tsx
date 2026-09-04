@@ -27,6 +27,7 @@ import { emptyQuality } from "@/lib/desk/types";
 import { researchHealth } from "@/lib/desk/research-health";
 import { evaluateProductionAlerts } from "@/lib/desk/v34-alerts";
 import { ML_TRAINING_LOCKED, PRODUCTION_EPOCH } from "@/lib/desk/v34-lock";
+import { certifyCorpus } from "@/lib/desk/v34-certify";
 import { cn } from "@/lib/utils";
 
 const TABS = ["scan", "inspect", "book", "journal", "research"] as const;
@@ -867,6 +868,13 @@ function ResearchPanel({
         <div className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
           <QualityRow label="target epoch" value={PRODUCTION_EPOCH} />
           <QualityRow label="train switch" value="LOCKED" />
+          <QualityRow
+            label="certify"
+            value={certifyCorpus(quality, {
+              uniqueTokens: quality.epochUniqueTokens ?? 0,
+              eligibleRows: 0,
+            }).status}
+          />
           <QualityRow
             label="ops alerts"
             value={String(
