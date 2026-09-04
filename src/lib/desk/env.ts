@@ -32,14 +32,17 @@ export function validateProductionConfig(config: ProductionConfig) {
 }
 
 export function currentEpochName(env: MeridianEnvironment = meridianEnvironment()): string {
-  if (env === "production" && canonicalDriver() === "neon") return "v33a2_production";
-  if (env === "production") return "v33a2_production_blocked";
-  return "v33a2_preview";
+  if (env === "production" && canonicalDriver() === "neon") return "v33b_production";
+  if (env === "production") return "v33b_production_blocked";
+  return "v33b_preview";
 }
 
 export function officialSoakAllowed(env: MeridianEnvironment = meridianEnvironment()) {
   return env === "production" && canonicalDriver() === "neon";
 }
+
+/** Official soak clock marker. Previous preview minutes do not count. */
+export const PRODUCTION_SOAK_CLOSURE = "v33b_worker";
 
 export const SOAK_INCIDENT_TYPES = [
   "WORKER_DOWN",

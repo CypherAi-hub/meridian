@@ -133,15 +133,18 @@ async function createPgliteSql(): Promise<Sql> {
   // SQL is inlined by the bundler via import.meta.glob (no runtime fs); applied
   // files are tracked in _migrations. The glob does not descend, so the opt-in
   // auth schema under migrations/auth/ stays out. Runs once per module instance
-  // — so an HMR reload after adding a migration file applies it live — with
-  // passes serialized on a global chain so concurrent callers never
+  // — so an HMR reload after adding a migration file (including 0010) applies it
+  // live — with passes serialized on a global chain so concurrent callers never
   // double-apply.
   const migrate = async (): Promise<void> => {
-    const migrations = import.meta.glob("/migrations/*.sql", {
-      query: "?raw",
-      import: "default",
-      eager: true,
-    }) as Record<string, string>;
+    const migrations =
+      typeof import.meta.glob === "function"
+        ? (import.meta.glob("/migrations/*.sql", {
+            query: "?raw",
+            import: "default",
+            eager: true,
+          }) as Record<string, string>)
+        : {};
     const doneRows = await pg.query<{ name: string }>(
       "select name from _migrations",
     );

@@ -5,6 +5,7 @@ import { deskSettings } from "../config.ts";
 import { breakerFor } from "../circuit.ts";
 import { bucketOf, type UniverseBucket } from "../buckets.ts";
 import { makeHolderJob, takeHolderJobs, type HolderLookupJob } from "../holder-queue.ts";
+import { budgetFor, parseRetryAfter } from "../rate-budget.ts";
 
 export type HolderObs = {
   holders: number | null;
@@ -61,6 +62,35 @@ function asPct(n: number | null | undefined) {
 
 function valid(obs: HolderObs | null): obs is HolderObs {
   return Boolean(obs && (obs.top10Pct != null || obs.holders != null) && obs.status === "VALID");
+}
+
+export function peekHolderCache(mint: string): { at: number; ttl: number; value: HolderObs } | null {
+  return cache.get(mint) ?? null;
+}
+
+export function applyHolderObs(
+  t: TokenSnapshot,
+  h: HolderObs,
+  eventTime: number,
+  ingestedAt: number,
+): TokenSnapshot {
+  const src = h.source;
+  const st = h.status === "STALE" ? "STALE" : h.status === "VALID" ? "VALID" : "UNKNOWN";
+  return {
+    ...t,
+    holders:
+      h.holders != null ? field(h.holders, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.holders,
+    top10Pct:
+      h.top10Pct != null ? field(h.top10Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.top10Pct,
+    top20Pct:
+      h.top20Pct != null
+        ? field(h.top20Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st)
+        : t.top20Pct,
+    largestHolderPct:
+      h.largestPct != null
+        ? field(h.largestPct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st)
+        : t.largestHolderPct,
+  };
 }
 
 export function unknownHolderObs(errors: HolderObs["errors"] = []): HolderObs {
@@ -239,18 +269,23 @@ async function rpcHolders(mint: string): Promise<HolderObs | null> {
 async function rugcheckHolders(mint: string): Promise<HolderObs | null> {
   const circuit = breakerFor("rugcheck:holders");
   if (!circuit.canCall()) throw new Error("circuit open");
+  const budget = budgetFor("rugcheck");
+  if (!budget.take()) throw new Error("rate budget empty");
   const r = await fetch(`https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mint)}/report`, {
     headers: { accept: "application/json", "user-agent": "meridian-research/3.3a2" },
     signal: AbortSignal.timeout(8000),
   });
   if (!r.ok) {
+    if (r.status === 429) budget.onRateLimit(parseRetryAfter(r.headers.get("retry-after")));
     circuit.failure(`rugcheck ${r.status}`);
     throw new Error(`rugcheck ${r.status}`);
   }
   const body = (await r.json()) as { topHolders?: Array<{ pct?: number }>; totalHolders?: number };
   const parsed = parseRugcheckReport(body);
-  if (parsed) circuit.success();
-  else circuit.failure("empty");
+  if (parsed) {
+    circuit.success();
+    budget.onSuccess();
+  } else circuit.failure("empty");
   return parsed;
 }
 
@@ -340,7 +375,11 @@ export async function enrichHolders(
   let rugErr = "empty";
 
   const next = tokens.map((t) => {
-    const h = by.get(t.address);
+    const fetched = by.get(t.address);
+    const cached = !fetched ? cache.get(t.address) : null;
+    const h = fetched ?? cached?.value;
+    const eventAt = fetched ? eventTime : cached?.at ?? eventTime;
+    const ingestedAtTick = fetched ? ingestedAt : cached?.at ?? ingestedAt;
     if (!h) return t;
     if (h.source === "birdeye" && valid(h)) birdeyeOk = true;
     if (h.source === "helius" && valid(h)) heliusOk = true;
@@ -352,15 +391,7 @@ export async function enrichHolders(
       if (e.provider === "solana") rpcErr = e.error;
       if (e.provider === "rugcheck") rugErr = e.error;
     }
-    const src = h.source;
-    const st = h.status === "STALE" ? "STALE" : h.status === "VALID" ? "VALID" : "UNKNOWN";
-    return {
-      ...t,
-      holders: h.holders != null ? field(h.holders, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.holders,
-      top10Pct: h.top10Pct != null ? field(h.top10Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.top10Pct,
-      top20Pct: h.top20Pct != null ? field(h.top20Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.top20Pct,
-      largestHolderPct: h.largestPct != null ? field(h.largestPct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.largestHolderPct,
-    };
+    return applyHolderObs(t, h, eventAt, ingestedAtTick);
   });
 
   const lagMs = Date.now() - t0;

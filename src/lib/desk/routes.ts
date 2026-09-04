@@ -19,6 +19,7 @@ export function classifyRouteFailure(message: string | null | undefined, httpSta
   const msg = (message ?? "").toLowerCase();
   if (!msg) return "UNKNOWN_ERROR";
   if (msg.includes("not_checked") || msg.includes("not checked")) return "NOT_CHECKED";
+  if (msg.includes("rate budget") || msg.includes("budget empty")) return "NOT_CHECKED";
   if (msg.includes("circuit")) return "CIRCUIT_OPEN";
   if (msg.includes("timeout") || msg.includes("aborted") || msg.includes("timed out")) return "QUOTE_TIMEOUT";
   if (msg.includes("429") || msg.includes("rate limit")) return "RATE_LIMIT";

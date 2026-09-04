@@ -151,6 +151,10 @@ export type LedgerRow = {
   unique_sellers: number | null;
   holder_count: number | null;
   holder_concentration: number | null;
+  holder_status?: string | null;
+  holder_source?: string | null;
+  holder_event_time?: number | null;
+  holder_ingested_at?: number | null;
   mint_auth: number | null;
   freeze_auth: number | null;
   entry_impact: number | null;

@@ -12,8 +12,9 @@ import { requestFingerprint, observationFingerprint } from "./fingerprint";
 import { ACTIVE_INTERVAL_MS, UNIVERSE_INTERVAL_MS, researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES } from "./watch";
 import { stampResearchQuality } from "./labels";
 import { deskSettings } from "./config";
-import { currentEpochName, officialSoakAllowed, makeSoakIncident } from "./env";
+import { currentEpochName, officialSoakAllowed, makeSoakIncident, PRODUCTION_SOAK_CLOSURE } from "./env";
 import { decideLease, PRIMARY_LEASE, LEASE_TTL_MS } from "./lease";
+import { applyHolderObs, holderTtlMs } from "./providers/holders";
 import { toFastPathSample, watchDeadline } from "./fast-path";
 import { bucketOf } from "./buckets";
 import type { TokenSnapshot } from "./schema";
@@ -387,6 +388,69 @@ export async function loadResearch(sql?: Sql): Promise<ResearchSummary> {
   return summary;
 }
 
+export async function hydrateHoldersOntoTape<T extends TokenSnapshot>(
+  tokens: T[],
+  decisionTime: number,
+): Promise<T[]> {
+  if (!tokens.length) return tokens;
+  try {
+    const sql = await getSql();
+    const mints = tokens.map((t) => t.address);
+    const rows = await sql.query<{
+      mint: string;
+      holder_count: number | null;
+      top_10_holder_pct: number | null;
+      holder_status: string | null;
+      holder_provider: string | null;
+      event_time_ms: number | null;
+      ingested_at_ms: number | null;
+    }>(
+      `select distinct on (mint)
+         mint, holder_count, top_10_holder_pct, holder_status, holder_provider,
+         event_time_ms, ingested_at_ms
+       from market_observations
+       where mint = any($1)
+         and coalesce(ingested_at_ms, observed_at_ms) <= $2
+         and (top_10_holder_pct is not null or holder_count is not null)
+       order by mint, coalesce(ingested_at_ms, observed_at_ms) desc`,
+      [mints, decisionTime],
+    );
+    const by = new Map(rows.map((r) => [r.mint, r]));
+    return tokens.map((t) => {
+      const liveValid =
+        t.top10Pct.value != null &&
+        (t.top10Pct.status ?? "VALID") === "VALID" &&
+        t.top10Pct.ingestedAt > 0 &&
+        t.top10Pct.ingestedAt <= decisionTime;
+      if (liveValid) return t;
+      const row = by.get(t.address);
+      if (!row) return t;
+      const ingested = row.ingested_at_ms ?? 0;
+      if (!ingested || ingested > decisionTime) return t;
+      const age = decisionTime - ingested;
+      const ttl = holderTtlMs(bucketOf(t.createdAt ? (decisionTime - t.createdAt) / 1000 : null));
+      if (age > ttl) return t;
+      const source = (row.holder_provider ?? "solana") as "birdeye" | "helius" | "solana" | "rugcheck";
+      return applyHolderObs(
+        t,
+        {
+          holders: row.holder_count,
+          top10Pct: row.top_10_holder_pct,
+          top20Pct: null,
+          largestPct: null,
+          source,
+          status: "VALID",
+          errors: [],
+        },
+        row.event_time_ms ?? ingested,
+        ingested,
+      ) as T;
+    });
+  } catch {
+    return tokens;
+  }
+}
+
 export async function persistDesk(next: DeskSnapshot, prev?: DeskSnapshot) {
   const sql = await getSql();
   const now = Date.now();
@@ -470,11 +534,18 @@ export async function persistDesk(next: DeskSnapshot, prev?: DeskSnapshot) {
     );
     await ensureCollectionEpoch(sql, now);
     if (officialSoakAllowed()) {
-      await sql.query(
-        `insert into warehouse_metadata (key, value, updated_at_ms) values ('production_soak_started_at', $1::jsonb, $2)
-         on conflict (key) do nothing`,
-        [JSON.stringify({ ms: now }), now],
+      const existing = await sql.query<{ value: { ms?: number; closure?: string } }>(
+        `select value from warehouse_metadata where key = 'production_soak_started_at'`,
       );
+      const closure = existing[0]?.value?.closure;
+      if (closure !== PRODUCTION_SOAK_CLOSURE) {
+        await sql.query(`update desk_state set soak_started_at_ms = $1 where id = 1`, [now]);
+        await sql.query(
+          `insert into warehouse_metadata (key, value, updated_at_ms) values ('production_soak_started_at', $1::jsonb, $2)
+           on conflict (key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+          [JSON.stringify({ ms: now, closure: PRODUCTION_SOAK_CLOSURE }), now],
+        );
+      }
     }
   } catch {
     /* 0005/0006 */
@@ -666,7 +737,7 @@ async function persistTokenObservation(sql: Sql, t: TokenLive, next: DeskSnapsho
           t.sellQuote?.priceImpactPct != null ? t.sellQuote.priceImpactPct * 10_000 : null,
           t.top20Pct?.value ?? null,
           t.largestHolderPct?.value ?? null,
-          t.top10Pct.value != null ? "VALID" : "UNKNOWN",
+          t.top10Pct.status ?? (t.top10Pct.value != null ? "VALID" : "UNKNOWN"),
           t.top10Pct.source,
           Boolean(t.priceUsd.value != null && t.priceCrossUsd.value != null && t.priceUsd.value && t.priceCrossUsd.value && Math.abs(t.priceUsd.value - t.priceCrossUsd.value) / ((t.priceUsd.value + t.priceCrossUsd.value) / 2) > 0.03),
           t.priceUsd.value != null && t.priceCrossUsd.value != null && t.priceUsd.value
@@ -822,12 +893,50 @@ async function persistPathTicks(sql: Sql, row: LedgerRow) {
 
 async function insertConsideration(sql: Sql, row: LedgerRow, desk: DeskSnapshot): Promise<boolean> {
   const cooldown = cooldownKey(row.tokenAddress, row.strategy_version, row.decision_time);
+  if (row.holder_concentration == null) {
+    try {
+      const pit = await sql.query<{
+        holder_count: number | null;
+        top_10_holder_pct: number | null;
+        holder_status: string | null;
+        holder_provider: string | null;
+        event_time_ms: number | null;
+        ingested_at_ms: number | null;
+      }>(
+        `select holder_count, top_10_holder_pct, holder_status, holder_provider, event_time_ms, ingested_at_ms
+         from market_observations
+         where mint = $1
+           and coalesce(ingested_at_ms, observed_at_ms) <= $2
+           and (top_10_holder_pct is not null or holder_count is not null)
+         order by coalesce(ingested_at_ms, observed_at_ms) desc
+         limit 1`,
+        [row.tokenAddress, row.decision_time],
+      );
+      const hit = pit[0];
+      if (hit?.ingested_at_ms != null && hit.ingested_at_ms <= row.decision_time) {
+        const age = row.decision_time - hit.ingested_at_ms;
+        const ttl = holderTtlMs(bucketOf(row.token_age));
+        if (age <= ttl) {
+          row.holder_count = hit.holder_count;
+          row.holder_concentration = hit.top_10_holder_pct;
+          row.holder_status = "VALID";
+          row.holder_source = hit.holder_provider;
+          row.holder_event_time = hit.event_time_ms;
+          row.holder_ingested_at = hit.ingested_at_ms;
+          row.holder_age_at_decision_ms = age;
+          stampResearchQuality(row);
+        }
+      }
+    } catch {
+      /* warehouse PIT optional */
+    }
+  }
   let obsId: number | null = null;
   let featId: number | null = null;
   try {
     const obs = await sql.query<{ id: number }>(
-      `select id from market_observations where mint = $1 order by coalesce(ingested_at_ms, observed_at_ms) desc limit 1`,
-      [row.tokenAddress],
+      `select id from market_observations where mint = $1 and coalesce(ingested_at_ms, observed_at_ms) <= $2 order by coalesce(ingested_at_ms, observed_at_ms) desc limit 1`,
+      [row.tokenAddress, row.decision_time],
     );
     obsId = obs[0]?.id ?? null;
     if (obsId != null) {
@@ -889,7 +998,9 @@ async function insertConsideration(sql: Sql, row: LedgerRow, desk: DeskSnapshot)
       `update candidate_considerations set
          collection_epoch_id = $2, input_quality_score = $3, label_quality_score = $4,
          research_quality_v2 = $5, research_grade_v2 = $6, holder_age_at_decision_ms = $7,
-         first_sample_delay_seconds = $8
+         first_sample_delay_seconds = $8,
+         holder_count = $9, holder_concentration = $10, holder_status = $11, holder_source = $12,
+         holder_event_time_ms = $13, holder_ingested_at_ms = $14
        where decision_id = $1`,
       [
         row.decision_id,
@@ -900,6 +1011,12 @@ async function insertConsideration(sql: Sql, row: LedgerRow, desk: DeskSnapshot)
         row.research_grade_v2 ?? null,
         row.holder_age_at_decision_ms ?? null,
         row.first_sample_delay_seconds ?? null,
+        row.holder_count ?? null,
+        row.holder_concentration ?? null,
+        row.holder_status ?? null,
+        row.holder_source ?? null,
+        row.holder_event_time ?? null,
+        row.holder_ingested_at ?? null,
       ],
     );
   } catch {
@@ -1429,7 +1546,8 @@ export async function acquirePrimaryLease(instanceId: string): Promise<"acquired
       [next.leaseName, next.workerInstanceId, next.acquiredAt, next.renewedAt, next.expiresAt],
     );
     return decision;
-  } catch {
+  } catch (err) {
+    if (process.env.MERIDIAN_WORKER === "1") throw err;
     return "acquired";
   }
 }

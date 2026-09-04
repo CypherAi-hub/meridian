@@ -3,7 +3,7 @@ import { blankQuote } from "./normalize";
 import { breakerFor } from "../circuit";
 import { classifyRouteFailure, routeStateFromFailure } from "../routes";
 import { deskSettings } from "../config";
-import { budgetFor } from "../rate-budget";
+import { budgetFor, parseRetryAfter, JUPITER_KEYED_BUDGET } from "../rate-budget";
 
 type JupQuote = {
   inAmount?: string;
@@ -84,6 +84,13 @@ function failedQuote(
   return q;
 }
 
+export function skippedQuote(
+  opts: { inputMint: string; outputMint: string; amount: string; notionalUsd: number },
+  reason: string,
+): QuoteObs {
+  return failedQuote(opts, reason, 0);
+}
+
 async function quoteOnce(opts: {
   inputMint: string;
   outputMint: string;
@@ -96,17 +103,23 @@ async function quoteOnce(opts: {
   const t0 = Date.now();
   const ingestedAt = t0;
   const circuit = breakerFor("jupiter");
-  const budget = budgetFor("jupiter", deskSettings().jupiterApiKey ? { rate: 1.5, min: 0.2, max: 4 } : { rate: 0.35, min: 0.05, max: 1 });
+  const key = deskSettings().jupiterApiKey;
+  const budget = budgetFor("jupiter", key ? JUPITER_KEYED_BUDGET : undefined);
   if (!circuit.canCall()) {
     return failedQuote(opts, "circuit open", 0);
   }
+  if (!budget.take()) {
+    return failedQuote(opts, "rate budget empty", 0);
+  }
   let last = "quote failed";
   let lastStatus: number | undefined;
-  for (const base of ENDPOINTS) {
+  const endpoints = key
+    ? ["https://api.jup.ag/swap/v1/quote", ...ENDPOINTS]
+    : ENDPOINTS;
+  for (const base of endpoints) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
       const headers: Record<string, string> = { accept: "application/json" };
-      const key = deskSettings().jupiterApiKey;
       if (key) headers["x-api-key"] = key;
       const r = await fetch(url, {
         headers,
@@ -120,7 +133,7 @@ async function quoteOnce(opts: {
         if (r.status === 429) {
           providerCounters.jupiter429 += 1;
           circuit.failure("rate limit");
-          budget.onRateLimit();
+          budget.onRateLimit(parseRetryAfter(r.headers.get("retry-after")));
           return failedQuote(opts, last, latencyMs, r.status);
         }
         continue;
@@ -135,7 +148,7 @@ async function quoteOnce(opts: {
         return failedQuote(opts, body.error ?? "no route", latencyMs);
       }
       circuit.success();
-      budget.onHealthyWindow();
+      budget.onSuccess();
       return {
         available: true,
         inMint: opts.inputMint,
@@ -186,16 +199,7 @@ export async function quoteToken(opts: {
       ? Math.max(1, Math.round((opts.notionalUsd / opts.priceUsd) * 10 ** opts.decimals))
       : 0;
 
-  const [buy, sell] = await Promise.all([
-    quoteOnce({
-      inputMint: WSOL,
-      outputMint: opts.mint,
-      amount: String(solLamports),
-      inDecimals: 9,
-      outDecimals: opts.decimals,
-      solPriceUsd: opts.solPriceUsd,
-      notionalUsd: opts.notionalUsd,
-    }),
+  const sellP =
     tokenRaw > 0
       ? quoteOnce({
           inputMint: opts.mint,
@@ -206,8 +210,23 @@ export async function quoteToken(opts: {
           solPriceUsd: opts.solPriceUsd,
           notionalUsd: opts.notionalUsd,
         })
-      : Promise.resolve(failedQuote({ inputMint: opts.mint, outputMint: WSOL, amount: "0", notionalUsd: opts.notionalUsd }, "no token size", 0)),
-  ]);
+      : Promise.resolve(
+          failedQuote(
+            { inputMint: opts.mint, outputMint: WSOL, amount: "0", notionalUsd: opts.notionalUsd },
+            "no token size",
+            0,
+          ),
+        );
+  const buyP = quoteOnce({
+    inputMint: WSOL,
+    outputMint: opts.mint,
+    amount: String(solLamports),
+    inDecimals: 9,
+    outDecimals: opts.decimals,
+    solPriceUsd: opts.solPriceUsd,
+    notionalUsd: opts.notionalUsd,
+  });
+  const [sell, buy] = await Promise.all([sellP, buyP]);
 
   quoteCache.set(opts.mint, { at: Date.now(), buy, sell });
   return { buy, sell, lagMs: Date.now() - t0 };

@@ -42,7 +42,7 @@ test("preview does not throw production validation", () => {
   try {
     validateProductionConfig({ databaseUrl: null, databaseDriver: "pglite", executionMode: "PAPER" });
     assert.equal(officialSoakAllowed(), false);
-    assert.equal(currentEpochName(), "v33a2_preview");
+    assert.equal(currentEpochName(), "v33b_preview");
   } finally {
     if (prev == null) delete process.env.MERIDIAN_ENV;
     else process.env.MERIDIAN_ENV = prev;
@@ -134,13 +134,14 @@ test("route priority and TTL", () => {
 
 test("adaptive rate reduction and recovery", () => {
   const b = new AdaptiveRateBudget(1, 0.1, 2, 0);
-  b.onRateLimit();
+  b.onRateLimit(0, 0);
   assert.ok(b.rate <= 0.5 + 1e-9);
   const before = b.rate;
   b.onHealthyWindow();
   assert.ok(b.rate > before);
   b.tokens = 0;
   b.lastRefill = 0;
+  b.limitedUntil = 0;
   assert.equal(b.take(1, 0), false);
   assert.equal(b.take(1, 20_000), true);
 });
@@ -247,13 +248,24 @@ test("timeout stays UNKNOWN not a fake no-route under rate-limit storm", () => {
 test("paper mode and preview epoch are locked", () => {
   const s = loadDeskConfig();
   assert.equal(s.executionMode, "PAPER");
-  assert.equal(s.collectionEpoch, "v33a2_preview");
+  assert.equal(s.collectionEpoch, "v33b_preview");
   assert.equal(s.databaseDriver, "pglite");
 });
 
+test("EXECUTION_MODE=PAPER is accepted as the Railway alias for MERIDIAN_EXECUTION_MODE", () => {
+  const prev = process.env.EXECUTION_MODE;
+  process.env.EXECUTION_MODE = "PAPER";
+  try {
+    assert.equal(loadDeskConfig().executionMode, "PAPER");
+  } finally {
+    if (prev == null) delete process.env.EXECUTION_MODE;
+    else process.env.EXECUTION_MODE = prev;
+  }
+});
+
 test("production epoch is blocked without neon canonical", () => {
-  assert.equal(currentEpochName("preview"), "v33a2_preview");
-  assert.equal(currentEpochName("production"), "v33a2_production_blocked");
+  assert.equal(currentEpochName("preview"), "v33b_preview");
+  assert.equal(currentEpochName("production"), "v33b_production_blocked");
   assert.equal(officialSoakAllowed("production"), false);
 });
 

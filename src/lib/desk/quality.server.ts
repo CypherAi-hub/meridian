@@ -7,6 +7,10 @@ import { researchHealth } from "./research-health";
 import { currentEpochName, meridianEnvironment, officialSoakAllowed } from "./env";
 import { classifyVeto } from "./veto-report";
 import { providerCounters } from "./providers/jupiter";
+import { snapshotBudgets } from "./rate-budget";
+import { loadPersistedBudgets, restoreRateBudgets } from "./rate-budget.server";
+import { loadMigrationStatus, stampSchemaVersion } from "./neon-migrate";
+import { SCHEMA_VERSION } from "./neon-steps";
 
 function num(v: unknown, d = 0) {
   const n = typeof v === "number" ? v : Number(v);
@@ -538,6 +542,14 @@ export async function loadHealthPayload() {
     quality.productionSoakStartedAtMs == null
       ? 0
       : Math.max(0, (Date.now() - quality.productionSoakStartedAtMs) / 3_600_000);
+  const migrations = await loadMigrationStatus();
+  if (migrations.ready && migrations.schemaVersion !== SCHEMA_VERSION) {
+    await stampSchemaVersion(SCHEMA_VERSION).catch(() => undefined);
+    migrations.schemaVersion = SCHEMA_VERSION;
+  }
+  await restoreRateBudgets();
+  const liveBudgets = snapshotBudgets();
+  const rateBudgets = liveBudgets.length ? liveBudgets : await loadPersistedBudgets();
   return {
     status: status === "live" ? "ok" : "degraded",
     worker: {
@@ -570,6 +582,8 @@ export async function loadHealthPayload() {
       pending: num(corpus?.pending),
     },
     quality,
+    migrations,
+    rateBudgets,
     research: {
       status: rh.status,
       blockers: rh.blockers,

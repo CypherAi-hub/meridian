@@ -20,6 +20,10 @@ export const Route = createFileRoute("/api/health")({
         if (view === "research") {
           return Response.json(await researchHealthPayload());
         }
+        if (view === "migrations") {
+          const { loadMigrationStatus } = await import("@/lib/desk/neon-migrate");
+          return Response.json(await loadMigrationStatus());
+        }
         return Response.json(await loadHealthPayload());
       },
     },

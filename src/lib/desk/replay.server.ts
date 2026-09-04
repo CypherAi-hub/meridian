@@ -2,6 +2,8 @@ import { getSql } from "@/lib/db";
 import { analyzeEdgeMonotonicity, buildBaselineReport } from "./baseline";
 import { analyzeWasserstein } from "./wasserstein";
 import { replayStrategy, type ReplayObservation } from "./replay";
+import { runDeterministicReplayBaselines, type ReplayBaselineSlice } from "./replay-baseline";
+import { V33B_HYPOTHESIS_COUNT } from "./baseline-strategy";
 import { STRATEGIES } from "./strategies";
 import { exportRows } from "./repo.server";
 import type { SourceId } from "./schema";
@@ -108,4 +110,154 @@ export async function runWarehouseReplay() {
       note: baseline.note,
     },
   };
+}
+
+type PersistSlice = Pick<
+  ReplayBaselineSlice,
+  | "id"
+  | "version"
+  | "liveWired"
+  | "published"
+  | "seed"
+  | "hypothesisIndex"
+  | "considerations"
+  | "authorized"
+  | "labeled"
+  | "leakageViolations"
+  | "vsUniverseDelta"
+  | "median15mAuthorizedToken"
+> & { stats?: ReplayBaselineSlice["stats"]; result?: unknown };
+
+async function persistReplaySlice(
+  sql: Awaited<ReturnType<typeof getSql>>,
+  report: { tapeFingerprint: string; from: number; to: number; stepMs: number; observations: number; uniqueTokens: number; generatedAt: number },
+  s: PersistSlice,
+) {
+  const id = `${report.tapeFingerprint.slice(0, 16)}-${s.id}`;
+  const summary = "result" in s && s.result != null ? s.result : s;
+  const meanR = s.stats?.meanR ?? null;
+  const expectancy = s.stats?.expectancy ?? null;
+  const profitFactor =
+    s.stats?.profitFactor == null || !Number.isFinite(s.stats.profitFactor) ? null : s.stats.profitFactor;
+  const json = JSON.stringify(summary);
+
+  const v33b = [
+    id,
+    report.tapeFingerprint,
+    s.id,
+    String(s.version),
+    report.from,
+    report.to,
+    report.stepMs,
+    report.observations,
+    report.uniqueTokens,
+    s.considerations,
+    s.authorized,
+    s.labeled,
+    s.leakageViolations,
+    json,
+    s.vsUniverseDelta ?? null,
+    s.liveWired,
+    s.median15mAuthorizedToken ?? null,
+    s.seed,
+    s.hypothesisIndex,
+    meanR,
+    expectancy,
+    profitFactor,
+    report.generatedAt,
+  ];
+  try {
+    await sql.query(
+      `insert into replay_runs (
+         id, tape_fingerprint, strategy_id, strategy_version, from_ms, to_ms, step_ms,
+         observations, unique_tokens, considerations, authorized, labeled, leakage_violations,
+         result_summary, vs_universe_delta, live_wired, median_15m_token,
+         seed, hypothesis_index, mean_r, expectancy, profit_factor, created_at_ms
+       ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+       on conflict (id) do nothing`,
+      v33b,
+    );
+  } catch {
+    try {
+      await sql.query(
+        `insert into replay_runs (
+           id, tape_fingerprint, strategy_id, strategy_version, from_ms, to_ms, step_ms,
+           observations, unique_tokens, considerations, authorized, labeled, leakage_violations,
+           result_summary, vs_universe_delta, live_wired, median_15m_token, created_at_ms
+         ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18)
+         on conflict (id) do nothing`,
+        [...v33b.slice(0, 17), report.generatedAt],
+      );
+    } catch {
+      await sql.query(
+        `insert into replay_runs (
+           id, tape_fingerprint, strategy_id, strategy_version, from_ms, to_ms, step_ms,
+           observations, unique_tokens, considerations, authorized, labeled, leakage_violations,
+           result_summary, created_at_ms
+         ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
+         on conflict (id) do nothing`,
+        [...v33b.slice(0, 14), report.generatedAt],
+      );
+    }
+  }
+
+  if (!s.published) return;
+  try {
+    await sql.query(
+      `insert into replay_experiments (
+         id, name, version, seed, tape_fingerprint, hypothesis_index, hypothesis_count,
+         live_wired, result_summary, created_at_ms
+       ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+       on conflict (id) do nothing`,
+      [
+        id,
+        s.id,
+        String(s.version),
+        s.seed,
+        report.tapeFingerprint,
+        s.hypothesisIndex ?? 0,
+        V33B_HYPOTHESIS_COUNT,
+        false,
+        json,
+        report.generatedAt,
+      ],
+    );
+  } catch {
+    /* 0009 pending */
+  }
+}
+
+export async function runDeterministicBaselines() {
+  const observations = await loadReplayObservations(2500);
+  const to = observations.at(-1)?.ingestedAt ?? Date.now();
+  const from = Math.max(observations[0]?.ingestedAt ?? 0, to - 40 * 60_000);
+  const clipped = observations.filter((o) => o.ingestedAt >= from && o.ingestedAt <= to);
+  const report = runDeterministicReplayBaselines(clipped, { from, to, mints: 12, stepMs: 20_000 });
+  try {
+    const sql = await getSql();
+    const rows: PersistSlice[] = [
+      ...report.strategies,
+      {
+        id: "universe_buy_and_hold",
+        version: 1,
+        liveWired: false,
+        published: false,
+        seed: null,
+        hypothesisIndex: null,
+        considerations: 0,
+        authorized: 0,
+        labeled: report.universe.labeled,
+        leakageViolations: 0,
+        vsUniverseDelta: 0,
+        median15mAuthorizedToken: report.universe.median15m,
+        result: report.universe,
+      },
+    ];
+    for (const s of rows) {
+      await persistReplaySlice(sql, report, s);
+    }
+  } catch {
+    /* warehouse optional in unit tests */
+  }
+  return report;
 }

@@ -177,7 +177,9 @@ export function stampResearchQuality(next: LedgerRow) {
   next.research_quality_v2 = overallQualityV2(input, label, holderOk);
   next.research_grade_v2 = gradeFromV2(next.research_quality_v2, holderOk);
   next.holder_age_at_decision_ms =
-    next.ingested_at && next.decision_time ? Math.max(0, next.decision_time - next.ingested_at) : null;
+    next.holder_ingested_at != null && next.decision_time
+      ? Math.max(0, next.decision_time - next.holder_ingested_at)
+      : null;
   void RESEARCH_QUALITY_V2;
 }
 

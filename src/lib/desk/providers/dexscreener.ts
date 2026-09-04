@@ -61,6 +61,7 @@ export async function discoverDexScreener(): Promise<{
           `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
           7000,
           3,
+          "dexscreener",
         );
         if (!r.ok) continue;
         const body = (await r.json()) as { pairs?: DsPair[] };
@@ -78,7 +79,7 @@ export async function discoverDexScreener(): Promise<{
       if (byMint.size >= 40) break;
     }
     try {
-      const r = await getJsonRetry("https://api.dexscreener.com/token-boosts/latest/v1", 6000, 2);
+      const r = await getJsonRetry("https://api.dexscreener.com/token-boosts/latest/v1", 6000, 2, "dexscreener");
       if (r.ok) {
         const rows = (await r.json()) as { chainId?: string; tokenAddress?: string }[];
         const missing = rows
@@ -118,7 +119,7 @@ export async function lookupDexTokens(mints: string[]): Promise<TokenSnapshot[]>
   const eventTime = Date.now();
   const ingestedAt = eventTime;
   try {
-    const r = await getJsonRetry(`https://api.dexscreener.com/latest/dex/tokens/${unique.join(",")}`, 8000, 3);
+    const r = await getJsonRetry(`https://api.dexscreener.com/latest/dex/tokens/${unique.join(",")}`, 8000, 3, "dexscreener");
     if (!r.ok) return [];
     const extra = (await r.json()) as { pairs?: DsPair[] };
     const byMint = new Map<string, TokenSnapshot>();
@@ -171,6 +172,7 @@ export async function fetchSolPriceDex(): Promise<number | null> {
       "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
       6000,
       2,
+      "dexscreener",
     );
     if (!r.ok) return null;
     const body = (await r.json()) as { pairs?: DsPair[] };

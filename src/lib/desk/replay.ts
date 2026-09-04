@@ -67,6 +67,7 @@ export type ReplayConsideration = {
   visibleCount: number;
   hiddenCount: number;
   leaked: boolean;
+  regime: Regime;
 };
 
 export type ReplayRun = {
@@ -175,6 +176,13 @@ export function replayConsider(opts: {
   strategy: StrategyDef;
   regime?: Regime;
   equity?: number;
+  matches?: (args: {
+    token: TokenLive;
+    features: Features;
+    predictions: Predictions;
+    regime: Regime;
+  }) => boolean;
+  strategyLabel?: string;
 }): ReplayConsideration | null {
   const t = opts.decisionTime;
   const visible = observationsAsOf(opts.observations, t).filter((o) => o.mint === opts.mint);
@@ -198,7 +206,9 @@ export function replayConsider(opts: {
     now: t,
     dayDd: 0,
   });
-  const matched = strategyMatches(opts.strategy, { ...features, ...predictions });
+  const matched = opts.matches
+    ? opts.matches({ token, features, predictions, regime })
+    : strategyMatches(opts.strategy, { ...features, ...predictions });
   if (!matched && gov.approved) {
     gov.approved = false;
     gov.reasons = ["Strategy filters"];
@@ -207,7 +217,7 @@ export function replayConsider(opts: {
     decisionTime: t,
     mint: opts.mint,
     symbol: token.symbol,
-    strategyId: opts.strategy.id,
+    strategyId: opts.strategyLabel ?? opts.strategy.id,
     strategyVersion: STRATEGY_VERSION,
     matched,
     approved: Boolean(matched && gov.approved),
@@ -219,6 +229,7 @@ export function replayConsider(opts: {
     visibleCount: visible.length,
     hiddenCount: hidden.length,
     leaked,
+    regime,
   };
 }
 
@@ -273,7 +284,7 @@ export function labelReplayConsideration(
     flow_score: considered.predictions.flowScore,
     safety_score: considered.predictions.safetyScore,
     edge_score: considered.predictions.edgeScore,
-    regime: "chop" as Regime,
+    regime: considered.regime,
     strategy_id: considered.strategyId,
     strategy_version: considered.strategyVersion,
     feature_engine_version: "v1.3.0",
@@ -342,6 +353,13 @@ export function replayStrategy(opts: {
   stepMs?: number;
   regime?: Regime;
   mints?: string[];
+  matches?: (args: {
+    token: TokenLive;
+    features: Features;
+    predictions: Predictions;
+    regime: Regime;
+  }) => boolean;
+  strategyLabel?: string;
 }): ReplayRun {
   const obs = [...opts.observations].sort((a, b) => a.ingestedAt - b.ingestedAt);
   if (!obs.length) {
@@ -380,6 +398,8 @@ export function replayStrategy(opts: {
         decisionTime: t,
         strategy,
         regime: opts.regime,
+        matches: opts.matches,
+        strategyLabel: opts.strategyLabel,
       });
       if (!considered) continue;
       lastByMint[mint] = t;

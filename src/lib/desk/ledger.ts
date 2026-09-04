@@ -3,6 +3,7 @@ import { paperFillFromQuote } from "./governor.ts";
 import { LEDGER_ARCHIVE_MAX, LEDGER_MEMORY, STRATEGY_VERSION } from "./schema.ts";
 import { FEATURE_ENGINE_VERSION, LABEL_DEFINITION_VERSION } from "./versions.ts";
 import { stampResearchQuality } from "./labels.ts";
+import { freezeHolderAtDecision } from "./holder-at-decision.ts";
 import type {
   Intent,
   LedgerRow,
@@ -70,6 +71,11 @@ export function intentToLedger(intent: Intent, taken: boolean, slipBps: number):
       ? paperFillFromQuote(mid, s.buyQuote, slipBps, "buy", intent.governor.entryImpactPct)
       : null;
   const bucket = f.bucket ?? bucketOf(f.tokenAgeS);
+  const frozenHolder = freezeHolderAtDecision({
+    decisionTime: intent.decisionTs,
+    snapshot: s,
+    tokenAgeS: f.tokenAgeS,
+  });
   const row: LedgerRow = {
     decision_id: intent.intentId,
     event_time: s.priceUsd.eventTime,
@@ -89,8 +95,12 @@ export function intentToLedger(intent: Intent, taken: boolean, slipBps: number):
     buy_sell_imbalance: f.usdImbalance,
     unique_buyers: s.uniqueBuyers5m.value,
     unique_sellers: s.uniqueSellers5m.value,
-    holder_count: s.holders.value,
-    holder_concentration: s.top10Pct.value,
+    holder_count: frozenHolder.holders,
+    holder_concentration: frozenHolder.concentration,
+    holder_status: frozenHolder.status,
+    holder_source: frozenHolder.source,
+    holder_event_time: frozenHolder.eventTime,
+    holder_ingested_at: frozenHolder.ingestedAt,
     mint_auth: f.mintAuth,
     freeze_auth: f.freezeAuth,
     entry_impact: intent.governor.entryImpactPct,

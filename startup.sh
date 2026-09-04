@@ -2,6 +2,19 @@
 set -eu
 cd /workspace
 
+if [ -f /workspace/data/meridian.env ]; then
+  set -a
+  . /workspace/data/meridian.env
+  set +a
+fi
+
+if [ -f /tmp/meridian.env ]; then
+  set -a
+  # Runtime-only secrets. Never commit. Falls back to PGLite if missing.
+  . /tmp/meridian.env
+  set +a
+fi
+
 start_tick() {
   if [ -f /tmp/meridian-tick.pid ] && kill -0 "$(cat /tmp/meridian-tick.pid)" 2>/dev/null; then
     return 0

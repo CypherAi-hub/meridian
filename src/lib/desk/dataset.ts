@@ -33,6 +33,20 @@ export function walkForwardSplit<T extends { decision_time: number }>(
   };
 }
 
+/** Train may only keep rows whose label horizon ends before the split bound. */
+export function walkForwardPurgeSplit<T extends { decision_time: number }>(
+  rows: T[],
+  trainEnd: number,
+  validationEnd: number,
+  horizonMs = 60 * 60_000,
+): { train: T[]; validation: T[]; test: T[] } {
+  return {
+    train: rows.filter((r) => r.decision_time + horizonMs < trainEnd),
+    validation: rows.filter((r) => r.decision_time >= trainEnd && r.decision_time + horizonMs < validationEnd),
+    test: rows.filter((r) => r.decision_time >= validationEnd),
+  };
+}
+
 export function tokenLeakage(train: Array<{ tokenAddress: string }>, test: Array<{ tokenAddress: string }>): string[] {
   const inTrain = new Set(train.map((r) => r.tokenAddress));
   const leaked = new Set<string>();

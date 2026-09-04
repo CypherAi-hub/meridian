@@ -3,6 +3,8 @@ data
 attachments
 artifacts
 *.log
+.env
+*.env
 .output
 dist
 .tanstack

@@ -48,7 +48,7 @@ export async function fetchGeckoPools(): Promise<{
       "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
       "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
     ];
-    const res = await Promise.all(urls.map((u) => getJsonRetry(u, 6000, 2)));
+    const res = await Promise.all(urls.map((u) => getJsonRetry(u, 6000, 2, "geckoterminal")));
     const bodies = await Promise.all(
       res.map(async (r) => {
         if (!r.ok) return { data: [] as GeckoPool[], status: r.status };

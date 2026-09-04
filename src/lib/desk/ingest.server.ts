@@ -2,14 +2,15 @@ import { bucketOf, bucketRank } from "./buckets";
 import { discoverDexScreener, enrichDexScreener, fetchSolPriceDex, lookupDexTokens } from "./providers/dexscreener";
 import { fetchGeckoPools } from "./providers/gecko";
 import { enrichHolders } from "./providers/holders";
-import { quoteSolUsdc, quoteToken, cachedQuoteAge } from "./providers/jupiter";
+import { quoteSolUsdc, quoteToken, cachedQuoteAge, skippedQuote } from "./providers/jupiter";
 import { mergeSnap } from "./providers/normalize";
 import { enrichSolana } from "./providers/solana";
 import type { MarketTape, SourceHealth, TokenSnapshot } from "./schema";
+import { WSOL } from "./schema";
 import { makeHolderJob } from "./holder-queue";
 import { routePriority, selectRouteJobs, shouldRefreshRoute } from "./route-priority";
 import { deskSettings } from "./config";
-import { budgetFor } from "./rate-budget";
+import { budgetFor, JUPITER_KEYED_BUDGET } from "./rate-budget";
 
 function health(
   id: SourceHealth["id"],
@@ -121,12 +122,27 @@ export async function ingestSlowEnrichment(opts: {
     focus: want,
   });
   const by = new Map(quoted.map((t) => [t.address, t]));
+  const jupOk = quoted.some((t) => t.sellQuote?.available || t.buyQuote?.available);
+  const jupLag = quoted.find((t) => t.sellQuote)?.sellQuote?.latencyMs ?? null;
+  const checked = quoted.filter((t) => t.sellQuote && t.sellQuote.failureReason !== "NOT_CHECKED").length;
+  const jupSources: SourceHealth[] = [
+    health(
+      "jupiter",
+      jupOk,
+      jupLag,
+      jupOk ? `${checked} quotes` : quoted.some((t) => t.sellQuote) ? (quoted.find((t) => t.sellQuote)?.sellQuote?.error ?? "quoted") : "no priority jobs",
+    ),
+  ];
   return {
     ...opts.tape,
     tokens: opts.tape.tokens.map((t) => by.get(t.address) ?? t),
     ingestedAt: Date.now(),
     fetchMs: Date.now() - t0,
-    sources: [...opts.tape.sources.filter((s) => s.id !== "rugcheck" && s.id !== "birdeye" && s.id !== "helius"), ...holders.sources],
+    sources: [
+      ...opts.tape.sources.filter((s) => s.id !== "rugcheck" && s.id !== "birdeye" && s.id !== "helius" && s.id !== "jupiter"),
+      ...jupSources,
+      ...holders.sources,
+    ],
   };
 }
 
@@ -144,7 +160,6 @@ async function quotePriorityTargets(
   solPriceUsd: number | null,
   ctx: { held: Set<string>; pending: Set<string>; focus: Set<string> },
 ): Promise<TokenSnapshot[]> {
-  if (!solPriceUsd) return tokens;
   const settings = deskSettings();
   const limit = settings.jupiterApiKey ? 8 : 3;
   const now = Date.now();
@@ -162,13 +177,31 @@ async function quotePriorityTargets(
     jobs.filter((j) => shouldRefreshRoute({ lastQuotedAt: cachedQuoteAge(j.mint), now, priority: j.priority })),
     limit,
   );
-  const budget = budgetFor("jupiter");
   const quoteMap = new Map<string, TokenSnapshot["buyQuote"]>();
   const sellMap = new Map<string, TokenSnapshot["sellQuote"]>();
+  const key = settings.jupiterApiKey;
+  const budget = budgetFor("jupiter", key ? JUPITER_KEYED_BUDGET : undefined);
   for (const job of selected) {
-    if (!budget.take()) break;
     const t = tokens.find((x) => x.address === job.mint);
     if (!t) continue;
+    const skipArgs = {
+      inputMint: t.address,
+      outputMint: WSOL,
+      amount: "0",
+      notionalUsd: 120,
+    };
+    if (!solPriceUsd) {
+      const skipped = skippedQuote(skipArgs, "no sol price");
+      quoteMap.set(t.address, skipped);
+      sellMap.set(t.address, skipped);
+      continue;
+    }
+    if (budget.limited()) {
+      const skipped = skippedQuote(skipArgs, "rate budget empty");
+      quoteMap.set(t.address, skipped);
+      sellMap.set(t.address, skipped);
+      continue;
+    }
     try {
       const q = await quoteToken({
         mint: t.address,
@@ -179,8 +212,10 @@ async function quotePriorityTargets(
       });
       quoteMap.set(t.address, q.buy);
       sellMap.set(t.address, q.sell);
-    } catch {
-      /* keep last quote */
+    } catch (e) {
+      const skipped = skippedQuote(skipArgs, e instanceof Error ? e.message : "quote failed");
+      quoteMap.set(t.address, skipped);
+      sellMap.set(t.address, skipped);
     }
   }
   return tokens.map((t) => ({
@@ -246,9 +281,9 @@ async function ingestOnce(opts?: {
   const dex = await enrichDexScreener(selected);
   let solPrice = gecko.solPrice ?? (await fetchSolPriceDex());
 
-  const jupBudget = budgetFor("jupiter");
+  const jupBudget = budgetFor("jupiter", deskSettings().jupiterApiKey ? JUPITER_KEYED_BUDGET : undefined);
   let jupProbe = null as Awaited<ReturnType<typeof quoteSolUsdc>> | null;
-  if (jupBudget.take()) {
+  if (!solPrice) {
     jupProbe = await quoteSolUsdc();
     if (jupProbe.available && Number(jupProbe.outAmount) > 0) {
       solPrice = Number(jupProbe.outAmount) / 1e6 / 0.01;
@@ -279,6 +314,11 @@ async function ingestOnce(opts?: {
   const holderSources = holders.sources;
   const solLive = !sol.error && quoted.some((t) => t.mintAuth.value != null);
   const rpcHolders = holderSources.find((s) => s.id === "solana");
+  const jupDetail = jupOk
+    ? "read-only quotes"
+    : jupProbe?.error ??
+      quoted.find((t) => t.sellQuote)?.sellQuote?.error ??
+      (jupBudget.limited() ? "rate budget empty" : "no quote");
 
   const sources: SourceHealth[] = [
     health(
@@ -295,7 +335,7 @@ async function ingestOnce(opts?: {
       dsDisc.lagMs,
       dsDisc.error ?? `${dsDisc.tokens.length} discovered`,
     ),
-    health("jupiter", jupOk, jupLag, jupOk ? "read-only quotes" : jupProbe?.error ?? "deferred"),
+    health("jupiter", jupOk, jupLag, jupDetail),
     health(
       "solana",
       solLive || Boolean(rpcHolders?.status === "live"),

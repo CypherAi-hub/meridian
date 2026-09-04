@@ -8,8 +8,11 @@ type AccountValue = { data?: [string, string]; owner?: string } | null;
 const PUBLIC_RPCS = ["https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"];
 
 function rpcUrls(): string[] {
-  const custom = deskSettings().solanaRpcUrl;
-  return custom ? [custom, ...PUBLIC_RPCS] : PUBLIC_RPCS;
+  const s = deskSettings();
+  const dedicated = [s.solanaRpcUrl, s.heliusRpcUrl, s.heliusGatekeeperUrl].filter(
+    (u, i, all): u is string => Boolean(u) && all.indexOf(u) === i,
+  );
+  return dedicated.length ? [...dedicated, ...PUBLIC_RPCS] : PUBLIC_RPCS;
 }
 
 export async function solanaRpc<T>(payload: unknown): Promise<T> {

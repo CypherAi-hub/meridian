@@ -18,6 +18,7 @@ import { Route as ApiResearchRouteImport } from './routes/api/research'
 import { Route as ApiTapeRouteImport } from './routes/api/tape'
 import { Route as ApiTickRouteImport } from './routes/api/tick'
 import { Route as ApiHealthLiveRouteImport } from './routes/api/health.live'
+import { Route as ApiHealthMigrationsRouteImport } from './routes/api/health.migrations'
 import { Route as ApiHealthReadyRouteImport } from './routes/api/health.ready'
 import { Route as ApiHealthResearchRouteImport } from './routes/api/health.research'
 
@@ -66,6 +67,11 @@ const ApiHealthLiveRoute = ApiHealthLiveRouteImport.update({
   path: '/live',
   getParentRoute: () => ApiHealthRoute,
 } as any)
+const ApiHealthMigrationsRoute = ApiHealthMigrationsRouteImport.update({
+  id: '/migrations',
+  path: '/migrations',
+  getParentRoute: () => ApiHealthRoute,
+} as any)
 const ApiHealthReadyRoute = ApiHealthReadyRouteImport.update({
   id: '/ready',
   path: '/ready',
@@ -87,6 +93,7 @@ export interface FileRoutesByFullPath {
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/migrations': typeof ApiHealthMigrationsRoute
   '/api/health/ready': typeof ApiHealthReadyRoute
   '/api/health/research': typeof ApiHealthResearchRoute
 }
@@ -100,6 +107,7 @@ export interface FileRoutesByTo {
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/migrations': typeof ApiHealthMigrationsRoute
   '/api/health/ready': typeof ApiHealthReadyRoute
   '/api/health/research': typeof ApiHealthResearchRoute
 }
@@ -114,6 +122,7 @@ export interface FileRoutesById {
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
+  '/api/health/migrations': typeof ApiHealthMigrationsRoute
   '/api/health/ready': typeof ApiHealthReadyRoute
   '/api/health/research': typeof ApiHealthResearchRoute
 }
@@ -129,6 +138,7 @@ export interface FileRouteTypes {
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
+    | '/api/health/migrations'
     | '/api/health/ready'
     | '/api/health/research'
   fileRoutesByTo: FileRoutesByTo
@@ -142,6 +152,7 @@ export interface FileRouteTypes {
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
+    | '/api/health/migrations'
     | '/api/health/ready'
     | '/api/health/research'
   id:
@@ -155,6 +166,7 @@ export interface FileRouteTypes {
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
+    | '/api/health/migrations'
     | '/api/health/ready'
     | '/api/health/research'
   fileRoutesById: FileRoutesById
@@ -235,6 +247,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiHealthLiveRouteImport
       parentRoute: typeof ApiHealthRoute
     }
+    '/api/health/migrations': {
+      id: '/api/health/migrations'
+      path: '/migrations'
+      fullPath: '/api/health/migrations'
+      preLoaderRoute: typeof ApiHealthMigrationsRouteImport
+      parentRoute: typeof ApiHealthRoute
+    }
     '/api/health/ready': {
       id: '/api/health/ready'
       path: '/ready'
@@ -254,12 +273,14 @@ declare module '@tanstack/react-router' {
 
 interface ApiHealthRouteChildren {
   ApiHealthLiveRoute: typeof ApiHealthLiveRoute
+  ApiHealthMigrationsRoute: typeof ApiHealthMigrationsRoute
   ApiHealthReadyRoute: typeof ApiHealthReadyRoute
   ApiHealthResearchRoute: typeof ApiHealthResearchRoute
 }
 
 const ApiHealthRouteChildren: ApiHealthRouteChildren = {
   ApiHealthLiveRoute: ApiHealthLiveRoute,
+  ApiHealthMigrationsRoute: ApiHealthMigrationsRoute,
   ApiHealthReadyRoute: ApiHealthReadyRoute,
   ApiHealthResearchRoute: ApiHealthResearchRoute,
 }

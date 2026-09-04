@@ -29,6 +29,14 @@ export const Route = createFileRoute("/api/research")({
           const { runWarehouseReplay } = await import("@/lib/desk/replay.server");
           return Response.json(await runWarehouseReplay());
         }
+        if (view === "replay-baselines" || view === "baselines") {
+          const { runDeterministicBaselines } = await import("@/lib/desk/replay.server");
+          return Response.json(await runDeterministicBaselines());
+        }
+        if (view === "migrations") {
+          const { loadMigrationStatus } = await import("@/lib/desk/neon-migrate");
+          return Response.json(await loadMigrationStatus());
+        }
         const { exportRows, rowsToCsv } = await import("@/lib/desk/repo.server");
         const rows = await exportRows();
         if (format === "csv") {

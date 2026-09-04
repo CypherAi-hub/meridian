@@ -62,7 +62,7 @@ export function DeskApp() {
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
           <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
-          <p className="hidden text-xs text-muted lg:block">V3.3A.2 · data factory</p>
+          <p className="hidden text-xs text-muted lg:block">V3.3B · warehouse replay</p>
         </div>
         <Badge variant={desk.worker.db === "neon" ? "up" : "warn"}>
           {(desk.quality?.environment ?? "preview").toUpperCase()} / {(desk.worker.db ?? "pglite").toUpperCase()}
@@ -646,13 +646,29 @@ function ConfigStrip() {
       rpc?: string;
       database?: string;
     };
+    migrationsPending?: number;
+    neonStep?: string;
+    jupiterRate?: number | null;
+    jupiterSkipped?: number | null;
+    rugcheckRate?: number | null;
   } | null>(null);
   useEffect(() => {
     let alive = true;
     void fetch("/api/health", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : null))
       .then((payload) => {
-        if (alive && payload?.public) setCfg(payload.public);
+        if (!alive || !payload?.public) return;
+        const budgets = Array.isArray(payload.rateBudgets) ? payload.rateBudgets : [];
+        const jup = budgets.find((b: { name?: string }) => b.name === "jupiter");
+        const rug = budgets.find((b: { name?: string }) => b.name === "rugcheck");
+        setCfg({
+          ...payload.public,
+          migrationsPending: payload.migrations?.pending?.length ?? 0,
+          neonStep: payload.migrations?.currentStep ?? payload.migrations?.steps?.find((s: { status?: string }) => s.status === "current")?.name,
+          jupiterRate: typeof jup?.rate === "number" ? jup.rate : null,
+          jupiterSkipped: typeof jup?.skipped === "number" ? jup.skipped : null,
+          rugcheckRate: typeof rug?.rate === "number" ? rug.rate : null,
+        });
       })
       .catch(() => undefined);
     return () => {
@@ -669,6 +685,15 @@ function ConfigStrip() {
       <span>rpc {c.rpc ?? "public"}</span>
       <span>db {c.database ?? "PGLITE"}</span>
       <span>epoch {cfg.collectionEpoch ?? "—"}</span>
+      <span>schema {cfg.migrationsPending ? `${cfg.migrationsPending} pending` : "current"}</span>
+      <span>neon {cfg.neonStep ?? "preview"}</span>
+      {cfg.jupiterRate != null ? (
+        <span>
+          jup {cfg.jupiterRate.toFixed(2)}/s
+          {cfg.jupiterSkipped ? ` · skip ${cfg.jupiterSkipped}` : ""}
+        </span>
+      ) : null}
+      {cfg.rugcheckRate != null ? <span>rug {cfg.rugcheckRate.toFixed(2)}/s</span> : null}
     </div>
   );
 }
@@ -687,12 +712,39 @@ function ResearchPanel({
   onExport: (format: "json" | "csv") => void;
 }) {
   const [edge, setEdge] = useState<MonotonicityReport | null>(null);
+  const [replay, setReplay] = useState<{
+    tapeFingerprint?: string;
+    readyForModeling?: boolean;
+    readyForReplay?: boolean;
+    hypothesisCount?: number;
+    publishedSeed?: number;
+    leakageViolations?: number;
+    universe?: { median15m: number | null; labeled: number; uniqueTokens: number };
+    strategies?: Array<{
+      id: string;
+      authorized: number;
+      labeled: number;
+      median15mAuthorizedToken: number | null;
+      vsUniverseDelta: number | null;
+      beatsUniverse: boolean | null;
+      liveWired: boolean;
+      published?: boolean;
+      seed?: number | null;
+      stats?: { expectancy: number | null; meanR: number | null; profitFactor: number | null };
+    }>;
+  } | null>(null);
   useEffect(() => {
     let alive = true;
     void fetch("/api/research?view=edge", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : null))
       .then((payload: MonotonicityReport | null) => {
         if (alive && payload && typeof payload.verdict === "string") setEdge(payload);
+      })
+      .catch(() => undefined);
+    void fetch("/api/research?view=replay-baselines", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload) => {
+        if (alive && payload && typeof payload.tapeFingerprint === "string") setReplay(payload);
       })
       .catch(() => undefined);
     return () => {
@@ -780,7 +832,9 @@ function ResearchPanel({
           epoch {quality.collectionEpoch ?? "—"} · env {quality.environment ?? "preview"} · soak{" "}
           {quality.productionSoakStartedAtMs ? "production" : "preview-not-counted"}
         </p>
-        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">Current collection epoch</p>
+        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">
+          Current epoch · GO gates (not lifetime)
+        </p>
         <div className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
           <QualityRow label="epoch tokens" value={compact(quality.epochUniqueTokens ?? 0)} />
           <QualityRow label="epoch A/B" value={`${(quality.epochGradeA ?? 0) + (quality.epochGradeB ?? 0)}`} />
@@ -805,7 +859,9 @@ function ResearchPanel({
           <QualityRow label="veto route" value={compact(quality.vetoRoute ?? 0)} />
           <QualityRow label="veto security" value={compact(quality.vetoSecurity ?? 0)} />
         </div>
-        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">Lifetime corpus</p>
+        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">
+          Lifetime corpus · keep · do not mix into training
+        </p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
           <QualityRow label="tokens observed" value={compact(quality.tokensObserved)} />
           <QualityRow label="raw observations" value={compact(quality.rawObservations)} />
@@ -915,6 +971,36 @@ function ResearchPanel({
           <QualityRow label="provider fails / h" value={compact(quality.providerFailuresHour)} />
         </div>
       </div>
+      {replay ? (
+        <div className="border-b border-border px-4 py-3 sm:px-5">
+          <p className="mb-2 text-xs uppercase tracking-wider text-subtle">Deterministic replay · V3.3B published hypotheses</p>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+            <QualityRow label="ready for replay" value={replay.readyForReplay ? "YES" : "NO"} />
+            <QualityRow label="ready for ML" value={replay.readyForModeling ? "YES" : "NO"} />
+            <QualityRow label="hypotheses" value={String(replay.hypothesisCount ?? 3)} />
+            <QualityRow label="seed" value={String(replay.publishedSeed ?? 1337)} />
+            <QualityRow label="leakage" value={compact(replay.leakageViolations ?? 0)} />
+            <QualityRow label="tape fp" value={(replay.tapeFingerprint ?? "—").slice(0, 10)} />
+            <QualityRow
+              label="universe 15m"
+              value={replay.universe?.median15m == null ? "—" : pct(replay.universe.median15m)}
+            />
+            {(replay.strategies ?? []).map((s) => (
+              <QualityRow
+                key={s.id}
+                label={`${s.published ? "pub " : s.liveWired ? "live " : "diag "}${s.id.replaceAll("_", " ")}`}
+                value={`${s.authorized} auth${
+                  s.stats?.expectancy == null ? "" : ` · E ${pct(s.stats.expectancy)}`
+                }${s.stats?.meanR == null ? "" : ` · ${s.stats.meanR.toFixed(2)}R`}${
+                  s.median15mAuthorizedToken == null
+                    ? ""
+                    : ` · ${pct(s.median15mAuthorizedToken)}${s.vsUniverseDelta == null ? "" : s.beatsUniverse ? " > uni" : " ≤ uni"}`
+                }`}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
       <div className="border-b border-border px-4 py-3 sm:px-5">
         <p className="mb-2 text-xs uppercase tracking-wider text-subtle">Edge score monotonicity · replay diagnostic</p>
         {edge ? (

@@ -13,10 +13,12 @@ const EnvSchema = z.object({
   BIRDEYE_API_KEY: z.string().optional(),
   HELIUS_API_KEY: z.string().optional(),
   HELIUS_RPC_URL: z.string().optional(),
+  HELIUS_GATEKEEPER_URL: z.string().optional(),
   SOLANA_RPC_URL: z.string().optional(),
   JUPITER_API_KEY: z.string().optional(),
   DATABASE_URL: z.string().optional(),
   MERIDIAN_EXECUTION_MODE: z.enum(["PAPER"]).optional(),
+  EXECUTION_MODE: z.enum(["PAPER"]).optional(),
   MERIDIAN_ENV: z.string().optional(),
   UNIVERSE_INTERVAL_MS: z.coerce.number().int().min(5_000).optional(),
   ACTIVE_INTERVAL_MS: z.coerce.number().int().min(1_000).optional(),
@@ -43,6 +45,7 @@ export type DeskSettings = {
   birdeyeApiKey: string | null;
   heliusApiKey: string | null;
   heliusRpcUrl: string | null;
+  heliusGatekeeperUrl: string | null;
   solanaRpcUrl: string | null;
   jupiterApiKey: string | null;
   collectionEpoch: string;
@@ -50,12 +53,12 @@ export type DeskSettings = {
 
 function clean(v: string | undefined): string | null {
   if (!v || !v.trim()) return null;
-  return v.trim();
+  return v.trim().replace(/\.+$/, "");
 }
 
 export function loadDeskConfig(): DeskSettings {
   const parsed = EnvSchema.parse(process.env ?? {});
-  const mode = parsed.MERIDIAN_EXECUTION_MODE ?? "PAPER";
+  const mode = parsed.MERIDIAN_EXECUTION_MODE ?? parsed.EXECUTION_MODE ?? "PAPER";
   if (mode !== "PAPER") {
     throw new Error("Meridian V3.3A.2 supports PAPER mode only.");
   }
@@ -84,6 +87,7 @@ export function loadDeskConfig(): DeskSettings {
     birdeyeApiKey: clean(parsed.BIRDEYE_API_KEY),
     heliusApiKey: clean(parsed.HELIUS_API_KEY),
     heliusRpcUrl: clean(parsed.HELIUS_RPC_URL),
+    heliusGatekeeperUrl: clean(parsed.HELIUS_GATEKEEPER_URL),
     solanaRpcUrl: clean(parsed.SOLANA_RPC_URL),
     jupiterApiKey: clean(parsed.JUPITER_API_KEY),
     collectionEpoch: currentEpochName(environment),

@@ -1,7 +1,8 @@
 import { applyTape } from "./engine";
 import { ingestFastPath, ingestSlowEnrichment, ingestTape } from "./ingest.server";
-import { persistDesk, persistFastPath, loadDesk, recordError, startWorkerTick, finishWorkerTick, acquirePrimaryLease, renewPrimaryLease, recordSoakIncident } from "./repo.server";
+import { persistDesk, persistFastPath, loadDesk, recordError, startWorkerTick, finishWorkerTick, acquirePrimaryLease, renewPrimaryLease, recordSoakIncident, hydrateHoldersOntoTape } from "./repo.server";
 import { writeHeartbeat } from "./quality.server";
+import { persistRateBudgets, rateLimitStormActive, restoreRateBudgets } from "./rate-budget.server";
 import { researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES } from "./watch";
 import { assertPaperMode, deskSettings } from "./config";
 import { bucketOf } from "./buckets";
@@ -69,6 +70,7 @@ export async function runTick(): Promise<DeskSnapshot> {
       return prev;
     }
     await startWorkerTick(tickId, t0);
+    await restoreRateBudgets();
     const prev = await loadDesk();
     try {
       const watch = activeMints(prev);
@@ -86,7 +88,9 @@ export async function runTick(): Promise<DeskSnapshot> {
         held,
         pending,
       });
-      const next = applyTape(prev, enriched);
+      const decidedAt = Date.now();
+      const withHolders = await hydrateHoldersOntoTape(enriched.tokens, decidedAt);
+      const next = applyTape(prev, { ...enriched, tokens: withHolders, ingestedAt: decidedAt });
       const pendingRows = next.pending.filter((r) => !r.labels_complete);
       const lastProviderOkAt = next.sources.reduce<number | null>((acc, s) => {
         if (s.lastOkAt == null) return acc;
@@ -108,6 +112,14 @@ export async function runTick(): Promise<DeskSnapshot> {
         observationsWritten: (next.worker.observationsWritten ?? 0) + next.tokens.length,
       };
       await persistDesk(next, prev);
+      await persistRateBudgets();
+      if (rateLimitStormActive()) {
+        void recordSoakIncident({
+          type: "RATE_LIMIT_STORM",
+          severity: "warn",
+          metadata: { instance: INSTANCE_ID },
+        });
+      }
       await writeHeartbeat({
         status: "live",
         durationMs: duration,
@@ -227,6 +239,25 @@ export function ensureWorker() {
       });
     }, 10_000);
   }
+}
+
+export function stopWorker() {
+  if (g.__meridianTickTimer__ != null) {
+    clearInterval(g.__meridianTickTimer__);
+    g.__meridianTickTimer__ = undefined;
+  }
+  if (g.__meridianActiveTimer__ != null) {
+    clearInterval(g.__meridianActiveTimer__);
+    g.__meridianActiveTimer__ = undefined;
+  }
+  if (g.__meridianLeaseTimer__ != null) {
+    clearInterval(g.__meridianLeaseTimer__);
+    g.__meridianLeaseTimer__ = undefined;
+  }
+}
+
+export function workerInstanceId() {
+  return INSTANCE_ID;
 }
 
 export function peekLast() {
