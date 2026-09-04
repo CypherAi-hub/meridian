@@ -111,6 +111,27 @@ export const Route = createFileRoute("/api/research")({
             alerts,
           });
         }
+        if (view === "tournament" || view === "eval") {
+          const { runSyntheticTournament } = await import("@/lib/desk/v34-tournament");
+          const { ML_TRAINING_LOCKED } = await import("@/lib/desk/v34-lock");
+          const t = runSyntheticTournament({ n: 120, seed: 1337 });
+          return Response.json({
+            training: "LOCKED",
+            locked: ML_TRAINING_LOCKED,
+            usedProductionCorpus: t.usedProductionCorpus,
+            capitalAuthority: t.capitalAuthority,
+            beatsBaseRate: t.beatsBaseRate,
+            walkForward: t.walkForward,
+            scorecard: t.scorecard,
+            promotion: t.promotion,
+            kill: t.kill,
+            artifact: {
+              artifactId: t.logistic.artifactId,
+              status: t.logistic.status,
+              calibratorVersion: t.logistic.calibratorVersion,
+            },
+          });
+        }
         if (view === "migrations") {
           const { loadMigrationStatus } = await import("@/lib/desk/neon-migrate");
           return Response.json(await loadMigrationStatus());

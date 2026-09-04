@@ -59,11 +59,14 @@ export type PromotionState = "CANDIDATE" | "SHADOW" | "CHALLENGER" | "CHAMPION";
 export const PROMOTION_CHAIN: readonly PromotionState[] = ["CANDIDATE", "SHADOW", "CHALLENGER", "CHAMPION"];
 
 export type ModelArtifact = {
+  artifactId: string;
   modelId: string;
   version: string;
   datasetHash: string;
   jobHash: string;
   featureList: readonly string[];
+  featureSchemaHash: string;
+  calibratorVersion: string;
   metrics: EvalReport | null;
   calibration: CalibrationBin[] | null;
   commitSha: string;
@@ -75,10 +78,24 @@ export type ModelArtifact = {
 };
 
 export function registerArtifact(
-  input: Omit<ModelArtifact, "usedForCapital" | "status" | "prepVersion"> & { status?: PromotionState },
+  input: Omit<ModelArtifact, "usedForCapital" | "status" | "prepVersion" | "artifactId" | "featureSchemaHash" | "calibratorVersion"> & {
+    status?: PromotionState;
+    artifactId?: string;
+    featureSchemaHash?: string;
+    calibratorVersion?: string;
+  },
 ): ModelArtifact {
+  const artifactId =
+    input.artifactId ??
+    createHash("sha256")
+      .update(`${input.modelId}:${input.version}:${input.datasetHash}:${input.jobHash}:${input.commitSha}:${input.seed}`)
+      .digest("hex")
+      .slice(0, 16);
   return {
     ...input,
+    artifactId,
+    featureSchemaHash: input.featureSchemaHash ?? "unknown",
+    calibratorVersion: input.calibratorVersion ?? "none",
     status: input.status ?? "CANDIDATE",
     usedForCapital: false,
     prepVersion: V34_PREP_VERSION,

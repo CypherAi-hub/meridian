@@ -875,6 +875,7 @@ function ResearchPanel({
               eligibleRows: 0,
             }).status}
           />
+          <QualityRow label="eval lab" value="PREP.2 · synthetic" />
           <QualityRow
             label="ops alerts"
             value={String(
