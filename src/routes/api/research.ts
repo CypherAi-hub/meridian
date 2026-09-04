@@ -132,6 +132,40 @@ export const Route = createFileRoute("/api/research")({
             },
           });
         }
+        if (view === "governance") {
+          const { preregisterExperiment } = await import("@/lib/desk/v34-preregister");
+          const { createHoldoutVault } = await import("@/lib/desk/v34-holdout");
+          const { FEATURE_SCHEMA } = await import("@/lib/desk/versions");
+          const { ML_TRAINING_LOCKED, V34_PREP_VERSION } = await import("@/lib/desk/v34-lock");
+          const vault = createHoldoutVault(Date.now() + 30 * 86400000, Date.now() + 60 * 86400000);
+          const prereg = preregisterExperiment({
+            experimentId: "v34-prep3-template",
+            target: "hit10",
+            featureSet: FEATURE_SCHEMA.fields,
+            hyperSearch: { algorithm: ["logistic_regression"] },
+            splits: { trainEnd: 0, validationEnd: 0, holdoutStart: vault.from },
+            primaryMetric: "brier",
+            promotionThresholds: {
+              maxBrier: 0.22,
+              maxEce: 0.1,
+              maxWorstFoldBrier: 0.28,
+              maxTailLoss: 0.4,
+              minCoverage: 0.8,
+              minEconomicExpectancy: 0,
+              minN: 200,
+            },
+            failureCriteria: ["holdout worse than base-rate", "non-monotonic probabilities", "regime catastrophe"],
+          });
+          return Response.json({
+            training: "LOCKED",
+            locked: ML_TRAINING_LOCKED,
+            prepVersion: V34_PREP_VERSION,
+            holdoutLocked: vault.locked,
+            unlockCount: vault.unlockCount,
+            capitalAuthority: false,
+            prereg: { experimentId: prereg.experimentId, hash: prereg.hash, primaryMetric: prereg.primaryMetric },
+          });
+        }
         if (view === "migrations") {
           const { loadMigrationStatus } = await import("@/lib/desk/neon-migrate");
           return Response.json(await loadMigrationStatus());

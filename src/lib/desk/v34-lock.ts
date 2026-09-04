@@ -3,7 +3,7 @@ import type { DataQuality } from "./types.ts";
 
 /** Training stays off until the production corpus earns it. Not a feature flag to flip for curiosity. */
 export const ML_TRAINING_LOCKED = true;
-export const V34_PREP_VERSION = "v34-prep.2";
+export const V34_PREP_VERSION = "v34-prep.3";
 export const PRODUCTION_EPOCH = "v33b_production";
 
 export function assertTrainingLocked(action = "train"): never {
