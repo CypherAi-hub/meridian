@@ -3,7 +3,7 @@
  * with `@/` aliases and optional `.ts` extensions (Vite-style).
  */
 import { existsSync } from "node:fs";
-import { dirname, extname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,10 +30,9 @@ export async function resolve(specifier, context, nextResolve) {
   }
   if (specifier.startsWith(".") && context.parentURL) {
     const parentDir = dirname(fileURLToPath(context.parentURL));
-    if (!extname(specifier)) {
-      const hit = tryFile(join(parentDir, specifier));
-      if (hit) return { url: hit, shortCircuit: true };
-    }
+    // extname("./ingest.server") is ".server" — still need to try ".ts"
+    const hit = tryFile(join(parentDir, specifier));
+    if (hit) return { url: hit, shortCircuit: true };
   }
   return nextResolve(specifier, context);
 }
