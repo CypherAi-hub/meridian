@@ -479,20 +479,20 @@ async function loadResearchAggregated(db: Sql): Promise<ResearchSummary> {
       `select ${dim} as key,
          count(*)::int as n,
          count(*) filter (where c.trade_taken)::int as taken,
-         count(*) filter (where coalesce(o.labels_complete, false))::int as labeled,
+         count(*) filter (where coalesce(o.labels_complete, c.labels_complete, false))::int as labeled,
          coalesce(sum(case
-           when coalesce(o.labels_complete, false)
+           when coalesce(o.labels_complete, c.labels_complete, false)
             and nullif(s.snapshot->>'price','')::float > 0
             and o.price_after_5m is not null
            then o.price_after_5m / nullif(s.snapshot->>'price','')::float - 1
            else 0 end), 0)::float as sum5m,
          count(*) filter (
-           where coalesce(o.labels_complete, false)
-             and nullif(s.snapshot->>'price','') is not null
+           where coalesce(o.labels_complete, c.labels_complete, false)
+             and nullif(s.snapshot->>'price','')::float > 0
              and o.price_after_5m is not null
          )::int as n5m,
-         coalesce(sum(case when coalesce(o.labels_complete, false) then o.net_execution_return else 0 end), 0)::float as sumNet,
-         count(*) filter (where coalesce(o.labels_complete, false) and o.net_execution_return is not null)::int as nNet
+         coalesce(sum(case when coalesce(o.labels_complete, c.labels_complete, false) then o.net_execution_return else 0 end), 0)::float as sumNet,
+         count(*) filter (where coalesce(o.labels_complete, c.labels_complete, false) and o.net_execution_return is not null)::int as nNet
        from candidate_considerations c
        left join outcome_labels o on o.decision_id = c.decision_id
        left join decision_snapshots s on s.decision_id = c.decision_id
