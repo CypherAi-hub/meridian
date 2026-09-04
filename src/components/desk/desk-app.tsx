@@ -25,6 +25,8 @@ import type { DataQuality, FeatureMeta, GateResult, LedgerRow, Regime, ResearchS
 import type { MonotonicityReport } from "@/lib/desk/baseline";
 import { emptyQuality } from "@/lib/desk/types";
 import { researchHealth } from "@/lib/desk/research-health";
+import { evaluateProductionAlerts } from "@/lib/desk/v34-alerts";
+import { ML_TRAINING_LOCKED, PRODUCTION_EPOCH } from "@/lib/desk/v34-lock";
 import { cn } from "@/lib/utils";
 
 const TABS = ["scan", "inspect", "book", "journal", "research"] as const;
@@ -858,6 +860,25 @@ function ResearchPanel({
           <QualityRow label="veto holder conc" value={compact(quality.vetoHolderConcentration ?? 0)} />
           <QualityRow label="veto route" value={compact(quality.vetoRoute ?? 0)} />
           <QualityRow label="veto security" value={compact(quality.vetoSecurity ?? 0)} />
+        </div>
+        <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">
+          V3.4 PREP · intelligence · training {ML_TRAINING_LOCKED ? "LOCKED" : "OPEN"}
+        </p>
+        <div className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+          <QualityRow label="target epoch" value={PRODUCTION_EPOCH} />
+          <QualityRow label="train switch" value="LOCKED" />
+          <QualityRow
+            label="ops alerts"
+            value={String(
+              evaluateProductionAlerts({
+                workerStatus: worker.status,
+                lastTickAtMs: worker.lastTickAt,
+                holderAtDecisionPct: quality.holderCoverageAtDecisionPct,
+                routeCheckPct: quality.epochRouteCheckCoveragePct ?? quality.routeCheckCoveragePct,
+                activeMedianGapMs: quality.activeMedianGapMs,
+              }).length,
+            )}
+          />
         </div>
         <p className="mb-1 text-[10px] uppercase tracking-wider text-subtle">
           Lifetime corpus · keep · do not mix into training

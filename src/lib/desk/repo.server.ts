@@ -1239,16 +1239,19 @@ export async function setControl(patch: {
 
 export async function exportRows(): Promise<LedgerRow[]> {
   const sql = await getSql();
-  const rows = await sql.query<{ snapshot: unknown; labels: unknown }>(
-    `select s.snapshot, to_jsonb(o) as labels
+  const rows = await sql.query<{ snapshot: unknown; labels: unknown; collection_epoch_id: string | null }>(
+    `select s.snapshot, to_jsonb(o) as labels, c.collection_epoch_id
      from candidate_considerations c
      join decision_snapshots s on s.decision_id = c.decision_id
      left join outcome_labels o on o.decision_id = c.decision_id
      order by c.decision_time_ms asc limit 50000`,
   );
   return rows.map((r) => {
-    const merged = mergeRow(json<LedgerRow>(r.snapshot, {} as LedgerRow), json(r.labels, {}));
+    const merged = mergeRow(json<LedgerRow>(r.snapshot, {} as LedgerRow), json(r.labels, {})) as LedgerRow & {
+      collection_epoch_id?: string | null;
+    };
     merged.path = [];
+    merged.collection_epoch_id = r.collection_epoch_id;
     return merged;
   });
 }

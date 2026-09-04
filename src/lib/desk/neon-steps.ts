@@ -11,6 +11,9 @@ export const MERIDIAN_MIGRATIONS = [
   "0010_v33b_closure.sql",
 ] as const;
 
+/** Intelligence tables only. Not part of the frozen v33b collection schema. */
+export const V34_PREP_MIGRATIONS = ["0011_v34_prep.sql"] as const;
+
 export const SCHEMA_VERSION = "v33b";
 
 export const REQUIRED_TABLES = [
