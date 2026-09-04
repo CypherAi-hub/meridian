@@ -25,7 +25,11 @@ async function q<T>(sql: Sql, text: string, params: unknown[] = []): Promise<T[]
   }
 }
 
+const QUALITY_TTL_MS = 60_000;
+let qualityCache: { at: number; value: DataQuality } | null = null;
+
 export async function loadQuality(sql?: Sql): Promise<DataQuality> {
+  if (qualityCache && Date.now() - qualityCache.at < QUALITY_TTL_MS) return qualityCache.value;
   const db = sql ?? (await getSql());
   const since = Date.now() - 6 * 3600_000;
   const tokens = (await q<{ n: number }>(db, `select count(*)::int as n from tokens`))[0];
@@ -421,6 +425,7 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   if (epochRoute?.checks) {
     quality.epochRouteCheckCoveragePct = (epochRoute.checks - num(epochRoute.notchecked)) / epochRoute.checks;
   }
+  qualityCache = { at: Date.now(), value: quality };
   return quality;
 }
 

@@ -4,7 +4,8 @@ import { HEARTBEAT_STALE_MS, START_EQUITY, STRATEGY_VERSION } from "./schema";
 import { createDesk, emptyDesk } from "./engine";
 import { computeFeatures, predict } from "./features";
 import { cooldownKey } from "./leakage";
-import { rebuildSummary } from "./ledger";
+import { rebuildSummary, emptyResearch } from "./ledger";
+import { noteUniverseXfer } from "./neon-xfer";
 import { loadQuality } from "./quality.server";
 import { FEATURE_ENGINE_VERSION, FEATURE_SCHEMA, FEATURE_SCHEMA_HASH, LABEL_DEFINITION, LABEL_DEFINITION_VERSION, EXECUTION_ASSUMPTION, EXECUTION_ASSUMPTION_VERSION } from "./versions";
 import { STRATEGIES } from "./strategies";
@@ -252,6 +253,12 @@ export async function loadDesk(): Promise<DeskSnapshot> {
   s.ledger = recent.map((r) => mergeRow(json<LedgerRow>(r.snapshot, {} as LedgerRow), json(r.labels, {})));
   s.research = await loadResearch(sql);
   s.quality = await loadQuality(sql);
+  noteUniverseXfer({
+    researchRows: 0,
+    pendingRows: s.pending.length,
+    ledgerRows: s.ledger.length,
+    deskBytesEst: 8_000 + 130_000,
+  });
   const providerStats = (
     await sql.query<{ errors: number; last_ok: number | null }>(
       `select coalesce(sum(error_count), 0) as errors, max(last_ok_at_ms) as last_ok from providers`,
@@ -373,18 +380,137 @@ function workerFromState(
 
 export async function loadResearch(sql?: Sql): Promise<ResearchSummary> {
   const db = sql ?? (await getSql());
-  const rows = await db.query<{ snapshot: unknown; labels: unknown }>(
-    `select s.snapshot, to_jsonb(o) as labels
-     from candidate_considerations c
-     join decision_snapshots s on s.decision_id = c.decision_id
-     left join outcome_labels o on o.decision_id = c.decision_id
-     order by c.decision_time_ms asc
-     limit 50000`,
-  );
-  const list = rows.map((r) => mergeRow(json<LedgerRow>(r.snapshot, {} as LedgerRow), json(r.labels, {})));
-  const summary = rebuildSummary(list);
+  try {
+    return await loadResearchAggregated(db);
+  } catch (err) {
+    console.error("[meridian] research aggregate fallback", err instanceof Error ? err.message : err);
+    const rows = await db.query<{ snapshot: unknown; labels: unknown }>(
+      `select s.snapshot, to_jsonb(o) as labels
+       from candidate_considerations c
+       join decision_snapshots s on s.decision_id = c.decision_id
+       left join outcome_labels o on o.decision_id = c.decision_id
+       order by c.decision_time_ms asc
+       limit 50000`,
+    );
+    const list = rows.map((r) => mergeRow(json<LedgerRow>(r.snapshot, {} as LedgerRow), json(r.labels, {})));
+    const summary = rebuildSummary(list);
+    const now = Date.now();
+    summary.errors = list.filter((r) => !r.labels_complete && now - r.decision_time > 70 * 60_000).length;
+    return summary;
+  }
+}
+
+async function loadResearchAggregated(db: Sql): Promise<ResearchSummary> {
   const now = Date.now();
-  summary.errors = list.filter((r) => !r.labels_complete && now - r.decision_time > 70 * 60_000).length;
+  const totals = (
+    await db.query<{
+      considerations: number;
+      vetoed: number;
+      authorized: number;
+      taken: number;
+      labeled: number;
+      incomplete: number;
+      errors: number;
+    }>(
+      `select
+         count(*)::int as considerations,
+         count(*) filter (where c.governor_result = 'vetoed')::int as vetoed,
+         count(*) filter (where c.governor_result is distinct from 'vetoed')::int as authorized,
+         count(*) filter (where c.trade_taken)::int as taken,
+         count(*) filter (where coalesce(o.labels_complete, c.labels_complete, false))::int as labeled,
+         count(*) filter (where not coalesce(o.labels_complete, c.labels_complete, false))::int as incomplete,
+         count(*) filter (
+           where not coalesce(o.labels_complete, c.labels_complete, false)
+             and $1::bigint - c.decision_time_ms > 4200000
+         )::int as errors
+       from candidate_considerations c
+       left join outcome_labels o on o.decision_id = c.decision_id`,
+      [now],
+    )
+  )[0];
+  const summary = emptyResearch();
+  if (!totals) return summary;
+  summary.considerations = num(totals.considerations);
+  summary.vetoed = num(totals.vetoed);
+  summary.authorized = num(totals.authorized);
+  summary.taken = num(totals.taken);
+  summary.labeled = num(totals.labeled);
+  summary.incomplete = num(totals.incomplete);
+  summary.errors = num(totals.errors);
+
+  const fill = (
+    target: Record<string, { n: number; taken: number; labeled: number; sum5m: number; n5m: number; sumNet: number; nNet: number }>,
+    rows: Array<{
+      key: string | null;
+      n: number;
+      taken: number;
+      labeled: number;
+      sum5m: number;
+      n5m: number;
+      sumNet: number;
+      nNet: number;
+    }>,
+  ) => {
+    for (const r of rows) {
+      if (!r.key) continue;
+      const cur = target[r.key] ?? { n: 0, taken: 0, labeled: 0, sum5m: 0, n5m: 0, sumNet: 0, nNet: 0 };
+      cur.n = num(r.n);
+      cur.taken = num(r.taken);
+      cur.labeled = num(r.labeled);
+      cur.sum5m = num(r.sum5m);
+      cur.n5m = num(r.n5m);
+      cur.sumNet = num(r.sumNet);
+      cur.nNet = num(r.nNet);
+      target[r.key] = cur;
+    }
+  };
+
+  const sliceSql = (dim: string) =>
+    db.query<{
+      key: string | null;
+      n: number;
+      taken: number;
+      labeled: number;
+      sum5m: number;
+      n5m: number;
+      sumNet: number;
+      nNet: number;
+    }>(
+      `select ${dim} as key,
+         count(*)::int as n,
+         count(*) filter (where c.trade_taken)::int as taken,
+         count(*) filter (where coalesce(o.labels_complete, false))::int as labeled,
+         coalesce(sum(case
+           when coalesce(o.labels_complete, false)
+            and nullif(s.snapshot->>'price','')::float > 0
+            and o.price_after_5m is not null
+           then o.price_after_5m / nullif(s.snapshot->>'price','')::float - 1
+           else 0 end), 0)::float as sum5m,
+         count(*) filter (
+           where coalesce(o.labels_complete, false)
+             and nullif(s.snapshot->>'price','') is not null
+             and o.price_after_5m is not null
+         )::int as n5m,
+         coalesce(sum(case when coalesce(o.labels_complete, false) then o.net_execution_return else 0 end), 0)::float as sumNet,
+         count(*) filter (where coalesce(o.labels_complete, false) and o.net_execution_return is not null)::int as nNet
+       from candidate_considerations c
+       left join outcome_labels o on o.decision_id = c.decision_id
+       left join decision_snapshots s on s.decision_id = c.decision_id
+       group by ${dim}`,
+    );
+
+  fill(summary.byRegime, await sliceSql("c.regime"));
+  fill(summary.byBucket, await sliceSql("c.bucket"));
+  fill(summary.byStrategy, await sliceSql("c.strategy_id"));
+
+  const cov = await db.query<{ bucket: string; regime: string; n: number }>(
+    `select bucket, regime, count(*)::int as n from candidate_considerations group by bucket, regime`,
+  );
+  for (const r of cov) {
+    if (summary.coverage[r.bucket as keyof typeof summary.coverage]?.[r.regime as "trend"] != null) {
+      summary.coverage[r.bucket as keyof typeof summary.coverage][r.regime as "trend"] = num(r.n);
+    }
+  }
   return summary;
 }
 
