@@ -875,7 +875,7 @@ function ResearchPanel({
               eligibleRows: 0,
             }).status}
           />
-          <QualityRow label="eval lab" value="PREP.3 · governance" />
+          <QualityRow label="eval lab" value="V3.5 · shadow sniper" />
           <QualityRow
             label="ops alerts"
             value={String(

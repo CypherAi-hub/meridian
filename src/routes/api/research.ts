@@ -166,6 +166,19 @@ export const Route = createFileRoute("/api/research")({
             prereg: { experimentId: prereg.experimentId, hash: prereg.hash, primaryMetric: prereg.primaryMetric },
           });
         }
+        if (view === "sniper" || view === "participant") {
+          const { parseSniperMode, V35_VERSION } = await import("@/lib/desk/v35-lock");
+          const { ML_TRAINING_LOCKED } = await import("@/lib/desk/v34-lock");
+          return Response.json({
+            mode: parseSniperMode("SHADOW"),
+            version: V35_VERSION,
+            training: "LOCKED",
+            locked: ML_TRAINING_LOCKED,
+            capitalAuthority: false,
+            canCreatePaperOrders: false,
+            note: "Shadow sniper observes participants. It does not buy.",
+          });
+        }
         if (view === "migrations") {
           const { loadMigrationStatus } = await import("@/lib/desk/neon-migrate");
           return Response.json(await loadMigrationStatus());
