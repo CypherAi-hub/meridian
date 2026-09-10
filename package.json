@@ -26,6 +26,8 @@
     "test:desk": "node --experimental-strip-types --test src/lib/desk/*.test.ts",
     "test:scripts": "node --test 'scripts/**/*.test.mjs'",
     "certify": "node --experimental-strip-types --import ./scripts/desk-loader.mjs scripts/meridian-certify.mjs",
+    "shadow-collector": "node --experimental-strip-types --import ./scripts/desk-loader.mjs scripts/meridian-shadow-collector.mjs",
+    "v35:migrate": "node scripts/v35-migrate.mjs",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

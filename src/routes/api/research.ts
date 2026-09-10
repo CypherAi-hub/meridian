@@ -166,17 +166,23 @@ export const Route = createFileRoute("/api/research")({
             prereg: { experimentId: prereg.experimentId, hash: prereg.hash, primaryMetric: prereg.primaryMetric },
           });
         }
-        if (view === "sniper" || view === "participant") {
+        if (view === "sniper" || view === "participant" || view === "v351") {
           const { parseSniperMode, V35_VERSION } = await import("@/lib/desk/v35-lock");
+          const { V35_1_VERSION } = await import("@/lib/desk/v35-collector");
+          const { SHADOW_LEASE } = await import("@/lib/desk/v35-dev-lease");
           const { ML_TRAINING_LOCKED } = await import("@/lib/desk/v34-lock");
+          const { PRIMARY_LEASE } = await import("@/lib/desk/lease");
           return Response.json({
             mode: parseSniperMode("SHADOW"),
             version: V35_VERSION,
+            collector: V35_1_VERSION,
+            shadowLease: SHADOW_LEASE,
+            productionLease: PRIMARY_LEASE,
             training: "LOCKED",
             locked: ML_TRAINING_LOCKED,
             capitalAuthority: false,
-            canCreatePaperOrders: false,
-            note: "Shadow sniper observes participants. It does not buy.",
+            usesProductionDatabase: false,
+            note: "Shadow collector needs PARTICIPANT_DATABASE_URL. It will not take the production writer lease.",
           });
         }
         if (view === "migrations") {
