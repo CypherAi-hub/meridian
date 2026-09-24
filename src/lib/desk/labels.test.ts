@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { appendOutcomeTick, freezeLabels } from "./labels.ts";
 import type { LedgerRow, PathTick, TokenLive } from "./types.ts";
 import { blankSnapshot, field } from "./providers/normalize.ts";
+import { mergeLabelProgress } from "./label-progress.ts";
 
 function tick(ts: number, px: number, liq = 50_000, sell: 0 | 1 = 1): PathTick {
   return { ts, px, liq, sell };
@@ -12,6 +13,32 @@ function observedToken(at: number, px = 1): TokenLive {
   return { ...blankSnapshot("Mint", at, at), priceUsd: field(px, at, at, "dexscreener"),
     history: [px], prevLiq: 50_000, prevVolume5m: 0, prevBuyers: 0, rugged: false };
 }
+
+test("overlapping fast and universe ticks retain both paths and newer decisions", () => {
+  const t0 = 1_000_000;
+  const original = row();
+  const fast = { ...original, path: [...original.path, tick(t0 + 3_000, 1.01)] };
+  const slow = { ...original, path: [...original.path, tick(t0 + 6_000, 1.02)] };
+  const newDecision = row({ decision_id: "new-decision" });
+  const merged = mergeLabelProgress([slow, newDecision], [fast], t0 + 6_000);
+  assert.deepEqual(merged[0].path.map(t => t.ts), [t0, t0 + 3_000, t0 + 6_000]);
+  assert.equal(merged[1], newDecision);
+  const staleFinish = mergeLabelProgress(merged, [fast], t0 + 6_000);
+  assert.equal(staleFinish[0].path.length, 3);
+  assert.equal(staleFinish.length, 2);
+});
+
+test("fast label progress cannot introduce phantom decisions or finalize historical labels", () => {
+  const original = row();
+  const completed = row({ decision_id: "closed", labels_complete: true, barrier_label_confidence: "UNKNOWN" });
+  const progress = [row({ labels_complete: true, trade_taken: true }), row({decision_id: "phantom"}),
+    row({decision_id: "closed", barrier_label_confidence: "HIGH"})];
+  const result = mergeLabelProgress([original, completed], progress, 1_003_000);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].labels_complete, false);
+  assert.equal(result[0].trade_taken, false);
+  assert.equal(result[1], completed);
+});
 
 test("repeated cached prices do not manufacture dense label samples", () => {
   const t0 = 1_000_000;

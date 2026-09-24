@@ -11,7 +11,7 @@ import {
   RESEARCH_QUALITY_V2,
 } from "./quality-v2.ts";
 import { STALE_MS } from "./schema.ts";
-import type { BarrierConfidence, BarrierOutcome, LedgerRow, PathTick, TokenLive } from "./types.ts";
+import type { BarrierConfidence, BarrierOutcome, LedgerRow, PathTick, TokenSnapshot } from "./types.ts";
 
 const H = {
   m1: 60_000,
@@ -188,7 +188,7 @@ export function stampResearchQuality(next: LedgerRow, throughTime?: number) {
   void RESEARCH_QUALITY_V2;
 }
 
-export function appendOutcomeTick(row: LedgerRow, t: TokenLive, now: number): LedgerRow {
+export function appendOutcomeTick(row: LedgerRow, t: TokenSnapshot, now: number): LedgerRow {
   if (row.labels_complete || row.price == null) return row;
   const px = t.priceUsd.value;
   const observedAt = t.priceUsd.ingestedAt;
@@ -322,7 +322,7 @@ export function freezeLabels(row: LedgerRow, now: number): LedgerRow {
   return next;
 }
 
-export function labelPending(rows: LedgerRow[], tokens: TokenLive[], now: number): LedgerRow[] {
+export function labelPending(rows: LedgerRow[], tokens: TokenSnapshot[], now: number): LedgerRow[] {
   const by = new Map(tokens.map((t) => [t.address, t]));
   return rows.map((r) => {
     if (r.labels_complete) return r;

@@ -2,6 +2,8 @@ import { applyTape } from "./engine";
 import { ingestFastPath, ingestSlowEnrichment, ingestTape } from "./ingest.server";
 import { persistDesk, persistFastPath, loadDesk, recordError, startWorkerTick, finishWorkerTick, acquirePrimaryLease, renewPrimaryLease, recordSoakIncident, hydrateHoldersOntoTape } from "./repo.server";
 import { persistLabelProgress } from "./label-progress.server";
+import { mergeLabelProgress } from "./label-progress";
+import { labelPending } from "./labels";
 import { writeHeartbeat } from "./quality.server";
 import { persistRateBudgets, rateLimitStormActive, restoreRateBudgets } from "./rate-budget.server";
 import { researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES, ACTIVE_HOLD_MS, nextLabelBatch } from "./watch";
@@ -92,6 +94,7 @@ export async function runTick(): Promise<DeskSnapshot> {
       });
       const decidedAt = Date.now();
       const withHolders = await hydrateHoldersOntoTape(enriched.tokens, decidedAt);
+      prev.pending = mergeLabelProgress(prev.pending, g.__meridianLast__?.pending ?? [], decidedAt);
       const next = applyTape(prev, { ...enriched, tokens: withHolders, ingestedAt: decidedAt });
       const pendingRows = next.pending.filter((r) => !r.labels_complete);
       const lastProviderOkAt = next.sources.reduce<number | null>((acc, s) => {
@@ -138,6 +141,8 @@ export async function runTick(): Promise<DeskSnapshot> {
         labelsUpdated: next.pending.filter((r) => r.labels_complete).length,
         errorCount: next.sources.filter((s) => s.status === "offline").length,
       });
+      // Fast collection continues while the slow snapshot is persisted.
+      next.pending = mergeLabelProgress(next.pending, g.__meridianLast__?.pending ?? [], Date.now());
       g.__meridianLast__ = next;
       console.log(`[meridian] tick complete status=live worker=${INSTANCE_ID} tokens=${next.tokens.length} pending=${pendingRows.length} duration_ms=${Date.now() - t0}`);
       return next;
@@ -217,10 +222,14 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
       });
       const dbDelay = Date.now() - db0;
       void dbDelay;
-      const next = applyTape(prev, tape);
+      const latest = g.__meridianLast__ ?? prev;
       const touched = new Set(mints);
-      const progressed = next.pending.filter((r) => touched.has(r.tokenAddress));
+      const progressed = labelPending(latest.pending.filter(r => touched.has(r.tokenAddress)), tape.tokens, Date.now());
       await persistLabelProgress(progressed);
+      // Do not run the decision engine here: its new decisions/paper fills were
+      // never persisted, and a stale fast snapshot could erase a universe tick.
+      const current = g.__meridianLast__ ?? latest;
+      const next = { ...current, pending: mergeLabelProgress(current.pending, progressed, Date.now()) };
       g.__meridianLast__ = next;
       return next;
     } catch (e) {
