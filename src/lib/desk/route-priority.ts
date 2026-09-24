@@ -49,9 +49,15 @@ export function shouldRefreshRoute(opts: {
 }
 
 /** Preserve the quote's actual timestamps; a cache hit is not a new quote. */
-export function freshCachedRoute(quote: QuoteObs | null | undefined, now: number, priority: number): QuoteObs | null {
+export function routeObservedAt(quote: QuoteObs | null | undefined, now: number): number | null {
   if (!quote || !Number.isFinite(quote.ingestedAt) || !Number.isFinite(quote.eventTime) ||
-      quote.ingestedAt > now || quote.eventTime > now ||
-      shouldRefreshRoute({ lastQuotedAt: Math.min(quote.ingestedAt, quote.eventTime), now, priority })) return null;
-  return quote;
+      quote.ingestedAt < 0 || quote.eventTime < 0 || quote.ingestedAt > now || quote.eventTime > now ||
+      !quote.routeState || !['QUOTE_ONLY','ROUTABLE','NO_ROUTE','TIMEOUT','RATE_LIMITED','ERROR'].includes(quote.routeState) ||
+      quote.failureReason === 'NOT_CHECKED') return null;
+  return Math.min(quote.ingestedAt, quote.eventTime);
+}
+
+export function freshCachedRoute(quote: QuoteObs | null | undefined, now: number, priority: number): QuoteObs | null {
+  const at = routeObservedAt(quote, now);
+  return at == null || shouldRefreshRoute({lastQuotedAt:at,now,priority}) ? null : quote!;
 }
