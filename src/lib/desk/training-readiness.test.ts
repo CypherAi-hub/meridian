@@ -50,6 +50,10 @@ test('warehouse audit counts full epoch frozen snapshots and excludes legacy lab
  await db.exec("insert into candidate_considerations values('missing','m',100,'epoch'),('other','o',100,'other')");
  const row=(await db.query(TRAINING_AUDIT_SQL,['epoch'])).rows[0] as Record<string,number>;
  assert.equal(row.decisions,4); assert.equal(row.completed,3);
- assert.equal(row.qualifiedTokens,2); assert.equal(row.leakageViolations,1); assert.equal(row.missingSnapshots,1);
+ assert.equal(row.qualifiedTokens,1); assert.equal(row.leakageViolations,1); assert.equal(row.missingSnapshots,1);
+ await db.query("update decision_snapshots set snapshot=snapshot || $1::jsonb where decision_id='good'",
+  [JSON.stringify({holder_concentration:0.1,holder_ingested_at:101,holder_event_time:100})]);
+ const late=(await db.query(TRAINING_AUDIT_SQL,['epoch'])).rows[0] as Record<string,number>;
+ assert.equal(late.qualifiedTokens,0); assert.equal(late.leakageViolations,2);
  }finally{await db.close();}
 });

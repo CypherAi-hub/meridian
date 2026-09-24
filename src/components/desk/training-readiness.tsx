@@ -24,6 +24,7 @@ export function TrainingReadinessPanel() {
           {report.blockers.map(reason => <li key={reason}>{reason}</li>)}
         </ul>
         <p className="mt-2 text-xs text-muted">{report.nextStep}</p>
+        <p className="mt-2 text-xs text-muted">Quality counts use stored label grades. Dataset certification must independently verify complete price paths and feature provenance.</p>
       </>}
   </section>;
 }

@@ -28,7 +28,7 @@ export function trainingReadiness(q: DataQuality, audit: TrainingAudit, producti
     executionMode: "PAPER" as const, trainingEnabled: false as const,
     collectionReady: blockers.length === 0, blockers, soakHours, audit,
     nextStep: blockers.length
-      ? "Keep collecting genuine observations; historical UNKNOWN labels remain excluded."
+      ? "Keep collecting genuine observations. Historical UNKNOWN labels remain in epoch coverage; only audited v2 HIGH/MEDIUM rows count toward qualified tokens."
       : "Freeze and audit a dataset, then validate token-disjoint chronological splits before fitting a model.",
   };
 }
