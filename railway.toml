@@ -1,6 +1,9 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "npm ci"
+# Nixpacks installs locked dependencies in its install phase. Running npm ci
+# again in build deletes its mounted node_modules/.cache and fails with EBUSY.
+# This service executes source directly; it does not need the web app build.
+buildCommand = "node --check scripts/meridian-worker.mjs"
 
 [deploy]
 startCommand = "npm run worker"
