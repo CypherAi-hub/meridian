@@ -1,11 +1,54 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { freezeLabels } from "./labels.ts";
-import type { LedgerRow, PathTick } from "./types.ts";
+import { appendOutcomeTick, freezeLabels } from "./labels.ts";
+import type { LedgerRow, PathTick, TokenLive } from "./types.ts";
+import { blankSnapshot, field } from "./providers/normalize.ts";
 
 function tick(ts: number, px: number, liq = 50_000, sell: 0 | 1 = 1): PathTick {
   return { ts, px, liq, sell };
 }
+
+function observedToken(at: number, px = 1): TokenLive {
+  return { ...blankSnapshot("Mint", at, at), priceUsd: field(px, at, at, "dexscreener"),
+    history: [px], prevLiq: 50_000, prevVolume5m: 0, prevBuyers: 0, rugged: false };
+}
+
+test("repeated cached prices do not manufacture dense label samples", () => {
+  const t0 = 1_000_000;
+  let r = row();
+  for (let dt = 3_000; dt <= 60_000; dt += 3_000) {
+    r = appendOutcomeTick(r, observedToken(t0), t0 + dt);
+  }
+  assert.equal(r.path.length, 1);
+  assert.equal(r.barrier_label_confidence, "UNKNOWN");
+});
+
+test("label samples use observation time and preserve unchanged but freshly observed prices", () => {
+  const t0 = 1_000_000;
+  const r = appendOutcomeTick(row(), observedToken(t0 + 3_000), t0 + 8_000);
+  assert.equal(r.path.at(-1)?.ts, t0 + 3_000);
+  assert.equal(r.path.length, 2);
+  assert.equal(appendOutcomeTick(r, observedToken(t0 + 3_000), t0 + 12_000).path.length, 2);
+});
+
+test("a full dense hour retains its early price history and gaps", () => {
+  const t0 = 1_000_000;
+  let r = row();
+  for (let dt = 60_000; dt <= 3_600_000; dt += 3_000) {
+    r = appendOutcomeTick(r, observedToken(t0 + dt), t0 + dt);
+  }
+  assert.ok(r.path.length > 720);
+  assert.equal(r.path[0].ts, t0);
+  assert.equal(r.max_path_gap_seconds, 60);
+  assert.equal(r.barrier_label_confidence, "UNKNOWN");
+});
+
+test("a price outage through the horizon cannot finish as HIGH", () => {
+  const t0 = 1_000_000;
+  const r = freezeLabels(row({ path: [tick(t0, 1), tick(t0 + 3_000, 1)] }), t0 + 3_600_000);
+  assert.equal(r.barrier_label_confidence, "UNKNOWN");
+  assert.equal(r.max_path_gap_seconds, 3597);
+});
 
 function row(partial: Partial<LedgerRow> = {}): LedgerRow {
   const t0 = 1_000_000;

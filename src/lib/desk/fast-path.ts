@@ -1,5 +1,12 @@
 import type { RouteState, TokenSnapshot } from "./schema.ts";
 import { observationFingerprint } from "./fingerprint.ts";
+import { blankSnapshot } from "./providers/normalize.ts";
+
+/** Open labels still need prices after their mint leaves universe discovery. */
+export function fastPathTargets(tokens: TokenSnapshot[], mints: string[], now: number): TokenSnapshot[] {
+  const byMint = new Map(tokens.map(t => [t.address, t]));
+  return [...new Set(mints)].slice(0, 30).map(mint => byMint.get(mint) ?? blankSnapshot(mint, now, now));
+}
 
 export const FAST_PATH_FIELDS = ["priceUsd", "liquidityUsd", "routeState"] as const;
 export const SLOW_ENRICHMENT_FIELDS = ["holders", "security", "jupiter", "features"] as const;

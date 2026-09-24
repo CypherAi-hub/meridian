@@ -11,6 +11,7 @@ import { makeHolderJob } from "./holder-queue";
 import { routePriority, selectRouteJobs, shouldRefreshRoute } from "./route-priority";
 import { deskSettings } from "./config";
 import { budgetFor, JUPITER_KEYED_BUDGET } from "./rate-budget";
+import { fastPathTargets } from "./fast-path";
 
 function health(
   id: SourceHealth["id"],
@@ -81,12 +82,13 @@ export async function ingestFastPath(opts: {
   mints: string[];
 }): Promise<MarketTape> {
   const t0 = Date.now();
-  const want = new Set(opts.mints);
-  const targets = opts.tape.tokens.filter((t) => want.has(t.address)).slice(0, deskSettings().maxActiveWatches);
+  const targets = fastPathTargets(opts.tape.tokens, opts.mints, t0);
   if (!targets.length) return opts.tape;
   const dex = await enrichDexScreener(targets);
   const byFresh = new Map(dex.tokens.map((t) => [t.address, t]));
   const tokens = opts.tape.tokens.map((t) => byFresh.get(t.address) ?? t);
+  const existing = new Set(tokens.map(t => t.address));
+  tokens.push(...dex.tokens.filter(t => !existing.has(t.address) && t.priceUsd.value != null));
   return {
     ...opts.tape,
     tokens,

@@ -133,8 +133,13 @@ function windowPrices(path: PathTick[], origin: number, horizon: number) {
   return path.filter((p) => p.ts <= end).map((p) => p.px);
 }
 
-export function stampResearchQuality(next: LedgerRow) {
+export function stampResearchQuality(next: LedgerRow, throughTime?: number) {
   const gaps = pathGaps(next.path);
+  if (next.path.length && throughTime != null) {
+    gaps.max = Math.max(gaps.max,
+      Math.max(0, next.path[0].ts - next.decision_time) / 1000,
+      Math.max(0, Math.min(throughTime, next.decision_time + H.h1) - next.path.at(-1)!.ts) / 1000);
+  }
   next.path_sample_count = gaps.count;
   next.max_path_gap_seconds = Number.isFinite(gaps.max) ? gaps.max : null;
   next.avg_path_gap_seconds = Number.isFinite(gaps.avg) ? gaps.avg : null;
@@ -186,21 +191,27 @@ export function stampResearchQuality(next: LedgerRow) {
 export function appendOutcomeTick(row: LedgerRow, t: TokenLive, now: number): LedgerRow {
   if (row.labels_complete || row.price == null) return row;
   const px = t.priceUsd.value;
-  if (px == null) return row;
+  const observedAt = t.priceUsd.ingestedAt;
+  if (px == null || !Number.isFinite(px) || px <= 0 ||
+      !Number.isFinite(observedAt) || observedAt > now || observedAt < row.decision_time ||
+      t.priceUsd.stale || t.priceUsd.status === "ERROR" || t.priceUsd.status === "UNKNOWN") {
+    return freezeLabels(row, now);
+  }
   const path = row.path;
   const last = path.at(-1);
-  if (last && now - last.ts < PATH_MIN_INTERVAL_MS) return freezeLabels(row, now);
+  // A cached price is not a new observation just because the loop ran again.
+  if (last && observedAt - last.ts < PATH_MIN_INTERVAL_MS) return freezeLabels(row, now);
   const nextPath: PathTick[] = [
     ...path,
     {
-      ts: now,
+      ts: observedAt,
       px,
       liq: t.liquidityUsd.value ?? 0,
       sell: t.sellQuote?.available ? (1 as const) : (0 as const),
       entryQuote: t.buyQuote?.impliedPriceUsd ?? null,
       exitQuote: t.sellQuote?.impliedPriceUsd ?? null,
     },
-  ].slice(-720);
+  ]; // Keep the entire one-hour path, including early gaps and barrier hits.
   return freezeLabels({ ...row, path: nextPath }, now);
 }
 
@@ -302,7 +313,7 @@ export function freezeLabels(row: LedgerRow, now: number): LedgerRow {
     }
   }
 
-  stampResearchQuality(next);
+  stampResearchQuality(next, now);
   if (age >= H.h1 && next.price_after_1h != null && next.barrier_10_outcome !== "AMBIGUOUS" && next.barrier_10_outcome !== "INSUFFICIENT_DATA") {
     next.labels_complete = true;
   } else if (age >= H.h1 && next.price_after_1h != null) {
