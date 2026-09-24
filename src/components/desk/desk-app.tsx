@@ -1,3 +1,4 @@
+import { TrainingReadinessPanel } from "./training-readiness";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Activity,
@@ -768,6 +769,7 @@ function ResearchPanel({
   const rh = researchHealth(quality);
   return (
     <div>
+      <TrainingReadinessPanel />
       <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-5">
         <StatBox label="Considered" value={compact(summary.considerations)} />
         <StatBox label="Vetoed" value={compact(summary.vetoed)} />

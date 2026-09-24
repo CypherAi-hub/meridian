@@ -412,19 +412,21 @@ export async function loadQuality(sql?: Sql): Promise<DataQuality> {
   } else if (!officialSoakAllowed()) {
     quality.productionSoakStartedAtMs = null;
   }
+  // Full-epoch acceptance is measured on immutable decisions, not later polls.
   const epochRoute = (
-    await q<{ checks: number; notchecked: number }>(
+    await q<{ checks: number; checked: number }>(
       db,
       `select count(*)::int as checks,
-              count(*) filter (where route_status is null or route_status = 'UNKNOWN' or route_failure_reason = 'NOT_CHECKED')::int as notchecked
-       from market_observations
-       where collection_epoch_id = $1`,
+              count(*) filter (where s.snapshot->>'route_status' in
+                ('QUOTE_ONLY','ROUTABLE','NO_ROUTE','TIMEOUT','RATE_LIMITED','ERROR'))::int as checked
+       from candidate_considerations c
+       left join decision_snapshots s on s.decision_id=c.decision_id
+       where c.collection_epoch_id = $1`,
       [epochName],
     )
   )[0];
-  if (epochRoute?.checks) {
-    quality.epochRouteCheckCoveragePct = (epochRoute.checks - num(epochRoute.notchecked)) / epochRoute.checks;
-  }
+  quality.epochRouteCheckCoveragePct = epochRoute?.checks
+    ? num(epochRoute.checked) / epochRoute.checks : null;
   qualityCache = { at: Date.now(), value: quality };
   return quality;
 }

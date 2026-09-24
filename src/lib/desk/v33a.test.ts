@@ -98,7 +98,7 @@ test("feature-engine version persistence is stable", () => {
 });
 
 test("label-definition version persistence is stable", () => {
-  assert.equal(LABEL_DEFINITION_VERSION, "labels_v1");
+  assert.equal(LABEL_DEFINITION_VERSION, "labels_v2");
   assert.equal(LABEL_DEFINITION.liquidity_collapse_threshold, 0.6);
 });
 

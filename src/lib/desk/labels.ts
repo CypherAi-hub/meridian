@@ -216,10 +216,12 @@ export function appendOutcomeTick(row: LedgerRow, t: TokenSnapshot, now: number)
 }
 
 export function freezeLabels(row: LedgerRow, now: number): LedgerRow {
+  if (row.labels_complete) return row;
   if (row.price == null) return row;
   const age = now - row.decision_time;
   const entry = row.price;
-  const path = [...row.path].sort((a, b) => a.ts - b.ts);
+  const path = row.path.filter(p => p.ts >= row.decision_time && p.ts <= row.decision_time + H.h1)
+    .sort((a, b) => a.ts - b.ts);
   const next: LedgerRow = { ...row, path };
 
   const stamp = (key: keyof LedgerRow, horizon: number) => {
