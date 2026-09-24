@@ -2,6 +2,7 @@ export const TRAINING_AUDIT_SQL = `
     select count(*)::int as decisions,
       count(*) filter(where o.labels_complete)::int as completed,
       count(*) filter(where o.labels_complete and o.label_definition_version='labels_v2'
+        and s.snapshot->>'label_definition_version'='labels_v2'
         and o.barrier_label_confidence in ('HIGH','MEDIUM'))::int as qualified,
       count(distinct c.mint) filter(where o.labels_complete and o.label_definition_version='labels_v2'
         and s.snapshot->>'label_definition_version'='labels_v2'

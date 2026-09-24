@@ -123,6 +123,7 @@ async function quoteOnce(opts: {
       const headers = jupiterHeaders(base, key);
       const r = await fetch(url, {
         headers,
+        redirect: "error", // Never forward a custom credential through a redirect.
         signal: AbortSignal.timeout(7000),
       });
       const latencyMs = Date.now() - t0;
