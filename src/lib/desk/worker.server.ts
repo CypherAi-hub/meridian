@@ -1,9 +1,10 @@
 import { applyTape } from "./engine";
 import { ingestFastPath, ingestSlowEnrichment, ingestTape } from "./ingest.server";
 import { persistDesk, persistFastPath, loadDesk, recordError, startWorkerTick, finishWorkerTick, acquirePrimaryLease, renewPrimaryLease, recordSoakIncident, hydrateHoldersOntoTape } from "./repo.server";
+import { persistLabelProgress } from "./label-progress.server";
 import { writeHeartbeat } from "./quality.server";
 import { persistRateBudgets, rateLimitStormActive, restoreRateBudgets } from "./rate-budget.server";
-import { researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES } from "./watch";
+import { researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES, ACTIVE_HOLD_MS, nextLabelBatch } from "./watch";
 import { assertPaperMode, deskSettings } from "./config";
 import { bucketOf } from "./buckets";
 import type { DeskSnapshot } from "./types";
@@ -22,6 +23,7 @@ const g = globalThis as typeof globalThis & {
   __meridianFastChain__?: Promise<DeskSnapshot | null>;
   __meridianLast__?: DeskSnapshot | null;
   __meridianLeaseHeld__?: boolean;
+  __meridianLabelCursor__?: number;
 };
 
 g.__meridianTickChain__ ??= Promise.resolve(null);
@@ -36,7 +38,7 @@ function rankActive(s: DeskSnapshot) {
     const urgency = researchUrgency({
       hasOpenPaperPosition: held.has(t.address),
       hasPendingLabel: pending.has(t.address),
-      wasJustConsidered: Boolean(consideredAt[t.address] && s.now - consideredAt[t.address] < 60_000),
+      wasJustConsidered: Boolean(consideredAt[t.address] && s.now - consideredAt[t.address] < ACTIVE_HOLD_MS),
       isNewLaunch: bucketOf(ageS) === "new_launch",
       edgeScore: s.lastIntent?.tokenAddress === t.address ? s.lastIntent.predictions.edgeScore : 0,
     });
@@ -181,7 +183,13 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
     if (g.__meridianLeaseHeld__ === false) return last;
     const scheduledAt = Date.now();
     const prev = g.__meridianLast__ ?? last;
-    const mints = activeMints(prev);
+    const pendingMints = [
+      ...new Set(prev.pending.filter((r) => !r.labels_complete).map((r) => r.tokenAddress)),
+    ];
+    const held = prev.positions.map((p) => p.tokenAddress);
+    const batch = nextLabelBatch(pendingMints, g.__meridianLabelCursor__ ?? 0);
+    g.__meridianLabelCursor__ = batch.cursor;
+    const mints = [...new Set([...held, ...batch.mints])];
     if (!mints.length) return prev;
     try {
       const startedAt = Date.now();
@@ -208,6 +216,9 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
       const dbDelay = Date.now() - db0;
       void dbDelay;
       const next = applyTape(prev, tape);
+      const touched = new Set(mints);
+      const progressed = next.pending.filter((r) => touched.has(r.tokenAddress));
+      await persistLabelProgress(progressed);
       g.__meridianLast__ = next;
       return next;
     } catch (e) {
@@ -219,8 +230,13 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
   return (await job) as DeskSnapshot;
 }
 
+export function writerAllowed() {
+  return process.env.MERIDIAN_WORKER === "1";
+}
+
 export function ensureWorker() {
   assertPaperMode();
+  if (!writerAllowed()) return;
   if (g.__meridianTickTimer__ == null) {
     g.__meridianTickTimer__ = setInterval(() => {
       void runTick();
