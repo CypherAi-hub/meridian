@@ -139,9 +139,11 @@ export async function runTick(): Promise<DeskSnapshot> {
         errorCount: next.sources.filter((s) => s.status === "offline").length,
       });
       g.__meridianLast__ = next;
+      console.log(`[meridian] tick complete status=live worker=${INSTANCE_ID} tokens=${next.tokens.length} pending=${pendingRows.length} duration_ms=${Date.now() - t0}`);
       return next;
     } catch (e) {
       const msg = e instanceof Error ? e.message : "tick failed";
+      console.error(`[meridian] tick failed worker=${INSTANCE_ID}: ${msg}`);
       void recordError(msg);
       const incidentType = /database|sql|neon|pglite/i.test(msg) ? "DB_DOWN" : "WORKER_DOWN";
       void recordSoakIncident({ type: incidentType, severity: "error", metadata: { message: msg } });
