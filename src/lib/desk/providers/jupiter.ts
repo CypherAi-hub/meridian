@@ -1,3 +1,4 @@
+import { jupiterHeaders } from "../provider-headers";
 import { USDC, WSOL, type QuoteObs } from "../schema";
 import { blankQuote } from "./normalize";
 import { breakerFor } from "../circuit";
@@ -119,8 +120,7 @@ async function quoteOnce(opts: {
   for (const base of endpoints) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
-      const headers: Record<string, string> = { accept: "application/json" };
-      if (key) headers["x-api-key"] = key;
+      const headers = jupiterHeaders(base, key);
       const r = await fetch(url, {
         headers,
         signal: AbortSignal.timeout(7000),

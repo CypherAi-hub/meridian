@@ -7,6 +7,10 @@ export const Route = createFileRoute("/api/research")({
         const url = new URL(request.url);
         const format = url.searchParams.get("format") ?? "json";
         const view = url.searchParams.get("view");
+        if (view === "training-readiness") {
+          const { loadTrainingReadiness } = await import("@/lib/desk/training-readiness.server");
+          return Response.json(await loadTrainingReadiness(), { headers: { "cache-control": "no-store" } });
+        }
         if (view === "stats") {
           const { loadHealthPayload } = await import("@/lib/desk/quality.server");
           return Response.json(await loadHealthPayload());

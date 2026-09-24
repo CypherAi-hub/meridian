@@ -262,7 +262,7 @@ export function buildBaselineReport(rows: LedgerRow[]): BaselineReport {
   }
   for (const key of Object.keys(byBucket)) byBucket[key] = groupStats(labeled.filter((r) => r.bucket === key));
   for (const key of Object.keys(byRegime)) byRegime[key] = groupStats(labeled.filter((r) => r.regime === key));
-  const ready = labeled.length >= 1000;
+  const ready = false; // Descriptive report cannot certify a frozen training dataset.
   return {
     generatedAt: Date.now(),
     labeled: labeled.length,
@@ -272,7 +272,7 @@ export function buildBaselineReport(rows: LedgerRow[]): BaselineReport {
     readyForModeling: ready,
     note: ready
       ? monotonicity.note
-      : `Only ${labeled.length} completed labels. Need 1000+ before baseline modeling. ${monotonicity.note}`,
+      : `Descriptive report only: ${labeled.length} completed labels, including unqualified paths. Training requires full-epoch quality gates, a zero-leakage audit, and a frozen dataset. ${monotonicity.note}`,
     monotonicEdge15m: monotonicity.verdict === "monotonic" ? true : monotonicity.verdict === "not_monotonic" ? false : null,
     monotonicity,
     byEdge,
