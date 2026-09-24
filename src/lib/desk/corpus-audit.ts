@@ -5,7 +5,7 @@ export const HORIZON_MS = 3_600_000;
 export const MODEL_FIELDS = ['price','liquidity','market_cap','volume_5m','holder_concentration','mint_auth','freeze_auth'] as const;
 export type CorpusRecord = { epoch: string; decision: Pick<LedgerRow, typeof MODEL_FIELDS[number] | 'decision_id' | 'tokenAddress' | 'decision_time' | 'label_definition_version' | 'feature_sources' | 'holder_source' | 'holder_status' | 'holder_event_time' | 'holder_ingested_at'>; outcome: Pick<LedgerRow,'labels_complete'|'label_definition_version'|'barrier_label_confidence'|'barrier_10_outcome'|'path'> };
 export type AuditedExample = { id:string; mint:string; at:number; end:number; x:number[]; y:0|1; maxGapSeconds:number };
-const metaKeys = ['price','liquidity','mcap','volume5m',null,'mint','freeze'] as const;
+const metaKeys = ['price','liquidity','mcap','volume5m','top10','mint','freeze'] as const;
 const validTime = (v:unknown,t:number):v is number => typeof v==='number' && Number.isFinite(v) && v>=0 && v<=t;
 
 /** This independently checks frozen inputs and raw paths; it never repairs history. */
@@ -27,8 +27,10 @@ export function auditRecord(record:CorpusRecord,now:number): { reasons:string[];
   if(!meta?.source || !validTime(meta.eventTime,t) || !validTime(meta.ingestedAt,t)) reasons.push(`INVALID_PROVENANCE:${key}`);
   if(metaKey) {
    const cell=meta as typeof meta & {value?:unknown;status?:string;stale?:boolean};
-   if(cell?.value!==value || cell?.status!=='VALID' || cell?.stale===true) reasons.push(`UNVERIFIED_FEATURE:${key}`);
-  } else if(d.holder_status!=='VALID') reasons.push('UNVERIFIED_FEATURE:holder_concentration');
+   const observed=i>4 && typeof cell?.value==='boolean' ? Number(cell.value) : cell?.value;
+   if((i>4 && typeof cell?.value!=='boolean') || observed!==value || cell?.status!=='VALID' || cell?.stale===true) reasons.push(`UNVERIFIED_FEATURE:${key}`);
+  }
+  if(i===4 && (d.holder_status!=='VALID' || d.holder_source!==meta?.source || d.holder_event_time!==meta?.eventTime || d.holder_ingested_at!==meta?.ingestedAt)) reasons.push('UNVERIFIED_FEATURE:holder_concentration');
   x.push(i<4?Math.log1p(value):value);
  }
  const path=o.path;
@@ -69,24 +71,17 @@ export function auditCorpus(records:CorpusRecord[],epoch:string,now:number) {
   for(const reason of result.reasons) rejected[reason]=(rejected[reason]??0)+1;
  }
  examples.sort((a,b)=>a.at-b.at || a.id.localeCompare(b.id));
- const payload={schema:'meridian-audit-v1',epoch,asOf:now,featureFields:MODEL_FIELDS,examples};
- return {...payload,sha256:createHash('sha256').update(JSON.stringify(payload)).digest('hex'),
-  sourceSha256:createHash('sha256').update(JSON.stringify([...records].sort((a,b)=>a.decision.decision_id.localeCompare(b.decision.decision_id)))).digest('hex'),
+ const payload={schema:'meridian-audit-v1',epoch,featureFields:MODEL_FIELDS,examples};
+ return {...payload,asOf:now,sha256:createHash('sha256').update(canonicalJson(payload)).digest('hex'),
+  sourceSha256:createHash('sha256').update(canonicalJson([...records].sort((a,b)=>a.decision.decision_id.localeCompare(b.decision.decision_id)))).digest('hex'),
   inputRows:records.length,acceptedRows:examples.length,uniqueTokens:new Set(examples.map(r=>r.mint)).size,rejected,
   trainingEnabled:false as const, certification:'PATH_AND_INPUT_AUDIT_ONLY' as const};
 }
 
-/** One earliest eligible decision per mint, then chronological splits with a full horizon purge. */
-export function independentSplits(rows:AuditedExample[]) {
- const first=new Map<string,AuditedExample>();
- for(const row of [...rows].sort((a,b)=>a.at-b.at || a.id.localeCompare(b.id))) if(!first.has(row.mint)) first.set(row.mint,row);
- const ordered=[...first.values()];
- if(ordered.length<20) throw new Error('Need at least 20 independent tokens for a diagnostic split');
- const trainEnd=ordered[Math.floor(ordered.length*.7)].at;
- const validationEnd=ordered[Math.floor(ordered.length*.85)].at;
- const train=ordered.filter(r=>r.end<trainEnd);
- const validation=ordered.filter(r=>r.at>=trainEnd && r.end<validationEnd);
- const test=ordered.filter(r=>r.at>=validationEnd);
- if(!train.length || !validation.length || !test.length) throw new Error('Insufficient elapsed time after horizon purge');
- return {train,validation,test,purged:ordered.length-train.length-validation.length-test.length,trainEnd,validationEnd};
+/** Sort object keys recursively so JSONB key order does not change evidence identity. */
+function canonicalJson(value:unknown):string {
+ if(value===null || typeof value!=='object') return JSON.stringify(value) ?? 'null';
+ if(Array.isArray(value)) return '['+value.map(canonicalJson).join(',')+']';
+ const object=value as Record<string,unknown>;
+ return '{'+Object.keys(object).filter(k=>object[k]!==undefined).sort().map(k=>JSON.stringify(k)+':'+canonicalJson(object[k])).join(',')+'}';
 }
