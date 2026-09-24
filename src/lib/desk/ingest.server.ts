@@ -2,13 +2,13 @@ import { bucketOf, bucketRank } from "./buckets";
 import { discoverDexScreener, enrichDexScreener, fetchSolPriceDex, lookupDexTokens } from "./providers/dexscreener";
 import { fetchGeckoPools } from "./providers/gecko";
 import { enrichHolders } from "./providers/holders";
-import { quoteSolUsdc, quoteToken, cachedQuoteAge, skippedQuote } from "./providers/jupiter";
+import { quoteSolUsdc, quoteToken, cachedQuoteAge, cachedQuote, skippedQuote } from "./providers/jupiter";
 import { mergeSnap } from "./providers/normalize";
 import { enrichSolana } from "./providers/solana";
 import type { MarketTape, SourceHealth, TokenSnapshot } from "./schema";
 import { WSOL } from "./schema";
 import { makeHolderJob } from "./holder-queue";
-import { routePriority, selectRouteJobs, shouldRefreshRoute } from "./route-priority";
+import { routePriority, selectRouteJobs, shouldRefreshRoute, freshCachedRoute } from "./route-priority";
 import { deskSettings } from "./config";
 import { budgetFor, JUPITER_KEYED_BUDGET } from "./rate-budget";
 import { fastPathTargets } from "./fast-path";
@@ -173,10 +173,10 @@ async function quotePriorityTargets(
         : ctx.focus.has(t.address)
           ? ("NEAR_THRESHOLD" as const)
           : ("RESEARCH" as const);
-    return { mint: t.address, priority: routePriority(reason), reason };
+    return { mint: t.address, priority: routePriority(reason), reason, lastQuotedAt: cachedQuoteAge(t.address) };
   });
   const selected = selectRouteJobs(
-    jobs.filter((j) => shouldRefreshRoute({ lastQuotedAt: cachedQuoteAge(j.mint), now, priority: j.priority })),
+    jobs.filter((j) => shouldRefreshRoute({ lastQuotedAt: j.lastQuotedAt, now, priority: j.priority })),
     limit,
   );
   const quoteMap = new Map<string, TokenSnapshot["buyQuote"]>();
@@ -220,11 +220,16 @@ async function quotePriorityTargets(
       sellMap.set(t.address, skipped);
     }
   }
-  return tokens.map((t) => ({
-    ...t,
-    buyQuote: quoteMap.get(t.address) ?? t.buyQuote,
-    sellQuote: sellMap.get(t.address) ?? t.sellQuote,
-  }));
+  const attachedAt = Date.now();
+  return tokens.map((t) => {
+    const cached = cachedQuote(t.address);
+    const priority = jobs.find(j => j.mint === t.address)!.priority;
+    return {
+      ...t,
+      buyQuote: quoteMap.get(t.address) ?? freshCachedRoute(cached?.buy, attachedAt, priority) ?? t.buyQuote,
+      sellQuote: sellMap.get(t.address) ?? freshCachedRoute(cached?.sell, attachedAt, priority) ?? t.sellQuote,
+    };
+  });
 }
 
 async function ingestOnce(opts?: {
