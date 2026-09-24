@@ -3,7 +3,7 @@ import type { LedgerRow, PathTick } from './types.ts';
 
 export const HORIZON_MS = 3_600_000;
 export const MODEL_FIELDS = ['price','liquidity','market_cap','volume_5m','holder_concentration','mint_auth','freeze_auth'] as const;
-export type CorpusRecord = { epoch: string; decision: LedgerRow; outcome: Pick<LedgerRow,'labels_complete'|'label_definition_version'|'barrier_label_confidence'|'barrier_10_outcome'|'path'> };
+export type CorpusRecord = { epoch: string; decision: Pick<LedgerRow, typeof MODEL_FIELDS[number] | 'decision_id' | 'tokenAddress' | 'decision_time' | 'label_definition_version' | 'feature_sources' | 'holder_source' | 'holder_status' | 'holder_event_time' | 'holder_ingested_at'>; outcome: Pick<LedgerRow,'labels_complete'|'label_definition_version'|'barrier_label_confidence'|'barrier_10_outcome'|'path'> };
 export type AuditedExample = { id:string; mint:string; at:number; end:number; x:number[]; y:0|1; maxGapSeconds:number };
 const metaKeys = ['price','liquidity','mcap','volume5m',null,'mint','freeze'] as const;
 const validTime = (v:unknown,t:number):v is number => typeof v==='number' && Number.isFinite(v) && v>=0 && v<=t;

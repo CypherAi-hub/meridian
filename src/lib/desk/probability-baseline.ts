@@ -11,6 +11,7 @@ export function fitProbabilityBaseline(train:AuditedExample[]):ProbabilityModel 
  if(baseRate===0 || baseRate===1) throw new Error('Both outcome classes required');
  const means=Array.from({length:width},(_,j)=>train.reduce((s,r)=>s+r.x[j],0)/train.length);
  const scales=means.map((m,j)=>Math.sqrt(train.reduce((s,r)=>s+(r.x[j]-m)**2,0)/train.length)||1);
+ if([...means,...scales].some(v=>!Number.isFinite(v))) throw new Error('Nonfinite normalization');
  const x=train.map(r=>r.x.map((v,j)=>(v-means[j])/scales[j]));
  const weights=Array(width).fill(0); let intercept=Math.log(baseRate/(1-baseRate));
  for(let step=0;step<1000;step++) {

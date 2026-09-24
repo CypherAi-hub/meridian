@@ -2,14 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { auditRecord,auditCorpus,independentSplits, HORIZON_MS, type CorpusRecord,type AuditedExample } from './corpus-audit.ts';
 import { fitProbabilityBaseline,evaluateProbability,probability } from './probability-baseline.ts';
-import type { LedgerRow } from './types.ts';
 const t=1_000_000;
 function fixture():CorpusRecord {
  const meta={source:'test',eventTime:t,ingestedAt:t,lagMs:0};
  return {epoch:'test',decision:{decision_id:'d',tokenAddress:'mint',decision_time:t,label_definition_version:'labels_v2',
   price:1,liquidity:10000,market_cap:100000,volume_5m:100,holder_concentration:.1,mint_auth:0,freeze_auth:0,
   holder_status:'VALID',holder_source:'test',holder_event_time:t,holder_ingested_at:t,
-  feature_sources:Object.fromEntries(['price','liquidity','mcap','volume5m','mint','freeze'].map((k,i)=>[k,{...meta,value:[1,10000,100000,100,0,0][i],status:'VALID',stale:false}]))} as LedgerRow,
+  feature_sources:Object.fromEntries(['price','liquidity','mcap','volume5m','mint','freeze'].map((k,i)=>[k,{...meta,value:[1,10000,100000,100,0,0][i],status:'VALID',stale:false}]))},
   outcome:{labels_complete:true,label_definition_version:'labels_v2',barrier_label_confidence:'MEDIUM',barrier_10_outcome:'UPPER_FIRST',
    path:Array.from({length:601},(_,i)=>({ts:t+i*6000,px:i===2?1.2:1,liq:10000,sell:1}))}};
 }
