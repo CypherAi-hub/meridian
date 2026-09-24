@@ -1,5 +1,5 @@
 export const FEATURE_ENGINE_VERSION = "v1.3.0";
-export const LABEL_DEFINITION_VERSION = "labels_v1";
+export const LABEL_DEFINITION_VERSION = "labels_v2";
 export const EXECUTION_ASSUMPTION_VERSION = "exec_v1";
 export const STRATEGY_CODE_VERSION = "3.3.0";
 
@@ -10,6 +10,7 @@ export const LABEL_DEFINITION = {
   upper_barrier_2: 0.2,
   lower_barrier: 0.1,
   horizons: ["1m", "5m", "15m", "30m", "1h"],
+  path_semantics: "observed polls within decision-to-one-hour window; transactional union before finalization",
 } as const;
 
 export const EXECUTION_ASSUMPTION = {

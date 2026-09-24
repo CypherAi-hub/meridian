@@ -12,6 +12,7 @@ import { STRATEGIES } from "./strategies";
 import { requestFingerprint, observationFingerprint } from "./fingerprint";
 import { ACTIVE_INTERVAL_MS, UNIVERSE_INTERVAL_MS, researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES } from "./watch";
 import { stampResearchQuality } from "./labels";
+import { saveMergedLabel } from "./label-storage";
 import { deskSettings } from "./config";
 import { currentEpochName, officialSoakAllowed, makeSoakIncident, PRODUCTION_SOAK_CLOSURE } from "./env";
 import { decideLease, PRIMARY_LEASE, LEASE_TTL_MS } from "./lease";
@@ -1186,7 +1187,12 @@ async function insertConsideration(sql: Sql, row: LedgerRow, desk: DeskSnapshot)
 }
 
 async function upsertLabels(sql: Sql, row: LedgerRow) {
-  const path = row.labels_complete ? row.path.slice(-40) : row.path ?? [];
+  const saved = await saveMergedLabel(sql, row, Date.now(), writeLabelValues);
+  if (saved) Object.assign(row, saved);
+}
+
+async function writeLabelValues(sql: Sql, row: LedgerRow) {
+  const path = row.path ?? [];
   const base = [
     row.decision_id, JSON.stringify(path), row.price_after_1m, row.price_after_5m, row.price_after_15m,
     row.price_after_30m, row.price_after_1h, row.max_gain_5m, row.max_gain_15m, row.max_gain_1h,
@@ -1194,7 +1200,6 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
     row.hit_plus_20_before_minus_10, row.liquidity_collapse, row.sell_route_lost, row.rug_detected,
     row.simulated_entry, row.simulated_exit, row.net_execution_return, row.labels_complete, Date.now(),
   ];
-  try {
     await sql.query(
       `insert into outcome_labels (
         decision_id, path, price_after_1m, price_after_5m, price_after_15m, price_after_30m, price_after_1h,
@@ -1209,35 +1214,35 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
       )
       on conflict (decision_id) do update set
         path = excluded.path,
-        price_after_1m = coalesce(outcome_labels.price_after_1m, excluded.price_after_1m),
-        price_after_5m = coalesce(outcome_labels.price_after_5m, excluded.price_after_5m),
-        price_after_15m = coalesce(outcome_labels.price_after_15m, excluded.price_after_15m),
-        price_after_30m = coalesce(outcome_labels.price_after_30m, excluded.price_after_30m),
-        price_after_1h = coalesce(outcome_labels.price_after_1h, excluded.price_after_1h),
-        max_gain_5m = coalesce(outcome_labels.max_gain_5m, excluded.max_gain_5m),
-        max_gain_15m = coalesce(outcome_labels.max_gain_15m, excluded.max_gain_15m),
-        max_gain_1h = coalesce(outcome_labels.max_gain_1h, excluded.max_gain_1h),
-        max_drawdown_5m = coalesce(outcome_labels.max_drawdown_5m, excluded.max_drawdown_5m),
-        max_drawdown_15m = coalesce(outcome_labels.max_drawdown_15m, excluded.max_drawdown_15m),
-        max_drawdown_1h = coalesce(outcome_labels.max_drawdown_1h, excluded.max_drawdown_1h),
-        hit_plus_10_before_minus_10 = coalesce(outcome_labels.hit_plus_10_before_minus_10, excluded.hit_plus_10_before_minus_10),
-        hit_plus_20_before_minus_10 = coalesce(outcome_labels.hit_plus_20_before_minus_10, excluded.hit_plus_20_before_minus_10),
-        liquidity_collapse = coalesce(outcome_labels.liquidity_collapse, excluded.liquidity_collapse),
-        sell_route_lost = coalesce(outcome_labels.sell_route_lost, excluded.sell_route_lost),
-        rug_detected = coalesce(outcome_labels.rug_detected, excluded.rug_detected),
-        simulated_entry = coalesce(outcome_labels.simulated_entry, excluded.simulated_entry),
-        simulated_exit = coalesce(outcome_labels.simulated_exit, excluded.simulated_exit),
-        net_execution_return = coalesce(outcome_labels.net_execution_return, excluded.net_execution_return),
-        theoretical_return = coalesce(outcome_labels.theoretical_return, excluded.theoretical_return),
-        execution_adjusted_return = coalesce(outcome_labels.execution_adjusted_return, excluded.execution_adjusted_return),
-        mfe_1m = coalesce(outcome_labels.mfe_1m, excluded.mfe_1m),
-        mfe_30m = coalesce(outcome_labels.mfe_30m, excluded.mfe_30m),
-        mae_1m = coalesce(outcome_labels.mae_1m, excluded.mae_1m),
-        mae_30m = coalesce(outcome_labels.mae_30m, excluded.mae_30m),
-        first_sell_route_loss_at_ms = coalesce(outcome_labels.first_sell_route_loss_at_ms, excluded.first_sell_route_loss_at_ms),
-        sell_route_restored_at_ms = coalesce(outcome_labels.sell_route_restored_at_ms, excluded.sell_route_restored_at_ms),
+        price_after_1m = excluded.price_after_1m,
+        price_after_5m = excluded.price_after_5m,
+        price_after_15m = excluded.price_after_15m,
+        price_after_30m = excluded.price_after_30m,
+        price_after_1h = excluded.price_after_1h,
+        max_gain_5m = excluded.max_gain_5m,
+        max_gain_15m = excluded.max_gain_15m,
+        max_gain_1h = excluded.max_gain_1h,
+        max_drawdown_5m = excluded.max_drawdown_5m,
+        max_drawdown_15m = excluded.max_drawdown_15m,
+        max_drawdown_1h = excluded.max_drawdown_1h,
+        hit_plus_10_before_minus_10 = excluded.hit_plus_10_before_minus_10,
+        hit_plus_20_before_minus_10 = excluded.hit_plus_20_before_minus_10,
+        liquidity_collapse = excluded.liquidity_collapse,
+        sell_route_lost = excluded.sell_route_lost,
+        rug_detected = excluded.rug_detected,
+        simulated_entry = excluded.simulated_entry,
+        simulated_exit = excluded.simulated_exit,
+        net_execution_return = excluded.net_execution_return,
+        theoretical_return = excluded.theoretical_return,
+        execution_adjusted_return = excluded.execution_adjusted_return,
+        mfe_1m = excluded.mfe_1m,
+        mfe_30m = excluded.mfe_30m,
+        mae_1m = excluded.mae_1m,
+        mae_30m = excluded.mae_30m,
+        first_sell_route_loss_at_ms = excluded.first_sell_route_loss_at_ms,
+        sell_route_restored_at_ms = excluded.sell_route_restored_at_ms,
         labels_complete = outcome_labels.labels_complete or excluded.labels_complete,
-        completed_at_ms = coalesce(outcome_labels.completed_at_ms, excluded.completed_at_ms),
+        completed_at_ms = excluded.completed_at_ms,
         updated_at_ms = excluded.updated_at_ms`,
       [
         ...base, row.theoretical_return, row.execution_adjusted_return ?? row.net_execution_return,
@@ -1245,44 +1250,9 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
         row.sell_route_restored_at, row.labels_complete ? Date.now() : null,
       ],
     );
-  } catch {
-    await sql.query(
-      `insert into outcome_labels (
-        decision_id, path, price_after_1m, price_after_5m, price_after_15m, price_after_30m, price_after_1h,
-        max_gain_5m, max_gain_15m, max_gain_1h, max_drawdown_5m, max_drawdown_15m, max_drawdown_1h,
-        hit_plus_10_before_minus_10, hit_plus_20_before_minus_10, liquidity_collapse, sell_route_lost, rug_detected,
-        simulated_entry, simulated_exit, net_execution_return, labels_complete, updated_at_ms
-      ) values ($1,$2::jsonb,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-      on conflict (decision_id) do update set
-        path = excluded.path,
-        price_after_1m = coalesce(outcome_labels.price_after_1m, excluded.price_after_1m),
-        price_after_5m = coalesce(outcome_labels.price_after_5m, excluded.price_after_5m),
-        price_after_15m = coalesce(outcome_labels.price_after_15m, excluded.price_after_15m),
-        price_after_30m = coalesce(outcome_labels.price_after_30m, excluded.price_after_30m),
-        price_after_1h = coalesce(outcome_labels.price_after_1h, excluded.price_after_1h),
-        max_gain_5m = coalesce(outcome_labels.max_gain_5m, excluded.max_gain_5m),
-        max_gain_15m = coalesce(outcome_labels.max_gain_15m, excluded.max_gain_15m),
-        max_gain_1h = coalesce(outcome_labels.max_gain_1h, excluded.max_gain_1h),
-        max_drawdown_5m = coalesce(outcome_labels.max_drawdown_5m, excluded.max_drawdown_5m),
-        max_drawdown_15m = coalesce(outcome_labels.max_drawdown_15m, excluded.max_drawdown_15m),
-        max_drawdown_1h = coalesce(outcome_labels.max_drawdown_1h, excluded.max_drawdown_1h),
-        hit_plus_10_before_minus_10 = coalesce(outcome_labels.hit_plus_10_before_minus_10, excluded.hit_plus_10_before_minus_10),
-        hit_plus_20_before_minus_10 = coalesce(outcome_labels.hit_plus_20_before_minus_10, excluded.hit_plus_20_before_minus_10),
-        liquidity_collapse = coalesce(outcome_labels.liquidity_collapse, excluded.liquidity_collapse),
-        sell_route_lost = coalesce(outcome_labels.sell_route_lost, excluded.sell_route_lost),
-        rug_detected = coalesce(outcome_labels.rug_detected, excluded.rug_detected),
-        simulated_entry = coalesce(outcome_labels.simulated_entry, excluded.simulated_entry),
-        simulated_exit = coalesce(outcome_labels.simulated_exit, excluded.simulated_exit),
-        net_execution_return = coalesce(outcome_labels.net_execution_return, excluded.net_execution_return),
-        labels_complete = outcome_labels.labels_complete or excluded.labels_complete,
-        updated_at_ms = excluded.updated_at_ms`,
-      base,
-    );
-  }
   if (row.labels_complete) {
     await sql.query(`update candidate_considerations set labels_complete = true where decision_id = $1`, [row.decision_id]);
   }
-  try {
     await sql.query(
       `update outcome_labels set
          label_definition_version = $2,
@@ -1304,10 +1274,6 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
         row.path_sample_count,
       ],
     );
-  } catch {
-    /* 0004 */
-  }
-  try {
     await sql.query(
       `update outcome_labels set
          collection_epoch_id = coalesce(collection_epoch_id, $2),
@@ -1327,9 +1293,6 @@ async function upsertLabels(sql: Sql, row: LedgerRow) {
         row.first_sample_delay_seconds ?? null,
       ],
     );
-  } catch {
-    /* 0006 */
-  }
 }
 
 export async function setControl(patch: {
@@ -1692,70 +1655,41 @@ export async function persistFastPath(opts: {
   deadlineMs: number;
 }) {
   const sql = await getSql();
-  const completedAt = Date.now();
   const db0 = Date.now();
-  for (const t of opts.tokens) {
+  const samples = opts.tokens.flatMap(t => {
     const sample = toFastPathSample(t);
-    try {
-      await sql.query(
-        `insert into token_path_samples (
-           token_mint, event_time_ms, ingested_at_ms, price_usd, liquidity_usd,
-           sell_route_state, provider_snapshot, sample_fingerprint, created_at_ms
-         ) values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
-         on conflict (sample_fingerprint) do nothing`,
-        [
-          sample.mint,
-          sample.eventTime,
-          sample.ingestedAt,
-          sample.priceUsd,
-          sample.liquidityUsd,
-          sample.routeState ?? "UNKNOWN",
-          JSON.stringify({ source: sample.source, kind: "fast" }),
-          sample.sampleFingerprint,
-          completedAt,
-        ],
-      );
-      await sql.query(
-        `update token_path_samples set collection_epoch_id = $2, sample_kind = 'fast' where sample_fingerprint = $1`,
-        [sample.sampleFingerprint, currentEpochName()],
-      );
-    } catch {
-      /* 0005/0006 */
-    }
-  }
-  const databaseDelayMs = Date.now() - db0;
-  for (const mint of opts.mints) {
-    const d = watchDeadline({
-      scheduledAt: opts.scheduledAt,
-      startedAt: opts.startedAt,
-      completedAt,
-      deadlineMs: opts.deadlineMs,
-    });
-    try {
-      await sql.query(
-        `insert into watch_execution_stats (
-           token_mint, tier, scheduled_at_ms, started_at_ms, completed_at_ms,
-           queue_delay_ms, provider_delay_ms, database_delay_ms, total_delay_ms,
-           deadline_ms, deadline_missed, created_at_ms
-         ) values ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [
-          mint,
-          opts.scheduledAt,
-          opts.startedAt,
-          completedAt,
-          d.queueDelayMs,
-          opts.providerDelayMs,
-          databaseDelayMs,
-          d.totalDelayMs,
-          opts.deadlineMs,
-          d.deadlineMissed,
-          completedAt,
-        ],
-      );
-    } catch {
-      /* 0006 */
-    }
-  }
+    if (sample.priceUsd == null || !Number.isFinite(sample.priceUsd) || sample.priceUsd <= 0 ||
+        t.priceUsd.stale || t.priceUsd.status === "UNKNOWN" || t.priceUsd.status === "ERROR" ||
+        !Number.isFinite(sample.ingestedAt) || sample.ingestedAt > db0) return [];
+    return [{mint:sample.mint,event_time:sample.eventTime,ingested_at:sample.ingestedAt,
+      price:sample.priceUsd,liquidity:sample.liquidityUsd,route:sample.routeState ?? "UNKNOWN",
+      fingerprint:sample.sampleFingerprint,provider_snapshot:{source:sample.source,kind:"fast",pathTick:{
+        ts:sample.ingestedAt,px:sample.priceUsd,liq:sample.liquidityUsd ?? 0,
+        sell:t.sellQuote?.available ? 1 : 0,
+        entryQuote:t.buyQuote?.impliedPriceUsd ?? null,exitQuote:t.sellQuote?.impliedPriceUsd ?? null,
+      }}}];
+  });
+  if (samples.length) await sql.query(
+    `insert into token_path_samples (
+      token_mint,event_time_ms,ingested_at_ms,price_usd,liquidity_usd,sell_route_state,
+      provider_snapshot,sample_fingerprint,created_at_ms,collection_epoch_id,sample_kind)
+     select p.mint,p.event_time,p.ingested_at,p.price,p.liquidity,p.route,
+       p.provider_snapshot,p.fingerprint,$2,$3,'fast'
+     from jsonb_to_recordset($1::jsonb) as p(mint text,event_time bigint,ingested_at bigint,
+       price float8,liquidity float8,route text,provider_snapshot jsonb,fingerprint text)
+     on conflict(sample_fingerprint) do nothing`,
+    [JSON.stringify(samples),db0,currentEpochName()]);
+  const completedAt = Date.now();
+  const databaseDelayMs = completedAt - db0;
+  const d = watchDeadline({scheduledAt:opts.scheduledAt,startedAt:opts.startedAt,
+    completedAt,deadlineMs:opts.deadlineMs});
+  if (opts.mints.length) await sql.query(
+    `insert into watch_execution_stats (
+      token_mint,tier,scheduled_at_ms,started_at_ms,completed_at_ms,queue_delay_ms,
+      provider_delay_ms,database_delay_ms,total_delay_ms,deadline_ms,deadline_missed,created_at_ms)
+     select mint,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$4 from unnest($1::text[]) as mint`,
+    [[...new Set(opts.mints)],opts.scheduledAt,opts.startedAt,completedAt,d.queueDelayMs,
+      opts.providerDelayMs,databaseDelayMs,d.totalDelayMs,opts.deadlineMs,d.deadlineMissed]);
 }
 
 export async function recordSoakIncident(opts: {

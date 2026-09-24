@@ -26,6 +26,8 @@ const g = globalThis as typeof globalThis & {
   __meridianLast__?: DeskSnapshot | null;
   __meridianLeaseHeld__?: boolean;
   __meridianLabelCursor__?: number;
+  __meridianTickRunning__?: boolean;
+  __meridianFastRunning__?: boolean;
 };
 
 g.__meridianTickChain__ ??= Promise.resolve(null);
@@ -62,6 +64,8 @@ function activeMints(s: DeskSnapshot): string[] {
 }
 
 export async function runTick(): Promise<DeskSnapshot> {
+  if (g.__meridianTickRunning__) return g.__meridianTickChain__ as Promise<DeskSnapshot>;
+  g.__meridianTickRunning__ = true;
   const job = (g.__meridianTickChain__ ?? Promise.resolve(null)).then(async () => {
     const t0 = Date.now();
     const tickId = crypto.randomUUID();
@@ -92,8 +96,11 @@ export async function runTick(): Promise<DeskSnapshot> {
         held,
         pending,
       });
+      const withHolders = await hydrateHoldersOntoTape(enriched.tokens, Date.now());
+      // Drain immediately before synchronous decision/finalization. No await may
+      // intervene and permit a new pre-boundary request to remain in flight.
+      await g.__meridianFastChain__;
       const decidedAt = Date.now();
-      const withHolders = await hydrateHoldersOntoTape(enriched.tokens, decidedAt);
       prev.pending = mergeLabelProgress(prev.pending, g.__meridianLast__?.pending ?? [], decidedAt);
       const next = applyTape(prev, { ...enriched, tokens: withHolders, ingestedAt: decidedAt });
       const pendingRows = next.pending.filter((r) => !r.labels_complete);
@@ -182,15 +189,17 @@ export async function runTick(): Promise<DeskSnapshot> {
     }
   });
   g.__meridianTickChain__ = job;
-  return (await job) as DeskSnapshot;
+  try { return (await job) as DeskSnapshot; }
+  finally { g.__meridianTickRunning__ = false; }
 }
 
-export async function runActiveTick(): Promise<DeskSnapshot | null> {
+export async function runActiveTick(scheduledAt = Date.now()): Promise<DeskSnapshot | null> {
+  if (g.__meridianFastRunning__) return g.__meridianFastChain__!;
   const last = g.__meridianLast__;
   if (!last?.tokens.length) return null;
+  g.__meridianFastRunning__ = true;
   const job = (g.__meridianFastChain__ ?? Promise.resolve(null)).then(async () => {
     if (g.__meridianLeaseHeld__ === false) return last;
-    const scheduledAt = Date.now();
     const prev = g.__meridianLast__ ?? last;
     const pendingMints = [
       ...new Set(prev.pending.filter((r) => !r.labels_complete).map((r) => r.tokenAddress)),
@@ -240,7 +249,8 @@ export async function runActiveTick(): Promise<DeskSnapshot | null> {
     }
   });
   g.__meridianFastChain__ = job;
-  return (await job) as DeskSnapshot;
+  try { return (await job) as DeskSnapshot; }
+  finally { g.__meridianFastRunning__ = false; }
 }
 
 export function writerAllowed() {
