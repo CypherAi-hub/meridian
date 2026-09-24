@@ -116,6 +116,8 @@ export async function runTick(): Promise<DeskSnapshot> {
         avgTickMs: duration,
         observationsWritten: (next.worker.observationsWritten ?? 0) + next.tokens.length,
       };
+      // Publish decisions immediately so their price watch starts during the slow save.
+      g.__meridianLast__ = next;
       await persistDesk(next, prev);
       await persistRateBudgets();
       if (rateLimitStormActive()) {
