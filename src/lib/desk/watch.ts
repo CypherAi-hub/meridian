@@ -110,6 +110,19 @@ export function selectActiveWatches(
   };
 }
 
+export const LABEL_BATCH = 25;
+
+/** Rotate open-label mints so each one is priced inside a 15s hole. */
+export function nextLabelBatch(mints: string[], cursor: number, size = LABEL_BATCH): { mints: string[]; cursor: number } {
+  const unique = [...new Set(mints.filter(Boolean))];
+  if (!unique.length) return { mints: [], cursor: 0 };
+  const start = ((cursor % unique.length) + unique.length) % unique.length;
+  const n = Math.min(size, unique.length);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) out.push(unique[(start + i) % unique.length]);
+  return { mints: out, cursor: (start + n) % unique.length };
+}
+
 export function dueWatches(states: WatchState[], now: number, limit = 24): WatchState[] {
   return states
     .filter((s) => s.nextDueAt <= now)
