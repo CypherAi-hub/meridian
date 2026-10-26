@@ -16,10 +16,12 @@ export function MarketChart({
   pair,
   symbol,
   mint,
+  pending = false,
 }: {
   pair: string;
   symbol: string;
   mint: string;
+  pending?: boolean;
 }) {
   const host = useRef<HTMLDivElement>(null),
     wrap = useRef<HTMLDivElement>(null),
@@ -120,8 +122,8 @@ export function MarketChart({
     const pull = async () => {
       if (working || !pair) {
         if (!pair) {
-          setLoading(false);
-          setError("No indexed pool for this token yet.");
+          setLoading(pending);
+          setError(pending ? "" : "No indexed pool for this token yet.");
         }
         return;
       }
@@ -152,7 +154,7 @@ export function MarketChart({
       controller.abort();
       clearInterval(timer);
     };
-  }, [pair, mint, frame, revision]);
+  }, [pair, mint, frame, revision, pending]);
   useEffect(() => {
     const rows = data.map((d) => ({ ...d, time: d.time as UTCTimestamp }));
     candles.current?.setData(rows);

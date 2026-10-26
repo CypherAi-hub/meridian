@@ -11,6 +11,8 @@ import {
 } from "./sniper.ts";
 import { quotePaperSwap } from "./providers/jupiter";
 import type { TokenSnapshot } from "./schema.ts";
+import { sniperActivity } from "./sniper-activity.ts";
+import { writeSniperActivity } from "./sniper-activity-store.ts";
 
 const SESSION = "paper-sniper-v1";
 const LOCK = 13802011;
@@ -87,6 +89,7 @@ export async function advanceSniperSession(tokens: TokenSnapshot[], sessionId = 
       on conflict(id) do update set state=excluded.state,updated_at=excluded.updated_at`,
       [sessionId, JSON.stringify(state)],
     );
+    await writeSniperActivity(tx, sniperActivity(prior, state, tokens));
     if (tokens.length && sessionId === SESSION)
       await tx.query(
         `insert into paper_sniper_observations(session_id,mint,observed_at_ms,snapshot,rejects,eligible)
@@ -129,11 +132,22 @@ export async function controlSniper(enabled: boolean, sessionId = SESSION) {
       [sessionId],
     );
     const state = rows[0]?.state ?? newSniper(Date.now(), sessionId);
+    const changed = state.enabled !== enabled;
     state.enabled = enabled;
     await tx.query(
       `insert into paper_sniper_sessions(id,state,updated_at) values($1,$2::jsonb,now()) on conflict(id) do update set state=excluded.state,updated_at=excluded.updated_at`,
       [sessionId, JSON.stringify(state)],
     );
+    if (changed)
+      await writeSniperActivity(tx, [
+        {
+          key: `${sessionId}:control:${Date.now()}:${enabled}`,
+          session: sessionId,
+          at: Date.now(),
+          kind: "CONTROL",
+          detail: { enabled },
+        },
+      ]);
     return { enabled };
   });
 }

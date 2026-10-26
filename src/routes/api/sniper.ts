@@ -3,6 +3,20 @@ export const Route = createFileRoute("/api/sniper")({
   server: {
     handlers: {
       GET: async ({ request }) => {
+        if (new URL(request.url).searchParams.get("view") === "live") {
+          try {
+            const { sniperLiveReport } = await import("@/lib/desk/sniper-activity.server");
+            return Response.json(
+              await sniperLiveReport(new URL(request.url).searchParams.get("after")),
+              { headers: { "cache-control": "no-store" } },
+            );
+          } catch (e) {
+            return Response.json(
+              { error: e instanceof Error ? e.message : "Activity feed unavailable" },
+              { status: e instanceof Error && e.message === "Invalid activity cursor" ? 400 : 503 },
+            );
+          }
+        }
         if (new URL(request.url).searchParams.get("view") === "coverage") {
           const { sniperCoverage } = await import("@/lib/desk/sniper.server");
           return Response.json(await sniperCoverage());

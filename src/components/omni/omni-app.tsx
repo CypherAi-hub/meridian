@@ -19,6 +19,7 @@ import {
   Menu,
 } from "lucide-react";
 import { MarketChart } from "./market-chart";
+import { LiveBot } from "./live-bot";
 import { SniperPanel } from "@/components/desk/sniper-panel";
 import { CapitalPanel } from "@/components/desk/capital-panel";
 import { DeskApp } from "@/components/desk/desk-app";
@@ -135,8 +136,8 @@ function SolanaIcon() {
 export function OmniApp() {
   const manual = useFeed<ManualReport>("/api/terminal", 4000),
     desk = useFeed<DeskSnapshot>("/api/desk", 10000);
-  const [page, setPage] = useState<"terminal" | "automations" | "settings" | "research">(
-      "terminal",
+  const [page, setPage] = useState<"live" | "terminal" | "automations" | "settings" | "research">(
+      "live",
     ),
     [selected, setSelected] = useState(WSOL),
     [token, setToken] = useState<TerminalToken | null>(null),
@@ -349,11 +350,7 @@ export function OmniApp() {
         >
           <Menu size={18} />
         </button>
-        <button
-          className="omni-brand"
-          onClick={() => setPage("terminal")}
-          aria-label="Omni terminal"
-        >
+        <button className="omni-brand" onClick={() => setPage("live")} aria-label="Omni terminal">
           <span className="omni-mark">
             <i />
           </span>
@@ -368,6 +365,7 @@ export function OmniApp() {
         </div>
         <nav className="omni-nav">
           {[
+            ["live", "Live bot"],
             ["terminal", "Terminal"],
             ["automations", "Automations"],
             ["research", "Research"],
@@ -437,7 +435,11 @@ export function OmniApp() {
             <span />
             PAPER
           </span>
-          <button className="omni-wallet" onClick={() => setPage("settings")}>
+          <button
+            className="omni-wallet"
+            title="Manual paper account cash; separate from automatic strategies"
+            onClick={() => setPage("settings")}
+          >
             <Wallet size={14} />
             <span>{metrics ? "$" + metrics.cashUsdc.toFixed(2) : "—"}</span>
           </button>
@@ -460,10 +462,23 @@ export function OmniApp() {
         </span>
         <span>{discovered.length} markets tracked</span>
         <div />
-        <span className="omni-strip-note">Manual paper orders · no wallet connected</span>
+        <span className="omni-strip-note">
+          {page === "live"
+            ? "Autonomous paper strategies · worker runs outside the browser"
+            : "Manual paper orders · no wallet connected"}
+        </span>
         <span className="omni-strip-paper">SIMULATED FUNDS</span>
       </div>
-      {page === "terminal" ? (
+      {page === "live" ? (
+        <LiveBot
+          selected={selected}
+          token={token}
+          tokenError={tokenError}
+          onSelect={setSelected}
+          onTerminal={() => setPage("terminal")}
+          onControls={() => setPage("automations")}
+        />
+      ) : page === "terminal" ? (
         <div className="omni-workspace">
           <aside className={"omni-sidebar " + (sidebar ? "open" : "")}>
             <div className="omni-sidebar-heading">
@@ -610,7 +625,12 @@ export function OmniApp() {
                 </b>
               </div>
             </div>
-            <MarketChart pair={token?.pair ?? ""} symbol={token?.symbol ?? "SOL"} mint={selected} />
+            <MarketChart
+              pair={token?.pair ?? ""}
+              symbol={token?.symbol ?? "SOL"}
+              mint={selected}
+              pending={!token && !tokenError}
+            />
             {tokenError && <div className="omni-data-note">{tokenError}</div>}
             <section className="omni-portfolio">
               <div className="omni-portfolio-tabs">

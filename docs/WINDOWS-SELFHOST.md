@@ -25,6 +25,12 @@ The included `Collect-Meridian.cmd`, `Pause-Collection.cmd`, `Stop-Meridian.cmd`
 
 ## Collect continuously
 
+To start Omni after signing into Windows, double-click `Enable-Omni-Autostart.cmd` once from the permanent installation folder. This adds a shortcut to the current user's Startup folder and starts the background launcher immediately. It requires Node.js 22+ and an installed Docker Desktop with its first-run setup complete. No administrator permissions, password storage, paid service or public network exposure is added.
+
+The launcher waits for Docker, runs the existing self-host setup, and verifies fresh heartbeats from the local paper worker and all three strategy books. Progress and errors go to `logs/omni-autostart.log`. The containers continue after the launcher or browser exits. `Disable-Omni-Autostart.cmd` removes the shortcut; it does not stop containers that are already running. `Pause-Collection.cmd` stops the paper collector.
+
+This is start-after-sign-in, not a Windows service before login. The PC must stay awake and online, and Docker must be running. The startup scripts have syntax checks; actual shortcut installation and unattended Windows login still require verification on the Windows PC.
+
 ```powershell
 node scripts/selfhost.mjs collect
 ```

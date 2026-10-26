@@ -5,6 +5,12 @@ export const Route = createFileRoute("/api/terminal")({
       GET: async ({ request }) => {
         const p = new URL(request.url).searchParams;
         try {
+          if (p.get("view") === "chain") {
+            const { poolActivity } = await import("@/lib/desk/pool-activity.server");
+            return Response.json(await poolActivity(p.get("pair") ?? ""), {
+              headers: { "cache-control": "no-store" },
+            });
+          }
           if (p.get("view") === "search") {
             const { terminalSearch } = await import("@/lib/desk/terminal-market.server");
             return Response.json(await terminalSearch(p.get("q") ?? ""));

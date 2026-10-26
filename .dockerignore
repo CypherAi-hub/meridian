@@ -11,4 +11,5 @@ data
 backups
 capital-plan.json
 screenshots
+logs
 *.log

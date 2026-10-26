@@ -8,6 +8,8 @@ Double-click `Run-Omni.cmd` on Windows after installing Node.js 22+ and Docker D
 
 The repository name, database, Docker project, environment variables, and older launcher filenames retain Meridian identifiers so existing installations keep their data. There is no need to rename a working installation or reset its warehouse.
 
+The default **Live bot** screen shows persisted automatic paper decisions, current open exposure and independent strategy accounts. Its separate **On-chain pool** view shows a recent public Solana transaction-signature sample. Paper fills and blockchain transactions keep distinct labels. See [the feed contract](docs/OMNI-LIVE-API.md). Windows installations can use `Enable-Omni-Autostart.cmd` for start after user sign-in; actual Windows startup must be verified on that PC.
+
 V3.3A.2 manufactures new training-grade experience going forward. Historical sparse rows stay historical. Collection epochs isolate preview/legacy from production.
 
 Fast path (≈3s) writes price/liquidity path samples. Slow enrichment (holders, security, Jupiter) is budgeted and prioritized. Quote-only Jupiter is PASS for paper; timeout is never a fake no-route.

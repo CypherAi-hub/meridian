@@ -2,6 +2,10 @@
 
 Omni is the new name and trading interface for the existing Meridian project. It remains paper-only. The existing warehouse, automatic experiments, original research desk, and future payout preferences remain intact.
 
+The default home screen is now **Live bot**. It shows persisted automatic strategy decisions beside a real market chart. The Paper bot feed refreshes every three seconds and exposes skips, signals, quote issues and simulated fills with their real timestamps. Click a token in the feed to inspect its chart, or filter to Trades, Decisions or Scans. Pause feed freezes the display while the worker continues. Each strategy account is independent of the manual account.
+
+The separate **On-chain pool** tab shows actual public Solana transaction signatures referencing the selected pool, including failed transactions and Solscan links. It is a recent 30-second polled sample, not a complete stream or decoded buy/sell feed. These public transactions are separate from the bot's simulated fills. See `OMNI-LIVE-API.md` for the event and integration contract.
+
 ## Open it
 
 With Node.js 22+ and Docker Desktop running on Windows, double-click `Run-Omni.cmd` and open `http://localhost:8080`. This starts the built interface, PostgreSQL, and the paper worker. The older Meridian launchers remain compatible. See `WINDOWS-SELFHOST.md` for backups and updating an existing installation.
