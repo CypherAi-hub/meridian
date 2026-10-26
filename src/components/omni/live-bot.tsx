@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { MarketChart } from "./market-chart";
 import { OnchainFeed } from "./onchain-feed";
+import { LaunchEngine, usePhantomReport } from "./launch-engine";
 import {
   reasonLabel,
   type ActivityEvent,
@@ -110,7 +111,7 @@ function EventIcon({ kind }: { kind: ActivityKind }) {
   return <Icon size={14} />;
 }
 
-export function LiveBot({
+function StrategyBooks({
   selected,
   token,
   tokenError,
@@ -597,5 +598,45 @@ export function LiveBot({
         </span>
       </div>
     </main>
+  );
+}
+
+export function LiveBot(props: Parameters<typeof StrategyBooks>[0]) {
+  const feed = usePhantomReport();
+  const [view, setView] = useState<"launch" | "books" | null>(null);
+  useEffect(() => {
+    if (view === null && feed.report?.connection === "connected" && !feed.error) setView("launch");
+  }, [view, feed.report, feed.error]);
+  const selected = view ?? "books";
+  return (
+    <>
+      <div className="omni-engine-switch" role="group" aria-label="Choose paper engine">
+        <button className={selected === "launch" ? "active" : ""} onClick={() => setView("launch")}>
+          <Radio size={12} />
+          Launch engine
+        </button>
+        <button className={selected === "books" ? "active" : ""} onClick={() => setView("books")}>
+          <Workflow size={12} />
+          Strategy books
+        </button>
+        <span>
+          <i
+            className={
+              feed.report?.connection === "connected" && !feed.error
+                ? "status-dot"
+                : "status-dot warn"
+            }
+          />
+          {feed.report?.connection === "connected" && !feed.error
+            ? "Local launch engine connected"
+            : "Local launch engine unavailable"}
+        </span>
+      </div>
+      {selected === "launch" ? (
+        <LaunchEngine {...props} feed={feed} />
+      ) : (
+        <StrategyBooks {...props} />
+      )}
+    </>
   );
 }

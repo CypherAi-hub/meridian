@@ -3,6 +3,12 @@ export const Route = createFileRoute("/api/sniper")({
   server: {
     handlers: {
       GET: async ({ request }) => {
+        if (new URL(request.url).searchParams.get("view") === "phantom") {
+          const { phantomBridgeReport } = await import("@/lib/desk/phantom-bridge.server");
+          return Response.json(await phantomBridgeReport(), {
+            headers: { "cache-control": "no-store" },
+          });
+        }
         if (new URL(request.url).searchParams.get("view") === "live") {
           try {
             const { sniperLiveReport } = await import("@/lib/desk/sniper-activity.server");
@@ -29,6 +35,11 @@ export const Route = createFileRoute("/api/sniper")({
         return Response.json(await sniperReport());
       },
       POST: async ({ request }) => {
+        if (new URL(request.url).searchParams.get("view") === "phantom")
+          return Response.json(
+            { error: "Launch engine monitoring is read-only" },
+            { status: 405, headers: { Allow: "GET" } },
+          );
         // A browser on another origin must not mutate the local experiment.
         const origin = request.headers.get("origin");
         if (origin && origin !== new URL(request.url).origin)
