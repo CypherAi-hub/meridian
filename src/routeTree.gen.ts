@@ -10,11 +10,13 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiCapitalRouteImport } from './routes/api/capital'
 import { Route as ApiControlRouteImport } from './routes/api/control'
 import { Route as ApiDeskRouteImport } from './routes/api/desk'
 import { Route as ApiHealthRouteImport } from './routes/api/health'
 import { Route as ApiQuoteRouteImport } from './routes/api/quote'
 import { Route as ApiResearchRouteImport } from './routes/api/research'
+import { Route as ApiSniperRouteImport } from './routes/api/sniper'
 import { Route as ApiTapeRouteImport } from './routes/api/tape'
 import { Route as ApiTickRouteImport } from './routes/api/tick'
 import { Route as ApiHealthLiveRouteImport } from './routes/api/health.live'
@@ -25,6 +27,11 @@ import { Route as ApiHealthResearchRouteImport } from './routes/api/health.resea
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiCapitalRoute = ApiCapitalRouteImport.update({
+  id: '/api/capital',
+  path: '/api/capital',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiControlRoute = ApiControlRouteImport.update({
@@ -50,6 +57,11 @@ const ApiQuoteRoute = ApiQuoteRouteImport.update({
 const ApiResearchRoute = ApiResearchRouteImport.update({
   id: '/api/research',
   path: '/api/research',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiSniperRoute = ApiSniperRouteImport.update({
+  id: '/api/sniper',
+  path: '/api/sniper',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiTapeRoute = ApiTapeRouteImport.update({
@@ -85,11 +97,13 @@ const ApiHealthResearchRoute = ApiHealthResearchRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/api/capital': typeof ApiCapitalRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
   '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
+  '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
@@ -99,11 +113,13 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/api/capital': typeof ApiCapitalRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
   '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
+  '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
@@ -114,11 +130,13 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/api/capital': typeof ApiCapitalRoute
   '/api/control': typeof ApiControlRoute
   '/api/desk': typeof ApiDeskRoute
   '/api/health': typeof ApiHealthRouteWithChildren
   '/api/quote': typeof ApiQuoteRoute
   '/api/research': typeof ApiResearchRoute
+  '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
@@ -130,11 +148,13 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/api/capital'
     | '/api/control'
     | '/api/desk'
     | '/api/health'
     | '/api/quote'
     | '/api/research'
+    | '/api/sniper'
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
@@ -144,11 +164,13 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/api/capital'
     | '/api/control'
     | '/api/desk'
     | '/api/health'
     | '/api/quote'
     | '/api/research'
+    | '/api/sniper'
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
@@ -158,11 +180,13 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/api/capital'
     | '/api/control'
     | '/api/desk'
     | '/api/health'
     | '/api/quote'
     | '/api/research'
+    | '/api/sniper'
     | '/api/tape'
     | '/api/tick'
     | '/api/health/live'
@@ -173,11 +197,13 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ApiCapitalRoute: typeof ApiCapitalRoute
   ApiControlRoute: typeof ApiControlRoute
   ApiDeskRoute: typeof ApiDeskRoute
   ApiHealthRoute: typeof ApiHealthRouteWithChildren
   ApiQuoteRoute: typeof ApiQuoteRoute
   ApiResearchRoute: typeof ApiResearchRoute
+  ApiSniperRoute: typeof ApiSniperRoute
   ApiTapeRoute: typeof ApiTapeRoute
   ApiTickRoute: typeof ApiTickRoute
 }
@@ -189,6 +215,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/capital': {
+      id: '/api/capital'
+      path: '/api/capital'
+      fullPath: '/api/capital'
+      preLoaderRoute: typeof ApiCapitalRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/control': {
@@ -224,6 +257,13 @@ declare module '@tanstack/react-router' {
       path: '/api/research'
       fullPath: '/api/research'
       preLoaderRoute: typeof ApiResearchRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/sniper': {
+      id: '/api/sniper'
+      path: '/api/sniper'
+      fullPath: '/api/sniper'
+      preLoaderRoute: typeof ApiSniperRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/tape': {
@@ -291,11 +331,13 @@ const ApiHealthRouteWithChildren = ApiHealthRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ApiCapitalRoute: ApiCapitalRoute,
   ApiControlRoute: ApiControlRoute,
   ApiDeskRoute: ApiDeskRoute,
   ApiHealthRoute: ApiHealthRouteWithChildren,
   ApiQuoteRoute: ApiQuoteRoute,
   ApiResearchRoute: ApiResearchRoute,
+  ApiSniperRoute: ApiSniperRoute,
   ApiTapeRoute: ApiTapeRoute,
   ApiTickRoute: ApiTickRoute,
 }

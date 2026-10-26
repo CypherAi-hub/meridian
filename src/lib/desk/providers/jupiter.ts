@@ -7,6 +7,8 @@ import { deskSettings } from "../config";
 import { budgetFor, parseRetryAfter, JUPITER_KEYED_BUDGET } from "../rate-budget";
 
 type JupQuote = {
+  inputMint?: string;
+  outputMint?: string;
   inAmount?: string;
   outAmount?: string;
   priceImpactPct?: string | number;
@@ -15,9 +17,7 @@ type JupQuote = {
 };
 
 const ENDPOINTS = [
-  "https://lite-api.jup.ag/swap/v1/quote",
-  "https://public.jupiterapi.com/quote",
-  "https://quote-api.jup.ag/v6/quote",
+  "https://api.jup.ag/swap/v1/quote",
 ];
 
 export const providerCounters = {
@@ -114,9 +114,7 @@ async function quoteOnce(opts: {
   }
   let last = "quote failed";
   let lastStatus: number | undefined;
-  const endpoints = key
-    ? ["https://api.jup.ag/swap/v1/quote", ...ENDPOINTS]
-    : ENDPOINTS;
+  const endpoints = ENDPOINTS;
   for (const base of endpoints) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
@@ -143,6 +141,9 @@ async function quoteOnce(opts: {
       const labels = (body.routePlan ?? []).map((x) => x.swapInfo?.label).filter((x): x is string => Boolean(x));
       const inAmount = body.inAmount ?? opts.amount;
       const outAmount = body.outAmount ?? "0";
+      if (body.inputMint !== opts.inputMint || body.outputMint !== opts.outputMint) {
+        return failedQuote(opts, "quote token identity mismatch", latencyMs);
+      }
       const ok = Boolean(outAmount && Number(outAmount) > 0);
       if (!ok) {
         circuit.failure("no route");
@@ -243,4 +244,9 @@ export async function quoteSolUsdc(): Promise<QuoteObs> {
     solPriceUsd: 1,
     notionalUsd: 1,
   });
+}
+
+/** Exact-size quote-only adapter for the independent paper sniper. Never builds a swap. */
+export async function quotePaperSwap(opts: { inputMint: string; outputMint: string; amount: string; inDecimals: number; outDecimals: number; notionalUsd: number }): Promise<QuoteObs> {
+  return quoteOnce({ ...opts, solPriceUsd: 0 });
 }

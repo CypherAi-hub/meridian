@@ -1,3 +1,4 @@
+import { advanceSniperSuite, sniperWatchMints } from "./sniper.server";
 import { applyTape } from "./engine";
 import { ingestFastPath, ingestSlowEnrichment, ingestTape } from "./ingest.server";
 import { persistDesk, persistFastPath, loadDesk, recordError, startWorkerTick, finishWorkerTick, acquirePrimaryLease, renewPrimaryLease, recordSoakIncident, hydrateHoldersOntoTape } from "./repo.server";
@@ -10,10 +11,10 @@ import { researchUrgency, selectActiveWatches, MAX_ACTIVE_WATCHES, ACTIVE_HOLD_M
 import { assertPaperMode, deskSettings } from "./config";
 import { bucketOf } from "./buckets";
 import type { DeskSnapshot } from "./types";
-import { ACTIVE_INTERVAL_MS } from "./watch";
 
-const TICK_MS = 12_000;
-const ACTIVE_MS = ACTIVE_INTERVAL_MS;
+// Use the same validated settings that the worker reports at startup.
+const TICK_MS = deskSettings().universeWatchMs;
+const ACTIVE_MS = deskSettings().activeWatchMs;
 const STARTED_AT = Date.now();
 const INSTANCE_ID = crypto.randomUUID();
 
@@ -81,7 +82,9 @@ export async function runTick(): Promise<DeskSnapshot> {
     await restoreRateBudgets();
     const prev = await loadDesk();
     try {
-      const watch = activeMints(prev);
+      const sniperMints = await sniperWatchMints();
+      const youngest = prev.tokens.filter(t => t.createdAt != null && Date.now()-t.createdAt < 900_000).sort((a,b)=>(b.createdAt??0)-(a.createdAt??0)).slice(0,3).map(t=>t.address);
+      const watch = [...new Set([...sniperMints, ...youngest, ...activeMints(prev)])];
       const held = prev.positions.map((p) => p.tokenAddress);
       const pending = prev.pending.filter((r) => !r.labels_complete).map((r) => r.tokenAddress);
       const tape = await ingestTape({
@@ -89,14 +92,17 @@ export async function runTick(): Promise<DeskSnapshot> {
         focus: prev.selected,
         watch,
         pending,
+        reserveQuotes: sniperMints.length > 0,
       });
       const enriched = await ingestSlowEnrichment({
         tape,
         mints: watch,
         held,
         pending,
+        reserveQuotes: sniperMints.length > 0,
       });
       const withHolders = await hydrateHoldersOntoTape(enriched.tokens, Date.now());
+      await advanceSniperSuite(withHolders);
       // Drain immediately before synchronous decision/finalization. No await may
       // intervene and permit a new pre-boundary request to remain in flight.
       await g.__meridianFastChain__;
@@ -207,7 +213,8 @@ export async function runActiveTick(scheduledAt = Date.now()): Promise<DeskSnaps
     const held = prev.positions.map((p) => p.tokenAddress);
     const batch = nextLabelBatch(pendingMints, g.__meridianLabelCursor__ ?? 0);
     g.__meridianLabelCursor__ = batch.cursor;
-    const mints = [...new Set([...held, ...batch.mints])];
+    const sniperMints = await sniperWatchMints();
+    const mints = [...new Set([...sniperMints, ...held, ...batch.mints])];
     if (!mints.length) return prev;
     try {
       const startedAt = Date.now();
@@ -222,6 +229,7 @@ export async function runActiveTick(scheduledAt = Date.now()): Promise<DeskSnaps
         },
         mints,
       });
+      await advanceSniperSuite(tape.tokens.filter(t => mints.includes(t.address)));
       const db0 = Date.now();
       await persistFastPath({
         tokens: tape.tokens.filter((t) => mints.includes(t.address)),

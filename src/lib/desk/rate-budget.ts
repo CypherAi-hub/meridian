@@ -160,7 +160,7 @@ export class AdaptiveRateBudget {
 }
 
 export const FAMILY_DEFAULTS: Record<string, { rate: number; min: number; max: number }> = {
-  jupiter: { rate: 0.3, min: 0.05, max: 0.8 },
+  jupiter: { rate: 0.3, min: 0.05, max: 0.45 },
   geckoterminal: { rate: 0.25, min: 0.05, max: 0.8 },
   rugcheck: { rate: 0.45, min: 0.08, max: 1.5 },
   dexscreener: { rate: 0.8, min: 0.15, max: 2.5 },

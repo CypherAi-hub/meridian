@@ -44,18 +44,19 @@ export async function fetchGeckoPools(): Promise<{
   const t0 = Date.now();
   const ingestedAt = t0;
   try {
+    // New pools get the first budget token. A failed optional trending request
+    // must never discard successfully fetched launch data.
     const urls = [
-      "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
       "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+      "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
     ];
-    const res = await Promise.all(urls.map((u) => getJsonRetry(u, 6000, 2, "geckoterminal")));
-    const bodies = await Promise.all(
-      res.map(async (r) => {
-        if (!r.ok) return { data: [] as GeckoPool[], status: r.status };
-        return { ...((await r.json()) as { data?: GeckoPool[] }), status: r.status };
-      }),
-    );
-    const failed = res.filter((r) => !r.ok);
+    const results = await Promise.allSettled(urls.map(async (url) => {
+      const r = await getJsonRetry(url, 6000, 2, "geckoterminal");
+      if (!r.ok) return { data: [] as GeckoPool[], status: r.status };
+      return { ...((await r.json()) as { data?: GeckoPool[] }), status: r.status };
+    }));
+    const bodies = results.map(result => result.status === "fulfilled" ? result.value : { data: [] as GeckoPool[], status: 0 });
+    const failed = bodies.filter(body => body.status !== 200);
     const lagMs = Date.now() - t0;
     const eventTime = Date.now();
     const pools = bodies.flatMap((b) => b.data ?? []);
@@ -108,7 +109,7 @@ export async function fetchGeckoPools(): Promise<{
       tokens: [...byMint.values()],
       solPrice,
       lagMs,
-      error: failed.length === res.length ? `gecko ${failed[0]?.status ?? 0}` : failed.length ? `partial ${failed[0]?.status}` : undefined,
+      error: failed.length === bodies.length ? `gecko ${failed[0]?.status ?? 0}` : failed.length ? `partial ${failed[0]?.status}` : undefined,
     };
   } catch (e) {
     return {

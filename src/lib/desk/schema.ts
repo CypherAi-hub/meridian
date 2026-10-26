@@ -58,6 +58,7 @@ export type TokenSnapshot = {
   symbol: string;
   name: string;
   decimals: number;
+  mintSafety?: { program: string; initialized: boolean; supported: boolean; reason?: string };
   createdAt: number | null;
   priceUsd: FieldObs<number>;
   priceCrossUsd: FieldObs<number>;

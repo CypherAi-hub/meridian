@@ -11,3 +11,9 @@ dist
 .vite
 tmp
 /opt
+
+.env.*
+backups/
+.vercel/
+
+capital-plan.json

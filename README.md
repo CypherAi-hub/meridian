@@ -38,3 +38,11 @@ node --experimental-strip-types scripts/audit-corpus.mjs input.json new-audit.js
 Each record must contain its immutable frozen decision and full outcome path separately. The audit independently checks the one-hour path including leading/trailing gaps, first +10%/-10% hit, source timestamps, and source values for seven explicitly listed inputs. It excludes legacy labels and never rewrites the warehouse. It emits both source and accepted-dataset SHA-256 hashes. This is a path/input audit, not complete production certification or a training authorization.
 
 This branch adds no fitting function or model execution path. The separate preview already contains V3.4 split, embargo, grading, baseline, and model-lock modules; those must be reconciled before model work. This audit does not check Grade A/B, route coverage, or all collection gates, and its accepted rows must never be treated as a certified training set. The existing gates and 72-hour soak remain required.
+
+## Run on your own Windows PC
+
+See [Windows self-host instructions](docs/WINDOWS-SELFHOST.md). The Docker Compose setup runs PostgreSQL and the built web app locally, with an optional paper-only worker and persistent storage.
+
+## Future funded-mode preparation
+
+The local capital policy stores public payout preferences and previews distributions of net realized paper profit while protecting principal. Live actions remain locked. See [funding preparation](docs/FUTURE-FUNDING.md).

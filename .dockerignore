@@ -1,0 +1,13 @@
+.git
+node_modules
+.env
+*.env
+.env.*
+!.env.selfhost.example
+.output
+.vercel
+dist
+data
+backups
+screenshots
+*.log
