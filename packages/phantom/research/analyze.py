@@ -14,6 +14,7 @@ import statistics
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 WSOL = 'So11111111111111111111111111111111111111112'
@@ -187,7 +188,7 @@ def horizon_result(row):
             'actualHoldingTimeMs': row['sell']['observedAt'] - baseline}
 
 
-def cost_policy_compatibility(costs, strategy_rules):
+def cost_policy_compatibility(costs, strategy_rules, exact_costs=None):
     """Compare verified baseline costs with the actual exposed policy; never tune it."""
     budget = strategy_rules.get('maximumCostBps') if isinstance(strategy_rules, dict) else None
     comparison = {
@@ -201,25 +202,28 @@ def cost_policy_compatibility(costs, strategy_rules):
         'maximumExcessBps': None,
         'scope': 'Verified BASELINE quote costs only, not entry eligibility, execution guarantees, realized P&L, or profitability. Horizon outcomes are excluded.',
         'policyAutomaticallyChanged': False,
+        'comparisonArithmetic': 'EXACT_UNROUNDED_QUOTE_AMOUNTS',
     }
     if not finite(budget) or not 0 <= budget <= 10_000:
         comparison['unavailableReason'] = 'STRATEGY_RULES_OR_MAXIMUM_COST_MISSING_OR_INVALID'
         return comparison
-    excesses = [cost - budget for cost in costs if cost > budget]
+    comparisons = exact_costs if exact_costs is not None else costs
+    exact_budget = Fraction(str(budget))
+    excesses = [cost - exact_budget for cost in comparisons if cost > exact_budget]
     comparison.update({
         'status': 'AVAILABLE' if costs else 'NO_VALIDATED_BASELINE_COST_SAMPLES',
         'configuredMaximumCostBps': budget,
-        'withinBudgetCount': sum(cost <= budget for cost in costs),
+        'withinBudgetCount': sum(cost <= exact_budget for cost in comparisons),
         'overBudgetCount': len(excesses),
-        'medianExcessBpsAmongOverBudget': statistics.median(excesses) if excesses else None,
-        'maximumExcessBps': max(excesses) if excesses else (0 if costs else None),
+        'medianExcessBpsAmongOverBudget': float(statistics.median(excesses)) if excesses else None,
+        'maximumExcessBps': float(max(excesses)) if excesses else (0 if costs else None),
     })
     return comparison
 
 
 def research_analysis(research, strategy_rules=None):
     baselines = [row for row in research if row.get('phase', 'BASELINE') == 'BASELINE']
-    costs, invalid_baselines, unavailable_baselines = [], 0, 0
+    costs, exact_costs, invalid_baselines, unavailable_baselines = [], [], 0, 0
     for row in baselines:
         if row.get('status') == 'UNAVAILABLE':
             unavailable_baselines += 1
@@ -228,6 +232,8 @@ def research_analysis(research, strategy_rules=None):
             if row.get('status') != 'QUOTED':
                 raise ValueError('Unknown baseline status')
             costs.append(baseline_cost(row))
+            amount = integer(row['amountLamports'], True)
+            exact_costs.append(Fraction((amount + integer(row['modeledNetworkFeesLamports']) - integer(row['sell']['minOutAmount'])) * 10_000, amount))
         except (KeyError, TypeError, ValueError):
             invalid_baselines += 1
     horizon_rows = [row for row in research if row.get('phase') == 'HORIZON']
@@ -291,7 +297,7 @@ def research_analysis(research, strategy_rules=None):
             'invalid': invalid_baselines,
             'conservativeRoundTripCostBpsMedian': statistics.median(costs) if costs else None,
             'conservativeRoundTripCostBpsP95': percentile(costs, .95),
-            'strategyCostPolicyCompatibility': cost_policy_compatibility(costs, strategy_rules),
+            'strategyCostPolicyCompatibility': cost_policy_compatibility(costs, strategy_rules, exact_costs),
             'scope': 'BASELINE sequential quote costs only. Modeled expenses, no orders or fills; horizon outcomes excluded.',
         },
         'hypotheticalQuoteHorizons': {

@@ -31,6 +31,7 @@ import {
 import type { Quote } from "./execution.ts";
 import { QuoteResearchCollector } from "./quote-research.ts";
 import { runtimeSourceVersion } from "./runtime-version.ts";
+import { conservativeCostBps } from "./costs.ts";
 function rpcInterval() {
   const value = Number(process.env.PHANTOM_RPC_INTERVAL_MS ?? 1000);
   if (!Number.isInteger(value) || value < 100 || value > 60_000)
@@ -525,8 +526,8 @@ export class Engine {
       });
       return;
     }
-    const cost = Number(((amount - BigInt(sell.minOutAmount) + 20_000n) * 10_000n) / amount);
-    const feature = this.feature(event, snapshot, Math.max(0, cost));
+    const cost = conservativeCostBps(amount, BigInt(sell.minOutAmount), 20_000n);
+    const feature = this.feature(event, snapshot, cost);
     if (feature.observations >= 3 && this.launches.has(event.mint))
       snapshot.evidence.abnormalCreatorActivity = feature.creatorSelling;
     const safety = checkTokenSafety(snapshot.evidence);
@@ -649,13 +650,7 @@ export class Engine {
         });
         snapshot.evidence.sellRouteObservedAt = exitQuote.observedAt;
         snapshot.evidence.sellRouteAvailable = true;
-        const cost = Math.max(
-          0,
-          Number(
-            ((order.amountLamports - BigInt(exitQuote.minOutAmount) + 20_000n) * 10_000n) /
-              order.amountLamports,
-          ),
-        );
+        const cost = conservativeCostBps(order.amountLamports, BigInt(exitQuote.minOutAmount), 20_000n);
         const features = this.feature(event, snapshot, cost);
         snapshot.evidence.abnormalCreatorActivity =
           this.launches.has(event.mint) && features.observations >= 3

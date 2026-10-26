@@ -181,6 +181,35 @@ function enter(ledger: PaperLedger, mint: string, id: string) {
 }
 
 describe("engine economic and audit fault boundaries", () => {
+  it("uses the same conservative cost boundary before an entry is proposed", async () => {
+    const f = fixture(), base = f.internal.feature();
+    vi.mocked(f.internal.feature).mockImplementation((...args: any[]) => ({
+      ...base, executionCostBps: args[2] ?? 20,
+    }));
+    f.engine.setQuoteProvider({quote: async input => input.inputMint === WSOL
+      ? quote(WSOL, input.outputMint, input.amount, 1000n)
+      : quote(input.inputMint, WSOL, input.amount, 9_869_999n)});
+    await f.internal.analyze(f.e);
+    expect(f.internal.feature).toHaveBeenCalledWith(f.e, expect.anything(), 151);
+    expect(f.ledger.state.pending).toHaveLength(0);
+    expect(f.engine.store.decision).toHaveBeenCalledWith(expect.objectContaining({
+      accepted: false, reasons: expect.arrayContaining(["COST_BUDGET_EXCEEDED"]),
+    }), expect.any(Number));
+  });
+  it("rejects a fresh fill whose exact cost is 150.001bps above the unchanged150bps cap", async () => {
+    const f = fixture(), base = f.internal.feature();
+    vi.mocked(f.internal.feature).mockImplementation((...args: any[]) => ({
+      ...base, executionCostBps: args[2] ?? 20,
+    }));
+    f.engine.setQuoteProvider({quote: async input => input.inputMint === WSOL
+      ? quote(WSOL, input.outputMint, input.amount, 1000n)
+      : quote(input.inputMint, WSOL, input.amount, 9_869_999n)});
+    queue(f);
+    await f.engine.tick();
+    expect(f.internal.feature).toHaveBeenCalledWith(expect.anything(), expect.anything(), 151);
+    expect(f.ledger.state.positions).toHaveLength(0);
+    expect(f.ledger.state.cashLamports).toBe(1_000_000_000n);
+  });
   it("suspends without settling an entry when the worker lease is lost during repricing", async () => {
     const f = fixture();
     queue(f);

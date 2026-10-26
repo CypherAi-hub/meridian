@@ -4,6 +4,31 @@ const opts:ReplayOptions={strategy:'fixture',initialCapitalLamports:'10000',mini
 const row=(id:string,at:number,mint='M'):ReplayObservation=>({id,mint,at,regime:'trend',features:{pressure:at}});
 const quote=(at:number,inputRaw:string,outputRaw:string)=>({observedAt:at,inputRaw,outputRaw,networkFeeLamports:'10',priceImpactBps:50});
 describe('historical exact-size quote replay',()=>{
+ it('requires quote observations after decision plus latency on both entry and exit',()=>{
+   const rows=[row('a',0),{...row('b',100),buy:quote(99,'100','1000')},{...row('c',200),buy:quote(100,'100','900')},{...row('d',300),sell:quote(299,'900','140')},{...row('e',400),sell:quote(300,'900','130')}];
+   const report=replay(rows,c=>c.now===0?{action:'enter',amountLamports:'100',reasons:[]}:c.now===200?{action:'exit',reasons:[]}: {action:'hold',reasons:[]},{...opts,maxQuoteAgeMs:1000});
+   expect(report.trades).toHaveLength(1);
+   expect(report.trades[0]).toMatchObject({openedAt:200,closedAt:400,quantityRaw:'900'});
+ });
+ it('rejects a recorded pre-delay request even when its response arrives after the delay',()=>{
+   const rows=[row('a',0),{...row('b',100),buy:{...quote(100,'100','1000'),requestedAt:99}},{...row('c',200),buy:{...quote(200,'100','900'),requestedAt:100}}];
+   const report=replay(rows,c=>c.now===0?{action:'enter',amountLamports:'100',reasons:[]}:{action:'hold',reasons:[]},{...opts,maxQuoteAgeMs:1000});
+   expect(report.unresolvedPositions[0].openedAt).toBe(200);
+   expect(report.unresolvedPositions[0].quantityRaw).toBe('900');
+ });
+ it('does not use a pre-target quote attached to a later rejection-horizon row',()=>{
+   const report=replay([{...row('a',0),buy:quote(0,'100','10')},{...row('b',400),sell:quote(299,'10','140')}],()=>({action:'reject',reasons:[]}),{...opts,maxQuoteAgeMs:1000});
+   expect(report.rejectedOutcomes[0].hypotheticalPnlLamports).toBeNull();
+ });
+ it('continues to the first valid horizon quote and reports its actual observation time',()=>{
+   const report=replay([{...row('a',0),buy:quote(0,'100','10')},{...row('b',400),sell:quote(299,'10','999')},{...row('c',500),sell:quote(500,'10','140')}],()=>({action:'reject',reasons:[]}),{...opts,maxQuoteAgeMs:1000});
+   expect(report.rejectedOutcomes[0]).toMatchObject({hypotheticalPnlLamports:'20',horizonAt:300,exitQuoteObservedAt:500});
+ });
+ it('checks captured exit request times and refuses malformed request clocks',()=>{
+   const rows=[row('a',0),{...row('b',100),buy:quote(100,'100','900')},{...row('c',200),sell:{...quote(200,'900','140'),requestedAt:199}},{...row('d',300),sell:{...quote(300,'900','140'),requestedAt:301}},{...row('e',400),sell:{...quote(400,'900','130'),requestedAt:200}}];
+   const report=replay(rows,c=>c.now===0?{action:'enter',amountLamports:'100',reasons:[]}:c.now===100?{action:'exit',reasons:[]}:{action:'hold',reasons:[]},{...opts,maxQuoteAgeMs:1000});
+   expect(report.trades[0]).toMatchObject({openedAt:100,closedAt:400});
+ });
  it('uses future observable quotes after latency and deducts network fees once',()=>{
    const rows=[{...row('a',0),buy:quote(0,'100','1000')},{...row('b',50),buy:quote(50,'100','999')},{...row('c',100),buy:quote(100,'100','900')},{...row('d',150),sell:quote(150,'900','140')},{...row('e',200),sell:quote(200,'900','130')}];
    const report=replay(rows,c=>!c.position?{action:'enter',reasons:['pressure'],amountLamports:'100'}:{action:'exit',reasons:['risk']},opts);

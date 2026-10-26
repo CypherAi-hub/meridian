@@ -1,6 +1,8 @@
 /** Point-in-time, exact-size quote replay. No price interpolation or invented fills. */
 export interface ReplayQuote {
   observedAt: number;
+  /** Optional captured request time; absent legacy data cannot prove request timing. */
+  requestedAt?: number;
   inputRaw: string;
   outputRaw: string;
   /** Trading fees and quoted slippage are already reflected in outputRaw. */
@@ -41,6 +43,7 @@ export interface ReplayTrade extends ReplayPosition {
 }
 export interface RejectedOutcome {
   mint: string; at: number; reasons: string[]; horizonAt: number;
+  exitQuoteObservedAt: number | null;
   /** Diagnostic only; never supplied to a strategy. Null when exact quotes are unavailable. */
   hypotheticalPnlLamports: string | null;
 }
@@ -73,8 +76,9 @@ function freeze<T>(value: T): T {
   }
   return value;
 }
-function validQuote(q: ReplayQuote | undefined, at: number, input: bigint, opts: ReplayOptions): q is ReplayQuote {
-  if (!q || !Number.isFinite(q.observedAt) || q.observedAt > at || at - q.observedAt > opts.maxQuoteAgeMs) return false;
+function validQuote(q: ReplayQuote | undefined, at: number, input: bigint, opts: ReplayOptions, notBefore = -Infinity): q is ReplayQuote {
+  if (!q || !Number.isFinite(q.observedAt) || q.observedAt < notBefore || q.observedAt > at || at - q.observedAt > opts.maxQuoteAgeMs) return false;
+  if (q.requestedAt !== undefined && (!Number.isFinite(q.requestedAt) || q.requestedAt < 0 || q.requestedAt < notBefore || q.requestedAt > q.observedAt)) return false;
   return natural(q.inputRaw, true) === input && natural(q.outputRaw, true) > 0n && natural(q.networkFeeLamports) >= 0n
     && Number.isFinite(q.priceImpactBps) && q.priceImpactBps >= 0 && q.priceImpactBps <= opts.maxImpactBps;
 }
@@ -111,7 +115,7 @@ export function replay(observations: readonly ReplayObservation[], evaluate: (ct
     lastRows.set(row.mint,row);
     const order = pending.get(row.mint);
     if (order && row.at >= order.at + opts.minimumLatencyMs) {
-      if (order.action === 'enter' && !positions.has(row.mint) && validQuote(row.buy,row.at,order.amount,opts)) {
+      if (order.action === 'enter' && !positions.has(row.mint) && validQuote(row.buy,row.at,order.amount,opts,order.at+opts.minimumLatencyMs)) {
         if(opts.fillGuard){const verdict=opts.fillGuard(context(row,[...history,row]),{amountLamports:order.amount.toString(),decisionAt:order.at});if(!verdict.allowed){decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:[...verdict.reasons]});pending.delete(row.mint);history.push(row);continue;}}
         const fee=natural(row.buy.networkFeeLamports), total=order.amount+fee;
         if (cash >= total) {
@@ -121,7 +125,7 @@ export function replay(observations: readonly ReplayObservation[], evaluate: (ct
         } else { decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['INSUFFICIENT_CASH_AT_FILL']});pending.delete(row.mint); }
       } else if (order.action === 'exit') {
         const p=positions.get(row.mint);
-        if (p && validQuote(row.sell,row.at,natural(p.quantityRaw),opts)) {
+        if (p && validQuote(row.sell,row.at,natural(p.quantityRaw),opts,order.at+opts.minimumLatencyMs)) {
           const proceeds=natural(row.sell.outputRaw), exitFee=natural(row.sell.networkFeeLamports);
           if (cash + proceeds < exitFee) {decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['EXIT_NETWORK_FEE_UNFUNDED']});continue;}
           cash+=proceeds-exitFee;
@@ -144,15 +148,17 @@ export function replay(observations: readonly ReplayObservation[], evaluate: (ct
   }
   const horizon=opts.rejectionHorizonMs??60_000;
   const rejectedOutcomes=rejected.map(({row,decision})=>{
-    const target=row.at+horizon, later=rows.find(r=>r.mint===row.mint&&r.at>=target);
+    const target=row.at+horizon;
+    const later=row.buy&&validQuote(row.buy,row.at,natural(row.buy.inputRaw),opts)
+      ? rows.find(r=>r.mint===row.mint&&r.at>=target&&validQuote(r.sell,r.at,natural(row.buy!.outputRaw),opts,target)) : undefined;
     let pnl:string|null=null;
-    if(row.buy&&validQuote(row.buy,row.at,natural(row.buy.inputRaw),opts)&&later&&validQuote(later.sell,later.at,natural(row.buy.outputRaw),opts)) pnl=(natural(later.sell.outputRaw)-natural(row.buy.inputRaw)-natural(row.buy.networkFeeLamports)-natural(later.sell.networkFeeLamports)).toString();
-    return {mint:row.mint,at:row.at,reasons:decision.reasons,horizonAt:target,hypotheticalPnlLamports:pnl};
+    if(row.buy&&validQuote(row.buy,row.at,natural(row.buy.inputRaw),opts)&&later&&validQuote(later.sell,later.at,natural(row.buy.outputRaw),opts,target)) pnl=(natural(later.sell.outputRaw)-natural(row.buy.inputRaw)-natural(row.buy.networkFeeLamports)-natural(later.sell.networkFeeLamports)).toString();
+    return {mint:row.mint,at:row.at,reasons:decision.reasons,horizonAt:target,exitQuoteObservedAt:pnl!==null?later!.sell!.observedAt:null,hypotheticalPnlLamports:pnl};
   });
   let equityPeak=natural(opts.initialCapitalLamports),observedDrawdown=0n,unknownEquity=0;
   for(const point of equityHistory){if(point.equityLamports===null){unknownEquity++;continue;}const value=BigInt(point.equityLamports);if(value>equityPeak)equityPeak=value;if(equityPeak-value>observedDrawdown)observedDrawdown=equityPeak-value;}
   const metrics={...performanceMetrics(trades,opts.initialCapitalLamports),maximumObservedEquityDrawdownLamports:equityHistory.length?observedDrawdown.toString():null,unknownEquityObservations:unknownEquity};
-  return {fixtureKind:opts.fixtureKind,strategy:opts.strategy,initialCapitalLamports:opts.initialCapitalLamports,cashLamports:cash.toString(),trades,unresolvedPositions:[...positions.values()],unfilledOrders:[...pending].map(([mint,order])=>({mint,action:order.action,decisionAt:order.at,amountRaw:order.amount.toString()})),equity:equityHistory,decisions,rejectedOutcomes,metrics,executionAssumptions:['Exact-size contemporaneous observable quotes only; no linear price interpolation.','Quote output includes trading fees and quoted slippage; network fees charged once separately.','Orders fill no sooner than configured minimum latency on a later observed quote.','Unclosed inventory remains unresolved; realized metrics do not imply zero inventory loss.','Equity is unknown when any open inventory lacks a fresh exact-size exit quote; observed drawdown can understate losses across those gaps.','Rejected future outcomes are diagnostics only and never passed to strategy callbacks.']};
+  return {fixtureKind:opts.fixtureKind,strategy:opts.strategy,initialCapitalLamports:opts.initialCapitalLamports,cashLamports:cash.toString(),trades,unresolvedPositions:[...positions.values()],unfilledOrders:[...pending].map(([mint,order])=>({mint,action:order.action,decisionAt:order.at,amountRaw:order.amount.toString()})),equity:equityHistory,decisions,rejectedOutcomes,metrics,executionAssumptions:['Exact-size contemporaneous observable quotes only; no linear price interpolation.','Quote output includes trading fees and quoted slippage; network fees charged once separately.','Fill quote observations must be at or after decision plus configured latency; captured request times must satisfy the same boundary. Missing request timestamps do not prove when a request began.','Unclosed inventory remains unresolved; realized metrics do not imply zero inventory loss.','Equity is unknown when any open inventory lacks a fresh exact-size exit quote; observed drawdown can understate losses across those gaps.','Rejected future outcomes are diagnostics only and never passed to strategy callbacks.']};
 }
 
 export function performanceMetrics(trades: readonly ReplayTrade[], initialCapitalLamports: string) {
