@@ -7,7 +7,7 @@ import { PROGRAMS, decodeLogNotification, type RpcTransaction } from '../src/dec
 import { Rpc, SolanaStream, normalizeYellowstoneTransaction, startYellowstone, enrichmentPriority, ENRICHMENT_PRIORITY } from '../src/stream.ts';
 import { WSOL, type Health, type ChainEvent } from '../src/types.ts';
 
-// Transport responses and chain transactions in this file are SYNTHETIC fixtures.
+// Generated transport responses are SYNTHETIC. Separately attributed fixtures are recorded chain data.
 const signature = (n: number) => bs58.encode(new Uint8Array(64).fill(n));
 const tx = (n: number): RpcTransaction => ({ slot: n, blockTime: null, transaction: { signatures: [signature(n)], message: { accountKeys: [], instructions: [] } }, meta: { err: null } });
 const health = (): Health => ({ status: 'STARTING', source: 'synthetic-test', received: 0, decoded: 0, rejected: 0, errors: 0, lastEventAt: null, latencyMs: { p50: null, p95: null }, backfillGaps: 0, queueDepth: 0 });
@@ -45,6 +45,33 @@ describe('public RPC budget and errors', () => {
 });
 
 describe('finalized Solana backfill and cursor safety', () => {
+  it('requests numeric v1 capability and durably receives the attributed JSON v1 fixture', async () => {
+    const capture: RpcTransaction = JSON.parse(fs.readFileSync(new URL('./fixtures/real-v1-transaction.json', import.meta.url), 'utf8'));
+    const receive = vi.fn(async () => undefined), store = cursorStore(), requests: unknown[][] = [];
+    const rpc = rpcMock(async (method, params) => {
+      if (method === 'getSignaturesForAddress') return [{ signature: capture.transaction.signatures[0], slot: capture.slot, err: null }];
+      requests.push(params); return capture;
+    });
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', store, health(), receive, { attempts: 1, retryMs: 0 });
+    await stream.backfill();
+    expect(requests).toHaveLength(1);
+    expect(requests[0][1]).toMatchObject({ maxSupportedTransactionVersion: 1, encoding: 'json', commitment: 'finalized' });
+    expect(receive).toHaveBeenCalledExactlyOnceWith(capture, expect.any(Number), 'finalized');
+    expect(store.cursors.get(PROGRAMS[0])).toBe(capture.transaction.signatures[0]);
+    await stream.stop();
+  });
+  it('does not advance a durable cursor across malformed v1 configuration', async () => {
+    const capture: RpcTransaction = JSON.parse(fs.readFileSync(new URL('./fixtures/real-v1-transaction.json', import.meta.url), 'utf8'));
+    delete capture.transaction.message.transactionConfig; // Synthetic corruption of the separate recorded fixture.
+    const receive = vi.fn(async () => undefined), h = health(), store = cursorStore(signature(1));
+    const rpc = rpcMock(async method => method === 'getSignaturesForAddress' ? [{ signature: capture.transaction.signatures[0], slot: capture.slot, err: null }, { signature: signature(1), slot: 1, err: null }] : capture);
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', store, h, receive, { attempts: 1, retryMs: 0 });
+    await stream.backfill();
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.cursors.get(PROGRAMS[0])).toBe(signature(1));
+    expect(h.backfillGaps).toBeGreaterThan(0);
+    await stream.stop();
+  });
   it('advances a cursor only after every transaction is durably received', async () => {
     const store = cursorStore(signature(1)), h = health();
     let release!: () => void;
@@ -285,6 +312,45 @@ describe('Yellowstone finalized contract, durable replay and reconnect', () => {
     expect(normalized.meta?.loadedAddresses?.readonly[0]).toBe(bs58.encode(new Uint8Array(32).fill(4)));
     expect(() => normalizeYellowstoneTransaction(yellowstone('9007199254740993'))).toThrow('INVALID_SLOT');
   });
+  it.each([true, false])('identifies v1 from protobuf config presence before versioned=%s and preserves total priority lamports', versioned => {
+    const value = yellowstone(), message = value.transaction!.transaction!.message!;
+    value.transaction!.meta!.loadedWritableAddresses = [];
+    value.transaction!.meta!.loadedReadonlyAddresses = [];
+    message.versioned = versioned;
+    message.config = { priorityFee: '18446744073709551615', computeUnitLimit: 196132, loadedAccountsDataSizeLimit: 67108864 };
+    const normalized = normalizeYellowstoneTransaction(value);
+    expect(normalized.version).toBe(1);
+    expect(normalized.transaction.message.header).toEqual(message.header);
+    expect(normalized.transaction.message.transactionConfig).toEqual({ priorityFee: '18446744073709551615', computeUnitLimit: 196132, loadedAccountsDataSizeLimit: 67108864, heapSize: null });
+    expect(normalized.transaction.message.addressTableLookups).toEqual([]);
+    expect(normalized.meta!.loadedAddresses).toEqual({ writable: [], readonly: [] });
+  });
+  it('retains v1 config through the installed Yellowstone9 protobuf encoder/decoder without a raw Solana SDK wire decoder', async () => {
+    // Import the pinned generated codec directly, avoiding this SDK's unsupported Windows native client.
+    const codec = await import(new URL('./grpc/geyser.js', import.meta.resolve('@triton-one/yellowstone-grpc')).href);
+    const value = yellowstone(), message = value.transaction!.transaction!.message!;
+    value.transaction!.meta!.loadedWritableAddresses = [];
+    value.transaction!.meta!.loadedReadonlyAddresses = [];
+    message.config = { priorityFee: '18446744073709551615', computeUnitLimit: 30000, loadedAccountsDataSizeLimit: 200000 };
+    const protobufBytes = codec.SubscribeUpdateTransaction.encode(value).finish();
+    const decoded = codec.SubscribeUpdateTransaction.decode(protobufBytes) as SubscribeUpdateTransaction;
+    expect(decoded.transaction!.transaction!.message!.config!.priorityFee).toBe('18446744073709551615');
+    expect(normalizeYellowstoneTransaction(decoded)).toMatchObject({ version: 1, transaction: { message: { transactionConfig: { priorityFee: '18446744073709551615', computeUnitLimit: 30000, loadedAccountsDataSizeLimit: 200000, heapSize: null } } } });
+  });
+  it.each(['future-config', 'unsafe-priority', 'null-config', 'missing-header', 'lookups', 'loaded-addresses', 'invalid-u32'] as const)('rejects synthetic protobuf v1 %s without a v0 downgrade', fault => {
+    const value = yellowstone(), message = value.transaction!.transaction!.message!;
+    value.transaction!.meta!.loadedWritableAddresses = [];
+    value.transaction!.meta!.loadedReadonlyAddresses = [];
+    message.config = { computeUnitLimit: 30000, loadedAccountsDataSizeLimit: 200000, priorityFee: '8180' };
+    if (fault === 'future-config') Object.assign(message.config, { futureBudgetField: 1 });
+    if (fault === 'unsafe-priority') (message.config as any).priorityFee = Number.MAX_SAFE_INTEGER + 1;
+    if (fault === 'null-config') (message as any).config = null;
+    if (fault === 'missing-header') message.header = undefined;
+    if (fault === 'lookups') message.addressTableLookups.push({ accountKey: new Uint8Array(32).fill(3), writableIndexes: new Uint8Array([0]), readonlyIndexes: new Uint8Array() });
+    if (fault === 'loaded-addresses') value.transaction!.meta!.loadedWritableAddresses.push(new Uint8Array(32).fill(3));
+    if (fault === 'invalid-u32') message.config!.computeUnitLimit = 2 ** 32;
+    expect(() => normalizeYellowstoneTransaction(value)).toThrow();
+  });
   it('requires durable checkpoint storage rather than claiming restart recovery without it', async () => {
     const h = health(); await expect(startYellowstone('synthetic', '', h, async () => undefined)).rejects.toThrow('DURABLE_CHECKPOINT'); expect(h.status).toBe('UNSUPPORTED');
   });
@@ -307,6 +373,19 @@ describe('Yellowstone finalized contract, durable replay and reconnect', () => {
     client.streams[0].emit('data', { transaction: yellowstone('110') }); await handle.idle();
     expect(store.save).not.toHaveBeenCalled(); expect(h.backfillGaps).toBe(1);
     await vi.waitFor(() => expect(client.requests).toHaveLength(2)); expect(client.requests[1].fromSlot).toBe('68'); await handle.stop();
+  });
+  it('retains the durable replay boundary after malformed v1 protobuf config without calling receive', async () => {
+    const client = yellowClient(), store = checkpointStore('100'), h = health(), receive = vi.fn(async () => undefined);
+    const handle = await startYellowstone('synthetic', '', h, receive, { store, clientFactory: () => client, reconnectMs: 10000 });
+    const value = yellowstone('110');
+    (value.transaction!.transaction!.message as any).config = { futureBudgetField: 1 };
+    client.streams[0].emit('data', { transaction: value });
+    await handle.idle();
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.state().slot).toBe('100');
+    expect(store.save).not.toHaveBeenCalled();
+    expect(h.backfillGaps).toBe(1);
+    await handle.stop();
   });
   it('marks unsupported when server cannot replay the required slot range', async () => {
     const client = yellowClient(), store = checkpointStore('100'), h = health();

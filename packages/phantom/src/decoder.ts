@@ -1,22 +1,250 @@
-import fs from 'node:fs';
-import { BorshInstructionCoder, BorshEventCoder, BorshCoder, type Idl } from '@coral-xyz/anchor';
-import bs58 from 'bs58';
-import { WSOL, type ChainEvent, type Protocol } from './types.ts';
+import fs from "node:fs";
+import { BorshInstructionCoder, BorshEventCoder, BorshCoder, type Idl } from "@coral-xyz/anchor";
+import bs58 from "bs58";
+import { WSOL, type ChainEvent, type Protocol } from "./types.ts";
 
-export type Instruction = { programIdIndex: number; accounts: number[]; data: string; stackHeight?: number | null };
-type TokenBalance = { accountIndex: number; mint: string; owner?: string; uiTokenAmount: { amount: string; decimals: number } };
-export type RpcTransaction = { slot: number; blockTime: number | null; version?: unknown; transaction: { signatures: string[]; message: { accountKeys: string[]; instructions: Instruction[] } }; meta: { err: unknown; loadedAddresses?: { writable: string[]; readonly: string[] }; innerInstructions?: { index: number; instructions: Instruction[] }[]; preTokenBalances?: TokenBalance[]; postTokenBalances?: TokenBalance[]; logMessages?: string[]; fee?: number } | null };
-type Adapter = { protocol: Protocol; address: string; idl: Idl; coder: BorshInstructionCoder; eventCoder: BorshEventCoder; typesCoder: BorshCoder['types']; schemaVersion: string };
-const load = (name: string, protocol: Protocol): Adapter => {
-  const idl = JSON.parse(fs.readFileSync(new URL(`../vendor/${name}.json`, import.meta.url), 'utf8')) as Idl;
-  return { protocol, address: idl.address, idl, coder: new BorshInstructionCoder(idl), eventCoder: new BorshEventCoder(idl), typesCoder: new BorshCoder(idl).types, schemaVersion: name };
+export type Instruction = {
+  programIdIndex: number;
+  accounts: number[];
+  data: string;
+  stackHeight?: number | null;
 };
-export const ADAPTERS = [load('pump', 'pump'), load('pump_amm', 'pumpswap'), load('raydium_cp_swap', 'raydium-cpmm')];
-export const VERSIONED_ADAPTERS = [load('pump-sdk-4.3.1', 'pump'), load('pump-amm-sdk-2.2.0', 'pumpswap'), ...ADAPTERS, load('pump-2026-09-12', 'pump'), load('pump_amm-2026-09-12', 'pumpswap')];
-export const PROGRAMS = ADAPTERS.map(a => a.address);
-const keyValid = (v: unknown): v is string => { try { return typeof v === 'string' && bs58.decode(v).length === 32; } catch { return false; } };
-const signatureValid = (v: unknown): v is string => { try { return typeof v === 'string' && bs58.decode(v).length === 64; } catch { return false; } };
-const indexValid = (v: unknown, length: number): v is number => Number.isInteger(v) && Number(v) >= 0 && Number(v) < length;
+export type TransactionConfig = {
+  computeUnitLimit: number | null;
+  loadedAccountsDataSizeLimit: number | null;
+  heapSize: number | null;
+  /** Total lamports, never micro-lamports per compute unit. */ priorityFee: number | string | null;
+};
+export type MessageHeader = {
+  numRequiredSignatures: number;
+  numReadonlySignedAccounts: number;
+  numReadonlyUnsignedAccounts: number;
+};
+type TokenBalance = {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: { amount: string; decimals: number };
+};
+export type RpcTransaction = {
+  slot: number;
+  blockTime: number | null;
+  version?: unknown;
+  transaction: {
+    signatures: string[];
+    message: {
+      accountKeys: string[];
+      instructions: Instruction[];
+      header?: MessageHeader;
+      recentBlockhash?: string;
+      transactionConfig?: TransactionConfig;
+      addressTableLookups?: unknown[];
+    };
+  };
+  meta: {
+    err: unknown;
+    loadedAddresses?: { writable: string[]; readonly: string[] };
+    innerInstructions?: { index: number; instructions: Instruction[] }[];
+    preTokenBalances?: TokenBalance[];
+    postTokenBalances?: TokenBalance[];
+    logMessages?: string[];
+    fee?: number;
+  } | null;
+};
+type Adapter = {
+  protocol: Protocol;
+  address: string;
+  idl: Idl;
+  coder: BorshInstructionCoder;
+  eventCoder: BorshEventCoder;
+  typesCoder: BorshCoder["types"];
+  schemaVersion: string;
+};
+const load = (name: string, protocol: Protocol): Adapter => {
+  const idl = JSON.parse(
+    fs.readFileSync(new URL(`../vendor/${name}.json`, import.meta.url), "utf8"),
+  ) as Idl;
+  return {
+    protocol,
+    address: idl.address,
+    idl,
+    coder: new BorshInstructionCoder(idl),
+    eventCoder: new BorshEventCoder(idl),
+    typesCoder: new BorshCoder(idl).types,
+    schemaVersion: name,
+  };
+};
+export const ADAPTERS = [
+  load("pump", "pump"),
+  load("pump_amm", "pumpswap"),
+  load("raydium_cp_swap", "raydium-cpmm"),
+];
+export const VERSIONED_ADAPTERS = [
+  load("pump-sdk-4.3.1", "pump"),
+  load("pump-amm-sdk-2.2.0", "pumpswap"),
+  ...ADAPTERS,
+  load("pump-2026-09-12", "pump"),
+  load("pump_amm-2026-09-12", "pumpswap"),
+];
+export const PROGRAMS = ADAPTERS.map((a) => a.address);
+const keyValid = (v: unknown): v is string => {
+  try {
+    return typeof v === "string" && bs58.decode(v).length === 32;
+  } catch {
+    return false;
+  }
+};
+const signatureValid = (v: unknown): v is string => {
+  try {
+    return typeof v === "string" && bs58.decode(v).length === 64;
+  } catch {
+    return false;
+  }
+};
+const indexValid = (v: unknown, length: number): v is number =>
+  Number.isInteger(v) && Number(v) >= 0 && Number(v) < length;
+type NormalizedTransactionConfig = Omit<TransactionConfig, "priorityFee"> & {
+  priorityFee: string | null;
+};
+/** RPC JSON/protobuf configuration validation only; this does not deserialize or certify raw v1 wire transactions.
+ * Fields and units: https://solana.com/upgrades/larger-transaction-sizes (SIMD-0385).
+ */
+export function validateTransactionConfig(value: unknown): NormalizedTransactionConfig {
+  const names = ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize", "priorityFee"];
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== names.length ||
+    !names.every((name) => Object.hasOwn(value, name))
+  )
+    throw Error("TRANSACTION_V1_CONFIG_INVALID_OR_UNSUPPORTED");
+  const config = value as TransactionConfig;
+  for (const field of ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize"] as const) {
+    const amount = config[field];
+    if (
+      amount !== null &&
+      (typeof amount !== "number" ||
+        !Number.isSafeInteger(amount) ||
+        amount < 0 ||
+        amount > 0xffffffff)
+    )
+      throw Error("TRANSACTION_V1_CONFIG_INVALID_OR_UNSUPPORTED");
+  }
+  if (
+    config.heapSize !== null &&
+    (config.heapSize < 32768 || config.heapSize > 262144 || config.heapSize % 1024 !== 0)
+  )
+    throw Error("TRANSACTION_V1_CONFIG_INVALID_OR_UNSUPPORTED");
+  let priorityFee: string | null = null;
+  if (config.priorityFee !== null) {
+    const fee = config.priorityFee;
+    if (
+      !(
+        (typeof fee === "number" && Number.isSafeInteger(fee) && fee >= 0) ||
+        (typeof fee === "string" && fee.length <= 20 && /^(0|[1-9]\d*)$/.test(fee))
+      ) ||
+      BigInt(fee) > 18_446_744_073_709_551_615n
+    )
+      throw Error("TRANSACTION_V1_CONFIG_INVALID_OR_UNSUPPORTED");
+    priorityFee = String(fee);
+  }
+  return {
+    computeUnitLimit: config.computeUnitLimit,
+    loadedAccountsDataSizeLimit: config.loadedAccountsDataSizeLimit,
+    heapSize: config.heapSize,
+    priorityFee,
+  };
+}
+/** Shared structural gate for protocol observations and committed top-level wallet funding evidence. */
+export function validateTransactionLayout(tx: RpcTransaction): {
+  version: "legacy" | 0 | 1;
+  keys: string[];
+  config: NormalizedTransactionConfig | null;
+} {
+  const version = tx?.version == null ? "legacy" : tx.version;
+  if (version !== "legacy" && version !== 0 && version !== 1)
+    throw Error("TRANSACTION_VERSION_UNSUPPORTED");
+  const message = tx?.transaction?.message;
+  if (!message || !Array.isArray(message.accountKeys) || !Array.isArray(message.instructions))
+    throw Error("TRANSACTION_MESSAGE_INVALID");
+  const loaded = tx.meta?.loadedAddresses;
+  if (loaded != null && (!Array.isArray(loaded.writable) || !Array.isArray(loaded.readonly)))
+    throw Error("TRANSACTION_MESSAGE_INVALID");
+  const keys = [...message.accountKeys, ...(loaded?.writable ?? []), ...(loaded?.readonly ?? [])];
+  if (!keys.every(keyValid)) throw Error("TRANSACTION_MESSAGE_INVALID");
+  const hasConfig = Object.hasOwn(message, "transactionConfig");
+  if (version !== 1) {
+    if (hasConfig) throw Error("TRANSACTION_VERSION_CONFIG_MISMATCH");
+    return { version, keys, config: null };
+  }
+  if (!hasConfig) throw Error("TRANSACTION_V1_CONFIG_REQUIRED");
+  const config = validateTransactionConfig(message.transactionConfig),
+    header = message.header;
+  if (
+    (message.addressTableLookups !== undefined &&
+      (!Array.isArray(message.addressTableLookups) || message.addressTableLookups.length !== 0)) ||
+    (loaded && (loaded.writable.length !== 0 || loaded.readonly.length !== 0))
+  )
+    throw Error("TRANSACTION_V1_ADDRESS_LOOKUPS_UNSUPPORTED");
+  if (
+    !header ||
+    ![
+      header.numRequiredSignatures,
+      header.numReadonlySignedAccounts,
+      header.numReadonlyUnsignedAccounts,
+    ].every((n) => Number.isInteger(n) && n >= 0 && n <= 255) ||
+    header.numRequiredSignatures < 1 ||
+    header.numReadonlySignedAccounts >= header.numRequiredSignatures ||
+    header.numRequiredSignatures + header.numReadonlyUnsignedAccounts > keys.length ||
+    !Array.isArray(tx.transaction.signatures) ||
+    tx.transaction.signatures.length !== header.numRequiredSignatures ||
+    !tx.transaction.signatures.every(signatureValid) ||
+    !keyValid(message.recentBlockhash) ||
+    keys.length > 255 ||
+    new Set(keys).size !== keys.length ||
+    message.instructions.length > 255
+  )
+    throw Error("TRANSACTION_V1_LAYOUT_INVALID");
+  let payloadBytes = 0;
+  for (const ix of message.instructions) {
+    if (
+      !ix ||
+      !indexValid(ix.programIdIndex, keys.length) ||
+      !Array.isArray(ix.accounts) ||
+      ix.accounts.length > 255 ||
+      !ix.accounts.every((i) => indexValid(i, keys.length)) ||
+      typeof ix.data !== "string" ||
+      ix.data.length > 6000
+    )
+      throw Error("TRANSACTION_V1_LAYOUT_INVALID");
+    let bytes: Uint8Array;
+    try {
+      bytes = bs58.decode(ix.data);
+    } catch {
+      throw Error("TRANSACTION_V1_LAYOUT_INVALID");
+    }
+    payloadBytes += ix.accounts.length + bytes.length;
+  }
+  const configBytes =
+    (config.priorityFee !== null ? 8 : 0) +
+    [config.computeUnitLimit, config.loadedAccountsDataSizeLimit, config.heapSize].filter(
+      (n) => n !== null,
+    ).length *
+      4;
+  // Known v1 field lengths also bound malformed JSON payloads, without SDK wire decoding.
+  if (
+    42 +
+      keys.length * 32 +
+      configBytes +
+      message.instructions.length * 4 +
+      payloadBytes +
+      tx.transaction.signatures.length * 64 >
+    4096
+  )
+    throw Error("TRANSACTION_V1_LAYOUT_INVALID");
+  return { version, keys, config };
+}
 function serialize(v: unknown): unknown {
   if (v == null) return v;
   if (typeof v === 'object' && 'toBase58' in v) return (v as { toBase58(): string }).toBase58();
@@ -150,10 +378,10 @@ export function decodeTransaction(tx: RpcTransaction, receivedAt: number, commit
 }
 function decodeChecked(tx: RpcTransaction, receivedAt: number, commitment: 'confirmed' | 'finalized', now: number): ChainEvent[] {
   if (!tx || !tx.meta || tx.meta.err != null || !Number.isSafeInteger(tx.slot) || tx.slot < 0 || !signatureValid(tx.transaction?.signatures?.[0]) || !Number.isFinite(receivedAt) || !Number.isFinite(now)) return [];
-  if (tx.version != null && tx.version !== 'legacy' && tx.version !== 0) return [];
+  const transactionLayout = validateTransactionLayout(tx);
   const message = tx.transaction.message;
   if (!Array.isArray(message?.accountKeys) || !Array.isArray(message.instructions)) return [];
-  const keys = [...message.accountKeys, ...(tx.meta.loadedAddresses?.writable ?? []), ...(tx.meta.loadedAddresses?.readonly ?? [])];
+  const keys = transactionLayout.keys;
   if (!keys.every(keyValid)) return [];
   const instructions: { ix: Instruction; index: string }[] = [];
   const innerGroups = Array.isArray(tx.meta.innerInstructions) ? tx.meta.innerInstructions : [];
@@ -193,7 +421,7 @@ function decodeChecked(tx: RpcTransaction, receivedAt: number, commitment: 'conf
       else if (quoteMint === WSOL) finalKind = 'sell';
     } else if (adapter.protocol === 'raydium-cpmm' && mint === WSOL) [mint, quoteMint] = [quoteMint, mint];
     if (!actor || !mint || !quoteMint || mint === quoteMint) continue;
-    result.push({ id: `${tx.transaction.signatures[0]}:${index}`, protocol: adapter.protocol, kind: finalKind, signature: tx.transaction.signatures[0], slot: tx.slot, mint, quoteMint, actor, creator: kind === 'launch' ? String(args.creator ?? actor) : undefined, pool: accounts.bonding_curve ?? accounts.pool ?? accounts.pool_state ?? '', instruction: decoded.name, instructionIndex: index, receivedAt, processedAt: now, blockTime: Number.isFinite(tx.blockTime) ? tx.blockTime : null, commitment, amountRaw: null, quoteAmountRaw: null, quantityEvidence: 'unavailable', details: { args, accounts, instructionSchema: adapter.schemaVersion, quantityReason: 'NO_UNAMBIGUOUS_PROGRAM_EVENT', transactionFeeLamports: Number.isSafeInteger(tx.meta.fee) ? tx.meta.fee : null } });
+    result.push({ id: `${tx.transaction.signatures[0]}:${index}`, protocol: adapter.protocol, kind: finalKind, signature: tx.transaction.signatures[0], slot: tx.slot, mint, quoteMint, actor, creator: kind === 'launch' ? String(args.creator ?? actor) : undefined, pool: accounts.bonding_curve ?? accounts.pool ?? accounts.pool_state ?? '', instruction: decoded.name, instructionIndex: index, receivedAt, processedAt: now, blockTime: Number.isFinite(tx.blockTime) ? tx.blockTime : null, commitment, amountRaw: null, quoteAmountRaw: null, quantityEvidence: 'unavailable', details: { args, accounts, instructionSchema: adapter.schemaVersion, quantityReason: 'NO_UNAMBIGUOUS_PROGRAM_EVENT', transactionFeeLamports: Number.isSafeInteger(tx.meta.fee) ? tx.meta.fee : null, ...(transactionLayout.version === 1 ? { transactionVersion: 1, transactionConfig: transactionLayout.config, priorityFeeLamports: transactionLayout.config!.priorityFee ?? '0', priorityFeeUnit: 'LAMPORTS_TOTAL', executionSupported: false, executionUnsupportedReason: 'TRANSACTION_V1_READ_ONLY_EXECUTION_UNCERTIFIED' } : {}) } });
   }
   const emitted = typedEvents(tx.meta.logMessages);
   for (const event of result) {

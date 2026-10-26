@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { BN, type Idl } from '@coral-xyz/anchor';
 import { PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { ADAPTERS, VERSIONED_ADAPTERS, decodeTransaction, decodeLogNotification, type RpcTransaction } from '../src/decoder.ts';
+import { ADAPTERS, VERSIONED_ADAPTERS, decodeTransaction, decodeLogNotification, validateTransactionConfig, validateTransactionLayout, type RpcTransaction } from '../src/decoder.ts';
 import { WSOL } from '../src/types.ts';
 
 // Generated cases are SYNTHETIC. The separately attributed real-pump-buy fixture is mainnet capture.
@@ -49,6 +49,19 @@ function eventLog(schema: typeof ADAPTERS[number], name: string, overrides: Reco
 }
 function addTradeEvent(tx: RpcTransaction, schema: typeof ADAPTERS[number], instruction = 'buy_v3'): void {
   tx.meta!.logMessages = [`Program ${schema.address} invoke [1]`, eventLog(schema, 'TradeEvent', { user: actor, mint, quote_mint: new PublicKey(WSOL), is_buy: true, ix_name: instruction, token_amount: new BN(123456), quote_amount: new BN(9999) }), `Program ${schema.address} success`];
+}
+function syntheticV1(tx: RpcTransaction): RpcTransaction {
+  const copy = structuredClone(tx), message = copy.transaction.message, oldKeys = message.accountKeys;
+  const keys = [...new Set([actor.toBase58(), ...oldKeys])];
+  const remap = (ix: typeof message.instructions[number]) => ({ ...ix, programIdIndex: keys.indexOf(oldKeys[ix.programIdIndex]), accounts: ix.accounts.map(i => keys.indexOf(oldKeys[i])) });
+  message.instructions = message.instructions.map(remap);
+  if (copy.meta?.innerInstructions) copy.meta.innerInstructions = copy.meta.innerInstructions.map(group => ({ ...group, instructions: group.instructions.map(remap) }));
+  message.accountKeys = keys;
+  message.header = { numRequiredSignatures: 1, numReadonlySignedAccounts: 0, numReadonlyUnsignedAccounts: 1 };
+  message.recentBlockhash = key(90).toBase58();
+  message.transactionConfig = { priorityFee: 8180, computeUnitLimit: 196132, loadedAccountsDataSizeLimit: 67108864, heapSize: null };
+  copy.version = 1;
+  return copy;
 }
 
 describe('verified protocol instruction decoding', () => {
@@ -102,6 +115,63 @@ describe('verified protocol instruction decoding', () => {
     expect(events[0].details.eventSchema).toBe('pump-sdk-4.3.1');
     expect(events[0].details).not.toHaveProperty('unsupportedTrailingBytes');
     expect(events[0].details).toMatchObject({ eventInstructionLabelMismatch: true, executionSupported: false });
+  });
+});
+
+describe('read-only Solana v1 JSON transactions', () => {
+  it('decodes the attributed finalized mainnet v1 fixture with actual event amounts and total-lamport config', () => {
+    const tx: RpcTransaction = JSON.parse(fs.readFileSync(new URL('./fixtures/real-v1-transaction.json', import.meta.url), 'utf8'));
+    const source = JSON.parse(fs.readFileSync(new URL('./fixtures/real-v1-transaction.source.json', import.meta.url), 'utf8'));
+    expect(source).toMatchObject({ synthetic: false, version: 1, signature: tx.transaction.signatures[0], slot: tx.slot });
+    expect(tx.slot).toBe(461797644);
+    const decoded = decodeTransaction(tx, 1000);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0]).toMatchObject({ kind: 'sell', instruction: 'sell_v3', instructionIndex: '1.0', amountRaw: '1312376936857', quoteAmountRaw: '748764363', quantityEvidence: 'program-event' });
+    expect(decoded[0].details).toMatchObject({ transactionVersion: 1, executionSupported: false, executionUnsupportedReason: 'TRANSACTION_V1_READ_ONLY_EXECUTION_UNCERTIFIED', transactionConfig: { computeUnitLimit: 196132, loadedAccountsDataSizeLimit: 67108864, heapSize: null, priorityFee: '8180' }, priorityFeeLamports: '8180', priorityFeeUnit: 'LAMPORTS_TOTAL' });
+  });
+  it('preserves exact u64 total priority fees without converting them to prices per compute unit', () => {
+    const tx = syntheticV1(fixture(ADAPTERS[0], 'buy_v3'));
+    tx.transaction.message.transactionConfig!.priorityFee = '18446744073709551615';
+    expect(validateTransactionLayout(tx).config!.priorityFee).toBe('18446744073709551615');
+    expect(decodeTransaction(tx, 1000)[0].details.priorityFeeLamports).toBe('18446744073709551615');
+    expect(validateTransactionConfig({ computeUnitLimit: null, loadedAccountsDataSizeLimit: null, heapSize: null, priorityFee: null }).priorityFee).toBeNull();
+  });
+  it.each([
+    { priorityFee: Number.MAX_SAFE_INTEGER + 1 }, { priorityFee: '18446744073709551616' },
+    { priorityFee: -1 }, { priorityFee: '1.5' }, { priorityFee: '01' }, { priorityFee: undefined },
+    { computeUnitLimit: -1 }, { computeUnitLimit: 1.5 }, { computeUnitLimit: 4294967296 },
+    { loadedAccountsDataSizeLimit: '123' }, { heapSize: 32000 }, { heapSize: 32769 },
+    { futureBudgetRequest: 1 },
+  ])('rejects malformed or unsupported synthetic v1 config %#', override => {
+    const tx = syntheticV1(fixture(ADAPTERS[0], 'buy_v3'));
+    Object.assign(tx.transaction.message.transactionConfig!, override);
+    expect(() => validateTransactionLayout(tx)).toThrow('TRANSACTION_V1_CONFIG_INVALID_OR_UNSUPPORTED');
+    expect(decodeTransaction(tx, 1000)).toEqual([]);
+  });
+  it.each(['missing-config', 'v0-config', 'legacy-config', 'future-version', 'lookups', 'loaded-addresses', 'duplicate-keys', 'readonly-payer', 'signature-count', 'missing-blockhash', 'invalid-index'] as const)('fails closed for incoherent synthetic %s layout', fault => {
+    const tx = syntheticV1(fixture(ADAPTERS[0], 'buy_v3')), message = tx.transaction.message;
+    if (fault === 'missing-config') delete message.transactionConfig;
+    if (fault === 'v0-config') tx.version = 0;
+    if (fault === 'legacy-config') tx.version = 'legacy';
+    if (fault === 'future-version') tx.version = 2;
+    if (fault === 'lookups') message.addressTableLookups = [{}];
+    if (fault === 'loaded-addresses') tx.meta!.loadedAddresses = { writable: [key(110).toBase58()], readonly: [] };
+    if (fault === 'duplicate-keys') message.accountKeys.push(message.accountKeys[0]);
+    if (fault === 'readonly-payer') message.header!.numReadonlySignedAccounts = 1;
+    if (fault === 'signature-count') message.header!.numRequiredSignatures = 2;
+    if (fault === 'missing-blockhash') delete message.recentBlockhash;
+    if (fault === 'invalid-index') message.instructions[0].accounts[0] = 255;
+    expect(() => validateTransactionLayout(tx)).toThrow();
+    expect(decodeTransaction(tx, 1000)).toEqual([]);
+  });
+  it('preserves unknown event fields and instruction-label vetoes alongside the unconditional v1 execution veto', () => {
+    const sdk = VERSIONED_ADAPTERS.find(a => a.schemaVersion === 'pump-sdk-4.3.1')!;
+    const tx = syntheticV1(fixture(sdk, 'buy_v3')); addTradeEvent(tx, sdk, 'SYNTHETIC_UNRECOGNIZED_LABEL');
+    const encoded = tx.meta!.logMessages![1].slice(14);
+    tx.meta!.logMessages![1] = `Program data: ${Buffer.concat([Buffer.from(encoded, 'base64'), Buffer.from([1, 2])]).toString('base64')}`;
+    const decoded = decodeTransaction(tx, 1000)[0];
+    expect(decoded.amountRaw).toBe('123456');
+    expect(decoded.details).toMatchObject({ transactionVersion: 1, eventSchema: 'KNOWN_PREFIX_UNKNOWN_TRAILING_BYTES', eventInstructionLabelMismatch: true, executionSupported: false, executionUnsupportedReason: 'TRANSACTION_V1_READ_ONLY_EXECUTION_UNCERTIFIED' });
   });
 });
 

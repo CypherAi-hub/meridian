@@ -1,6 +1,6 @@
 import bs58 from 'bs58';
 import type { SubscribeRequest, SubscribeUpdate, SubscribeUpdateTransaction } from '@triton-one/yellowstone-grpc';
-import { PROGRAMS, type RpcTransaction } from './decoder.ts';
+import { PROGRAMS, validateTransactionConfig, validateTransactionLayout, type RpcTransaction } from './decoder.ts';
 import { WSOL, type Health, type ChainEvent } from './types.ts';
 import type { Store } from './store.ts';
 
@@ -135,9 +135,10 @@ export class SolanaStream {
         let ok = false;
         for (let attempt = 0; attempt < (this.options.attempts ?? 4) && !this.stopped; attempt++) {
           try {
-            const tx = await this.rpc.call<RpcTransaction | null>('getTransaction', [item.signature, { encoding: 'json', commitment: 'finalized', maxSupportedTransactionVersion: 0 }]);
+            const tx = await this.rpc.call<RpcTransaction | null>('getTransaction', [item.signature, { encoding: 'json', commitment: 'finalized', maxSupportedTransactionVersion: 1 }]);
             if (!tx) throw Error('FINALIZED_TRANSACTION_NOT_AVAILABLE');
             if (tx.transaction?.signatures?.[0] !== item.signature || !Number.isSafeInteger(tx.slot)) throw Error('RPC_TRANSACTION_ID_MISMATCH');
+            validateTransactionLayout(tx);
             await this.receive(tx, item.receivedAt, 'finalized'); ok = true; break;
           } catch (e) { this.error(e); if (attempt + 1 < (this.options.attempts ?? 4)) await sleep((this.options.retryMs ?? 500) * 2 ** attempt); }
         }
@@ -229,16 +230,107 @@ function subscription(fromSlot?: string): SubscribeRequest { return { accounts: 
 const asSafeSlot = (value: unknown): number => { if (typeof value !== 'string' || !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw Error('YELLOWSTONE_INVALID_SLOT'); return Number(value); };
 /** Normalization is exported for contract tests against installed Yellowstone protobuf types. */
 export function normalizeYellowstoneTransaction(tx: SubscribeUpdateTransaction): RpcTransaction {
-  const slot = asSafeSlot(tx.slot), info = tx.transaction;
-  if (!info?.transaction?.message || !info.meta) throw Error('YELLOWSTONE_INCOMPLETE_TRANSACTION');
-  const message = info.transaction.message, meta = info.meta;
-  const key = (x: Uint8Array) => { if (!(x instanceof Uint8Array) || x.length !== 32) throw Error('YELLOWSTONE_INVALID_ACCOUNT_KEY'); return bs58.encode(x); };
-  const sig = (x: Uint8Array) => { if (!(x instanceof Uint8Array) || x.length !== 64) throw Error('YELLOWSTONE_INVALID_SIGNATURE'); return bs58.encode(x); };
-  const convert = (ix: { programIdIndex: number; accounts: Uint8Array; data: Uint8Array; stackHeight?: number | null }) => ({ programIdIndex: ix.programIdIndex, accounts: Array.from(ix.accounts), data: bs58.encode(ix.data), ...(ix.stackHeight == null ? {} : { stackHeight: ix.stackHeight }) });
-  const balance = (x: typeof meta.preTokenBalances[number]) => { if (!x.uiTokenAmount || !/^\d+$/.test(x.uiTokenAmount.amount)) throw Error('YELLOWSTONE_INVALID_TOKEN_BALANCE'); return { accountIndex: x.accountIndex, mint: x.mint, owner: x.owner, uiTokenAmount: x.uiTokenAmount }; };
-  const signatures = info.transaction.signatures.length ? info.transaction.signatures.map(sig) : [sig(info.signature)];
+  const slot = asSafeSlot(tx.slot),
+    info = tx.transaction;
+  if (!info?.transaction?.message || !info.meta) throw Error("YELLOWSTONE_INCOMPLETE_TRANSACTION");
+  const message = info.transaction.message,
+    meta = info.meta;
+  // SIMD-0385 config presence identifies v1 BEFORE the legacy/v0 versioned flag.
+  const v1 = message.config !== undefined;
+  let transactionConfig: ReturnType<typeof validateTransactionConfig> | undefined;
+  if (v1) {
+    const config = message.config;
+    const names = ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize", "priorityFee"];
+    if (
+      !config ||
+      typeof config !== "object" ||
+      Array.isArray(config) ||
+      Object.keys(config).some((name) => !names.includes(name)) ||
+      (config.priorityFee !== undefined && typeof config.priorityFee !== "string") ||
+      [config.computeUnitLimit, config.loadedAccountsDataSizeLimit, config.heapSize].some(
+        (value) => value !== undefined && typeof value !== "number",
+      )
+    )
+      throw Error("YELLOWSTONE_V1_CONFIG_INVALID_OR_UNSUPPORTED");
+    transactionConfig = validateTransactionConfig({
+      computeUnitLimit: config.computeUnitLimit ?? null,
+      loadedAccountsDataSizeLimit: config.loadedAccountsDataSizeLimit ?? null,
+      heapSize: config.heapSize ?? null,
+      priorityFee: config.priorityFee ?? null,
+    });
+  }
+  if (typeof message.versioned !== "boolean") throw Error("YELLOWSTONE_INVALID_VERSION_FLAG");
+  const key = (x: Uint8Array) => {
+    if (!(x instanceof Uint8Array) || x.length !== 32)
+      throw Error("YELLOWSTONE_INVALID_ACCOUNT_KEY");
+    return bs58.encode(x);
+  };
+  const sig = (x: Uint8Array) => {
+    if (!(x instanceof Uint8Array) || x.length !== 64) throw Error("YELLOWSTONE_INVALID_SIGNATURE");
+    return bs58.encode(x);
+  };
+  const convert = (ix: {
+    programIdIndex: number;
+    accounts: Uint8Array;
+    data: Uint8Array;
+    stackHeight?: number | null;
+  }) => ({
+    programIdIndex: ix.programIdIndex,
+    accounts: Array.from(ix.accounts),
+    data: bs58.encode(ix.data),
+    ...(ix.stackHeight == null ? {} : { stackHeight: ix.stackHeight }),
+  });
+  const balance = (x: (typeof meta.preTokenBalances)[number]) => {
+    if (!x.uiTokenAmount || !/^\d+$/.test(x.uiTokenAmount.amount))
+      throw Error("YELLOWSTONE_INVALID_TOKEN_BALANCE");
+    return {
+      accountIndex: x.accountIndex,
+      mint: x.mint,
+      owner: x.owner,
+      uiTokenAmount: x.uiTokenAmount,
+    };
+  };
+  const signatures = info.transaction.signatures.length
+    ? info.transaction.signatures.map(sig)
+    : [sig(info.signature)];
   const fee = Number(meta.fee);
-  return { slot, blockTime: null, version: message.versioned ? 0 : 'legacy', transaction: { signatures, message: { accountKeys: message.accountKeys.map(key), instructions: message.instructions.map(convert) } }, meta: { err: meta.err ?? null, ...(Number.isSafeInteger(fee) ? { fee } : {}), loadedAddresses: { writable: meta.loadedWritableAddresses.map(key), readonly: meta.loadedReadonlyAddresses.map(key) }, innerInstructions: meta.innerInstructions.map(g => ({ index: g.index, instructions: g.instructions.map(convert) })), preTokenBalances: meta.preTokenBalances.map(balance), postTokenBalances: meta.postTokenBalances.map(balance), logMessages: meta.logMessages } };
+  const normalized: RpcTransaction = {
+    slot,
+    blockTime: null,
+    version: v1 ? 1 : message.versioned ? 0 : "legacy",
+    transaction: {
+      signatures,
+      message: {
+        accountKeys: message.accountKeys.map(key),
+        instructions: message.instructions.map(convert),
+        ...(message.header ? { header: { ...message.header } } : {}),
+        recentBlockhash: key(message.recentBlockhash),
+        ...(transactionConfig ? { transactionConfig } : {}),
+        addressTableLookups: message.addressTableLookups.map((lookup) => ({
+          accountKey: key(lookup.accountKey),
+          writableIndexes: Array.from(lookup.writableIndexes),
+          readonlyIndexes: Array.from(lookup.readonlyIndexes),
+        })),
+      },
+    },
+    meta: {
+      err: meta.err ?? null,
+      ...(Number.isSafeInteger(fee) ? { fee } : {}),
+      loadedAddresses: {
+        writable: meta.loadedWritableAddresses.map(key),
+        readonly: meta.loadedReadonlyAddresses.map(key),
+      },
+      innerInstructions: meta.innerInstructions.map((g) => ({
+        index: g.index,
+        instructions: g.instructions.map(convert),
+      })),
+      preTokenBalances: meta.preTokenBalances.map(balance),
+      postTokenBalances: meta.postTokenBalances.map(balance),
+      logMessages: meta.logMessages,
+    },
+  };
+  validateTransactionLayout(normalized);
+  return normalized;
 }
 
 /** Finalized-only Yellowstone stream. Inclusive durable-slot replay and store dedup protect

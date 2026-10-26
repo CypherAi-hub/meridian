@@ -39,6 +39,8 @@ Unit/integration tests use observable state or explicitly synthetic fixtures. Ma
 5. The pinned official SDK dependency graph retains the unpatched `bigint-buffer` native-extension advisory GHSA-3gc7-fjrx-p6mg. Compatible dependency overrides removed unrelated advisories; no breaking SDK downgrade was applied. Install with `--ignore-scripts` so the affected optional native extension is not built; the research runtime uses its JavaScript fallback. This remains a production review item, not a claim of a clean vulnerability audit.
 6. No automated capital transfer, payout, wallet creation, funded trade, signing, or real swap was performed. Live enablement is outside the current paper CLI and requires a separate explicit user decision and security review.
 
+Raw JSON RPC and Yellowstone observations now recognize validated v1 configuration without confusing its total priority fee with a per-compute-unit price. The real finalized v1 fixture and installed protobuf codec are covered by tests. This is read-only support; v1 observations cannot authorize execution, and the pinned SDK is not claimed to decode or sign raw v1 transactions. The existing Helius free plan explicitly rejected `transactionSubscribe` in a bounded capability probe; no paid upgrade occurred. See `DATA-SOURCE-RESEARCH.md` for primary documentation and the remaining provider gates.
+
 ## Verified source references
 
 - Solana JSON-RPC `logsSubscribe`: https://solana.com/docs/rpc/websocket/logssubscribe

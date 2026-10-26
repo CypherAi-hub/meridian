@@ -1,6 +1,6 @@
 import bs58 from "bs58";
 import { Rpc } from "./stream.ts";
-import { decodeTransaction, type RpcTransaction } from "./decoder.ts";
+import { decodeTransaction, validateTransactionLayout, type RpcTransaction } from "./decoder.ts";
 import { WalletIntelligence, type FundingEdge, type CreatorOutcome } from "./intelligence.ts";
 import type { Store } from "./store.ts";
 
@@ -184,14 +184,13 @@ export class WalletHistoryReader {
       seenSignatures.add(item.signature);
       const tx = await this.rpc.call<RpcTransaction | null>("getTransaction", [
         item.signature,
-        { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 0 },
+        { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 1 },
       ]);
       if (
         !tx?.meta ||
         tx.meta.err !== null ||
         tx.transaction?.signatures?.[0] !== item.signature ||
-        !timestamp(tx.slot) ||
-        (tx.version != null && tx.version !== 0 && tx.version !== "legacy")
+        !timestamp(tx.slot)
       )
         continue;
       const message = tx.transaction.message;
@@ -201,11 +200,12 @@ export class WalletHistoryReader {
         message.instructions.length > 1024
       )
         continue;
-      const keys = [
-        ...message.accountKeys,
-        ...(tx.meta.loadedAddresses?.writable ?? []),
-        ...(tx.meta.loadedAddresses?.readonly ?? []),
-      ];
+      let keys: string[];
+      try {
+        keys = validateTransactionLayout(tx).keys;
+      } catch {
+        continue;
+      }
       if (!keys.every(publicKey) || !keys.includes(wallet)) continue;
       const at = this.clock(),
         eventAt = tx.blockTime == null ? at : tx.blockTime * 1000;

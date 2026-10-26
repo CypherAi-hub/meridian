@@ -466,7 +466,11 @@ export class Engine {
     }
     const executionReasons =
       event.details.executionSupported === false
-        ? ["EVENT_SCHEMA_PARTIALLY_VERIFIED_EXECUTION_UNSUPPORTED"]
+        ? [
+            event.details.transactionVersion === 1
+              ? "TRANSACTION_V1_READ_ONLY_EXECUTION_UNCERTIFIED"
+              : "EVENT_SCHEMA_PARTIALLY_VERIFIED_EXECUTION_UNSUPPORTED",
+          ]
         : [];
     if (executionReasons.length)
       await this.decision({

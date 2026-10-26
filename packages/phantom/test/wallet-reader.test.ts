@@ -45,7 +45,7 @@ function fixture() {
     }),
   };
   const rpc = {
-    call: vi.fn(async (method: string) => {
+    call: vi.fn(async (method: string, _params?: unknown[]) => {
       if (method === "getSignaturesForAddress") return [{ signature, err: null }];
       if (method === "getTransaction") return tx;
       throw Error("UNEXPECTED_SYNTHETIC_RPC");
@@ -78,6 +78,70 @@ function fixture() {
   };
 }
 describe("bounded wallet history with committed top-level transfer evidence", () => {
+  it("reads a structurally validated synthetic v1 committed top-level transfer with numeric RPC version opt-in", async () => {
+    const f = fixture();
+    f.tx.version = 1;
+    Object.assign(f.tx.transaction.message, {
+      header: {
+        numRequiredSignatures: 1,
+        numReadonlySignedAccounts: 0,
+        numReadonlyUnsignedAccounts: 2,
+      },
+      recentBlockhash: key(),
+      transactionConfig: {
+        priorityFee: 8180,
+        computeUnitLimit: 30000,
+        loadedAccountsDataSizeLimit: 200000,
+        heapSize: null,
+      },
+    });
+    const result = await f.reader().inspect(f.a, new Set([f.a, f.b]));
+    expect(result.funding).toHaveLength(1);
+    expect(result.funding[0].amountLamports).toBe(1000n);
+    expect(f.rpc.call.mock.calls.find(([method]) => method === "getTransaction")![1]).toEqual([
+      signature,
+      { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 1 },
+    ]);
+  });
+  it.each([
+    "missing-config",
+    "incoherent-v0",
+    "future-config",
+    "lookup-addresses",
+    "missing-header",
+    "unsafe-priority",
+  ] as const)("does not infer v1 wallet funding from synthetic %s responses", async (fault) => {
+    const f = fixture();
+    f.tx.version = 1;
+    Object.assign(f.tx.transaction.message, {
+      header: {
+        numRequiredSignatures: 1,
+        numReadonlySignedAccounts: 0,
+        numReadonlyUnsignedAccounts: 2,
+      },
+      recentBlockhash: key(),
+      transactionConfig: {
+        priorityFee: 8180,
+        computeUnitLimit: 30000,
+        loadedAccountsDataSizeLimit: 200000,
+        heapSize: null,
+      },
+    });
+    const message = f.tx.transaction.message;
+    if (fault === "missing-config") delete message.transactionConfig;
+    if (fault === "incoherent-v0") f.tx.version = 0;
+    if (fault === "future-config")
+      Object.assign(message.transactionConfig!, { futureBudgetField: 10 });
+    if (fault === "lookup-addresses")
+      f.tx.meta!.loadedAddresses = { writable: [key()], readonly: [] };
+    if (fault === "missing-header") delete message.header;
+    if (fault === "unsafe-priority")
+      message.transactionConfig!.priorityFee = Number.MAX_SAFE_INTEGER + 1;
+    const result = await f.reader().inspect(f.a, new Set([f.a, f.b]));
+    expect(result.funding).toEqual([]);
+    expect(result.signaturesReviewed).toBe(0);
+    expect(result.historyComplete).toBe(false);
+  });
   it("does not turn a caught failed System CPI into a funding relationship", async () => {
     const f = fixture();
     f.tx.transaction.message.instructions = [
@@ -95,6 +159,38 @@ describe("bounded wallet history with committed top-level transfer evidence", ()
     expect(f.rows.get(`wallet:${f.a}`).fundingCandidates).toEqual([]);
     expect(result.historyComplete).toBe(false);
     expect(result.signaturesReviewed).toBe(1);
+  });
+  it("keeps the caught-inner-CPI funding veto for structurally valid synthetic v1 transactions", async () => {
+    const f = fixture();
+    f.tx.version = 1;
+    Object.assign(f.tx.transaction.message, {
+      header: {
+        numRequiredSignatures: 1,
+        numReadonlySignedAccounts: 0,
+        numReadonlyUnsignedAccounts: 2,
+      },
+      recentBlockhash: key(),
+      transactionConfig: {
+        priorityFee: "8180",
+        computeUnitLimit: 30000,
+        loadedAccountsDataSizeLimit: 200000,
+        heapSize: null,
+      },
+    });
+    f.tx.transaction.message.instructions = [
+      { programIdIndex: 3, accounts: [], data: bs58.encode(Buffer.from([1])) },
+    ];
+    f.tx.meta!.innerInstructions = [{ index: 0, instructions: [transfer()] }];
+    f.tx.meta!.logMessages = [
+      `Program ${f.outer} invoke [1]`,
+      `Program ${SystemProgram.programId} invoke [2]`,
+      `Program ${SystemProgram.programId} failed: insufficient lamports`,
+      `Program ${f.outer} success`,
+    ];
+    const result = await f.reader().inspect(f.a, new Set([f.a, f.b]));
+    expect(result.signaturesReviewed).toBe(1);
+    expect(result.funding).toEqual([]);
+    expect(f.rows.get(`wallet:${f.a}`).fundingCandidates).toEqual([]);
   });
   it("does not claim successful inner instructions are verified funding without a frame-aware decoder", async () => {
     const f = fixture();
