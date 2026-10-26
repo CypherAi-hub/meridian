@@ -241,6 +241,54 @@ describe("bounded quote-only research and horizon observations", () => {
     await collector.sample({ ...event(), mint: "SYNTHETIC_NEW_MINT" }, p);
     expect(p.quote).toHaveBeenCalledTimes(3);
   });
+  it("reserves future horizon capacity under sustained baseline pressure", async () => {
+    const store = memoryStore(),
+      p = provider(),
+      collector = new QuoteResearchCollector(store as any);
+    for (let offset = 0; offset <= 720_000; offset += 3000) {
+      vi.setSystemTime(1_000_000 + offset);
+      await collector.sample({ ...event(), mint: `SYNTHETIC_TIMING_${offset}` }, p);
+      await collector.tick(p);
+    }
+    const rows = [...store.rows.values()],
+      baselines = rows.filter((r) => r.phase === "BASELINE"),
+      horizons = rows.filter((r) => r.phase === "HORIZON");
+    expect(baselines.length).toBeGreaterThanOrEqual(4);
+    expect(horizons.length).toBeGreaterThanOrEqual(12);
+    expect(Math.max(...horizons.map((r) => r.delayPastTargetMs))).toBeLessThanOrEqual(5000);
+    for (let i = 1; i < baselines.length; i++)
+      expect(baselines[i].startedAt - baselines[i - 1].startedAt).toBeGreaterThanOrEqual(90_000);
+  });
+  it("keeps an upcoming reservation across restart before any horizon is due", async () => {
+    const store = memoryStore(), p = provider(), collector = new QuoteResearchCollector(store as any);
+    await collector.sample(event(), p);
+    for (const offset of [30_000, 60_000]) {
+      vi.setSystemTime(1_000_000 + offset);
+      await collector.tick(p);
+    }
+    vi.setSystemTime(1_150_000);
+    const restarted = new QuoteResearchCollector(store as any);
+    await restarted.sample({ ...event(), mint: "SYNTHETIC_COLLIDING_MINT" }, p);
+    expect(p.quote).toHaveBeenCalledTimes(4);
+    vi.setSystemTime(1_180_000);
+    await restarted.tick(p);
+    vi.setSystemTime(1_210_000);
+    await restarted.sample({ ...event(), mint: "SYNTHETIC_FREE_CAPACITY_MINT" }, p);
+    expect(p.quote).toHaveBeenCalledTimes(7);
+    expect([...store.rows.values()].every((r) => r.schedulingPolicy === "HORIZON_CAPACITY_RESERVED_V2")).toBe(true);
+  });
+  it("retains legacy episode provenance and permits a slower configured quote budget", async () => {
+    const store = memoryStore(), p = provider();
+    await new QuoteResearchCollector(store as any, 60_000).sample(event(), p);
+    const saved = store.state.get(RESEARCH_WATCH_STATE_KEY);
+    delete saved.episodes[0].schedulingPolicy;
+    store.state.set(RESEARCH_WATCH_STATE_KEY, saved);
+    vi.setSystemTime(1_060_000);
+    await new QuoteResearchCollector(store as any, 60_000).tick(p);
+    const row = [...store.rows.values()].find((r) => r.phase === "HORIZON");
+    expect(row).toMatchObject({schedulingPolicy: "LEGACY_DUE_ONLY_V1", delayPastTargetMs: 30_000});
+    expect(p.quote).toHaveBeenCalledTimes(3);
+  });
   it("caps persisted watches and refuses over-budget configuration", async () => {
     const store = memoryStore(),
       p = provider(),

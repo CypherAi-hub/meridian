@@ -9,7 +9,9 @@ export const RESEARCH_WATCH_STATE_KEY = "quote-research-horizons-v1";
 const MAX_WATCHES = 10,
   MAX_EPISODE_AGE_MS = 600_000,
   MAX_QUOTE_AGE_MS = 5_000,
-  BASELINE_INTERVAL_MS = 90_000;
+  BASELINE_INTERVAL_MS = 90_000,
+  MAX_ADMISSION_LATENESS_MS = 5_000;
+const SCHEDULING_POLICY = "HORIZON_CAPACITY_RESERVED_V2";
 type Horizon = { horizonMs: number; targetAt: number; done: boolean };
 type Episode = {
   id: string;
@@ -21,6 +23,7 @@ type Episode = {
   amountLamports: string;
   quantityRaw: string;
   buy: Quote;
+  schedulingPolicy?: string;
   horizons: Horizon[];
 };
 type CollectorState = {
@@ -109,6 +112,7 @@ export class QuoteResearchCollector {
             !Number.isFinite(e.eventObservedAt) ||
             !Number.isFinite(e.baselineAt) ||
             e.baselineAt < 0 ||
+            (e.schedulingPolicy !== undefined && e.schedulingPolicy !== SCHEDULING_POLICY) ||
             !Array.isArray(e.horizons) ||
             e.horizons.length !== 3
           )
@@ -158,6 +162,25 @@ export class QuoteResearchCollector {
       .flatMap((e) => e.horizons.filter((h) => !h.done && h.targetAt <= now).map((h) => ({ e, h })))
       .sort((a, b) => a.h.targetAt - b.h.targetAt || a.e.id.localeCompare(b.e.id))[0];
   }
+  private baselineFits(now: number) {
+    // A slower configured budget still permits one episode; overlapping watches
+    // must not add contention to an already capacity-limited schedule.
+    if (!this.state.episodes.length) return true;
+    // A baseline spends this provider turn and creates three future turns.
+    // Checking only already-due horizons admits overlapping watches that cannot
+    // meet their targets even with an instantaneous, healthy quote provider.
+    const targets = [
+      ...this.state.episodes.flatMap((e) => e.horizons.filter((h) => !h.done).map((h) => h.targetAt)),
+      ...RESEARCH_HORIZONS_MS.map((horizon) => now + horizon),
+    ].sort((a, b) => a - b);
+    let available = now + this.intervalMs;
+    for (const target of targets) {
+      const scheduled = Math.max(available, target);
+      if (scheduled - target > MAX_ADMISSION_LATENESS_MS) return false;
+      available = scheduled + this.intervalMs;
+    }
+    return true;
+  }
   private prune() {
     this.state.episodes = this.state.episodes.filter((e) => e.horizons.some((h) => !h.done));
   }
@@ -181,6 +204,7 @@ export class QuoteResearchCollector {
         this.state.episodes.length >= MAX_WATCHES ||
         this.state.episodes.some((e) => e.mint === event.mint) ||
         !this.eligible(now) ||
+        !this.baselineFits(now) ||
         (this.state.lastBaselineSampleAt &&
           now - this.state.lastBaselineSampleAt < BASELINE_INTERVAL_MS)
       )
@@ -263,6 +287,7 @@ export class QuoteResearchCollector {
     const payload: Record<string, unknown> = {
       id,
       phase: "BASELINE",
+      schedulingPolicy: SCHEDULING_POLICY,
       mint: event.mint,
       signature: event.signature,
       slot: event.slot,
@@ -312,6 +337,7 @@ export class QuoteResearchCollector {
         amountLamports: amount.toString(),
         quantityRaw: buy.minOutAmount,
         buy: structuredClone(buy),
+        schedulingPolicy: SCHEDULING_POLICY,
         horizons: RESEARCH_HORIZONS_MS.map((horizonMs) => ({
           horizonMs,
           targetAt: buy!.observedAt + horizonMs,
@@ -344,6 +370,7 @@ export class QuoteResearchCollector {
       id: `${e.id}:horizon:${h.horizonMs}`,
       episodeId: e.id,
       phase: "HORIZON",
+      schedulingPolicy: e.schedulingPolicy ?? "LEGACY_DUE_ONLY_V1",
       mint: e.mint,
       signature: e.signature,
       slot: e.slot,
