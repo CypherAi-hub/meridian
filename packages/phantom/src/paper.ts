@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { WSOL } from "./types.ts";
-import { rawAmount, type Quote } from "./execution.ts";
+import { rawAmount, type Quote, type QuotePriority } from "./execution.ts";
 import {
   RiskGovernor,
   type PortfolioRiskState,
@@ -77,6 +77,7 @@ export type QuoteProvider = {
     outputMint: string;
     amount: bigint;
     slippageBps?: number;
+    priority?: QuotePriority;
   }): Promise<Quote>;
 };
 export type PaperPolicy = { minExecutionDelayMs: number; maxQuoteAgeMs: number };

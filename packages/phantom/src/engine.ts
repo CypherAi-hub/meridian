@@ -1,6 +1,8 @@
 import { createServer, type Server } from "node:http";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { Connection } from "@solana/web3.js";
 import { Store } from "./store.ts";
 import { decodeTransaction, decodeLogNotification, type RpcTransaction } from "./decoder.ts";
@@ -32,6 +34,25 @@ import type { Quote } from "./execution.ts";
 import { QuoteResearchCollector } from "./quote-research.ts";
 import { runtimeSourceVersion } from "./runtime-version.ts";
 import { conservativeCostBps } from "./costs.ts";
+import { ForwardRuntime } from "./forward-runtime.ts";
+function sourceCommit(configured?: string) {
+  const explicit = configured ?? process.env.PHANTOM_SOURCE_COMMIT;
+  if (explicit?.trim()) {
+    if (!/^[a-f0-9]{40}$/.test(explicit.trim())) throw Error("INVALID_SOURCE_COMMIT");
+    return explicit.trim();
+  }
+  try {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    if (/^[a-f0-9]{40}$/.test(head)) return head;
+  } catch {}
+  throw Error("FORWARD_SOURCE_COMMIT_REQUIRED_FOR_ARCHIVED_SOURCE");
+}
 function rpcInterval() {
   const value = Number(process.env.PHANTOM_RPC_INTERVAL_MS ?? 1000);
   if (!Number.isInteger(value) || value < 100 || value > 60_000)
@@ -71,6 +92,8 @@ export class Engine {
   private walletJobs = new Set<string>();
   private killFile = resolve(process.env.PHANTOM_KILL_FILE ?? "./data/KILL");
   private quoteResearch!: QuoteResearchCollector;
+  private forwardRuntime: ForwardRuntime | null = null;
+  private managingPositions = false;
   private researchTimer: ReturnType<typeof setInterval> | null = null;
   private researchWork: Promise<void> | null = null;
   private fastEvents: ChainEvent[] = [];
@@ -117,9 +140,10 @@ export class Engine {
     "Jupiter requires a configured API key. Missing routes or security evidence veto paper entries.",
     "No strategy is certified profitable. Adaptive selection stays locked until validated artifacts exist.",
     "Creator relationships and track records are limited to collected, point-in-time evidence.",
+    "The current SecurityReader always leaves creator associations unverified: no token can pass strict entry safety until scoped supply coverage is implemented.",
     "Live execution primitives are not connected to this CLI; production unattended execution remains uncertified.",
   ];
-  async start(options: { stream?: boolean; port?: number } = {}) {
+  async start(options: { stream?: boolean; port?: number; sourceCommit?: string } = {}) {
     try {
       return await this.initialize(options);
     } catch (error) {
@@ -136,7 +160,9 @@ export class Engine {
       throw error;
     }
   }
-  private async initialize(options: { stream?: boolean; port?: number } = {}) {
+  private async initialize(
+    options: { stream?: boolean; port?: number; sourceCommit?: string } = {},
+  ) {
     if ((process.env.PHANTOM_MODE ?? "PAPER") !== "PAPER")
       throw Error("CLI_PAPER_MODE_ONLY_LIVE_REQUIRES_SEPARATE_REVIEW");
     if (process.env.NODE_ENV === "production" && !process.env.PHANTOM_DATABASE_URL)
@@ -146,7 +172,23 @@ export class Engine {
       process.env.PHANTOM_DATA_DIR ?? "./data/warehouse",
       true,
     );
-    this.quoteResearch = new QuoteResearchCollector(this.store);
+    if (
+      process.env.PHANTOM_QUOTE_RESEARCH !== "false" &&
+      process.env.PHANTOM_FORWARD_RESEARCH !== "false"
+    ) {
+      this.forwardRuntime = await new ForwardRuntime(this.store, {
+        runtimeSourceVersion: this.sourceVersion,
+        sourceCommit: sourceCommit(options.sourceCommit),
+      }).initialize();
+    }
+    this.quoteResearch = new QuoteResearchCollector(
+      this.store,
+      30_000,
+      this.forwardRuntime?.collector,
+      () =>
+        !this.managingPositions &&
+        !this.ledger?.state.pendingExits.some((exit) => exit.readyAt <= Date.now()),
+    );
     await this.quoteResearch.initialize();
     const restored = restoreLedger(await this.store.get("ledger"));
     this.suspensionReason = (await this.store.get("suspension"))?.reason ?? null;
@@ -205,6 +247,44 @@ export class Engine {
           .catch(() => {
             res.writeHead(503);
             res.end(json({ error: "RESEARCH_EXPORT_UNAVAILABLE" }));
+          });
+      } else if (req.url === "/forward-cohorts") {
+        if (!this.forwardRuntime) {
+          res.writeHead(503);
+          res.end(json({ error: "FORWARD_RESEARCH_DISABLED" }));
+          return;
+        }
+        void this.forwardRuntime
+          .history()
+          .then((experiments) =>
+            res.end(
+              json({ activeExperimentId: this.forwardRuntime!.protocol.experimentId, experiments }),
+            ),
+          )
+          .catch(() => {
+            res.writeHead(503);
+            res.end(json({ error: "FORWARD_HISTORY_UNAVAILABLE" }));
+          });
+      } else if (req.url === "/forward-cohort" || req.url?.startsWith("/forward-cohort?")) {
+        if (!this.forwardRuntime) {
+          res.writeHead(503);
+          res.end(json({ error: "FORWARD_RESEARCH_DISABLED" }));
+          return;
+        }
+        const url = new URL(req.url, "http://127.0.0.1");
+        if (
+          [...url.searchParams.keys()].some((key) => key !== "experiment") ||
+          url.searchParams.getAll("experiment").length > 1
+        ) {
+          res.writeHead(400);
+          res.end(json({ error: "INVALID_FORWARD_EXPORT_QUERY" }));
+          return;
+        }
+        void this.exportForwardCohort(url.searchParams.get("experiment") ?? undefined)
+          .then((value) => res.end(json(value)))
+          .catch(() => {
+            res.writeHead(404);
+            res.end(json({ error: "FORWARD_EXPORT_UNAVAILABLE" }));
           });
       } else {
         res.writeHead(404);
@@ -582,6 +662,7 @@ export class Engine {
         ? undefined
         : {
             observedAt: q.observedAt,
+            ...(q.requestedAt !== undefined ? { requestedAt: q.requestedAt } : {}),
             inputRaw: q.inAmount,
             outputRaw: q.minOutAmount,
             networkFeeLamports: "10000",
@@ -610,6 +691,13 @@ export class Engine {
     if (this.stopped) return;
     if (!(await this.workerLeaseAvailable())) return;
     this.ledger.state.killSwitch = this.killed();
+    this.managingPositions = true;
+    try {
+      await this.managePositions();
+    } finally {
+      this.managingPositions = false;
+    }
+    if (this.stopped || !(await this.workerLeaseAvailable())) return;
     for (const order of [...this.ledger.state.pending]) {
       if (Date.now() < order.readyAt) continue;
       let settled = false;
@@ -620,12 +708,14 @@ export class Engine {
         if (!event || event.details.executionSupported === false)
           throw Error("ENTRY_EVENT_UNSUPPORTED");
         const preliminary = await this.quote.quote({
+          priority: "entry",
           inputMint: WSOL,
           outputMint: order.mint,
           amount: order.amountLamports,
           slippageBps: 100,
         });
         const route = await this.quote.quote({
+          priority: "entry",
           inputMint: order.mint,
           outputMint: WSOL,
           amount: BigInt(preliminary.minOutAmount),
@@ -637,12 +727,14 @@ export class Engine {
         );
         // Reprice after slower security reads. An earlier quote cannot authorize a later fill.
         const quote = await this.quote.quote({
+          priority: "entry",
           inputMint: WSOL,
           outputMint: order.mint,
           amount: order.amountLamports,
           slippageBps: 100,
         });
         const exitQuote = await this.quote.quote({
+          priority: "entry",
           inputMint: order.mint,
           outputMint: WSOL,
           amount: BigInt(quote.minOutAmount),
@@ -650,7 +742,11 @@ export class Engine {
         });
         snapshot.evidence.sellRouteObservedAt = exitQuote.observedAt;
         snapshot.evidence.sellRouteAvailable = true;
-        const cost = conservativeCostBps(order.amountLamports, BigInt(exitQuote.minOutAmount), 20_000n);
+        const cost = conservativeCostBps(
+          order.amountLamports,
+          BigInt(exitQuote.minOutAmount),
+          20_000n,
+        );
         const features = this.feature(event, snapshot, cost);
         snapshot.evidence.abnormalCreatorActivity =
           this.launches.has(event.mint) && features.observations >= 3
@@ -697,12 +793,25 @@ export class Engine {
         });
       }
     }
-    for (const p of [...this.ledger.state.positions]) {
+    this.ledger.recordEquity(Date.now());
+    await this.persistLedger();
+  }
+  private async managePositions() {
+    const readyExits = new Set(
+      this.ledger.state.pendingExits
+        .filter((exit) => exit.readyAt <= Date.now())
+        .map((exit) => exit.positionId),
+    );
+    const positions = [...this.ledger.state.positions].sort(
+      (a, b) => Number(readyExits.has(b.id)) - Number(readyExits.has(a.id)),
+    );
+    for (const p of positions) {
       try {
         const pending = this.ledger.state.pendingExits.find((x) => x.positionId === p.id);
         if (pending) {
           if (Date.now() < pending.readyAt) continue;
           const quote = await this.quote.quote({
+            priority: "protective_exit",
             inputMint: p.mint,
             outputMint: WSOL,
             amount: pending.quantityRaw,
@@ -722,6 +831,7 @@ export class Engine {
           continue;
         }
         const quote = await this.quote.quote({
+          priority: "protective_exit",
           inputMint: p.mint,
           outputMint: WSOL,
           amount: p.quantityRaw,
@@ -757,8 +867,6 @@ export class Engine {
         });
       }
     }
-    this.ledger.recordEquity(Date.now());
-    await this.persistLedger();
   }
   private async workerLeaseAvailable() {
     try {
@@ -813,6 +921,53 @@ export class Engine {
       observations: (
         await this.store.query("SELECT payload FROM phantom_replay_observations ORDER BY at,id")
       ).map((x) => x.payload),
+    };
+  }
+  private async exportForwardCohort(experimentId?: string) {
+    if (!this.forwardRuntime) throw Error("FORWARD_RESEARCH_DISABLED");
+    const value = await this.forwardRuntime.export(experimentId);
+    // Read the original tagged delivery intents even for retired/closed cohorts.
+    // Never initialize an old collector or create a later eligibility decision.
+    const tagged = await this.store.query(
+      `SELECT jsonb_build_object('mint',payload->>'mint','probeId',payload->'forwardProbe'->>'id',
+         'phase',payload->>'phase') AS payload FROM phantom_quote_research
+       WHERE payload->>'forwardExperimentId'=$1 AND at<=$2 ORDER BY at,id`,
+      [value.protocol.experimentId, value.exportedAt],
+    );
+    const first = new Map<string, string>();
+    for (const { payload } of tagged) {
+      if (
+        payload.phase !== "BASELINE" ||
+        typeof payload.mint !== "string" ||
+        !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(payload.mint) ||
+        typeof payload.probeId !== "string" ||
+        !/^[A-Za-z0-9:_-]{1,128}$/.test(payload.probeId)
+      )
+        throw Error("FORWARD_TAGGED_PROBE_INVALID");
+      if (!first.has(payload.mint)) first.set(payload.mint, payload.probeId);
+    }
+    const enrollments = new Map(
+      value.records.filter((r) => r.phase === "ENROLLMENT").map((r) => [r.mint, r]),
+    );
+    const missing = [...first.keys()].filter((mint) => !enrollments.has(mint)).length;
+    const displaced = [...first].filter(
+      ([mint, id]) => enrollments.has(mint) && enrollments.get(mint)!.data.probeId !== id,
+    ).length;
+    const unmatched = [...enrollments.keys()].filter((mint) => !first.has(mint)).length;
+    return {
+      ...value,
+      probeDeliveryAudit: {
+        version: 1,
+        scope: "EXPLICITLY_TAGGED_BASELINES_ONLY",
+        experimentId: value.protocol.experimentId,
+        exportedAt: value.exportedAt,
+        taggedBaselineRows: tagged.length,
+        distinctTaggedMints: first.size,
+        missingEnrollmentMints: missing,
+        displacedFirstProbeMints: displaced,
+        unmatchedEnrollmentMints: unmatched,
+        status: missing || displaced || unmatched ? "INCOMPLETE" : "COMPLETE",
+      },
     };
   }
   state() {
@@ -874,6 +1029,17 @@ export class Engine {
       equity: l.equity,
       cashLamports: l.cashLamports,
       pending: l.pending,
+      research: this.quoteResearch?.status() ?? null,
+      forwardResearch: this.forwardRuntime
+        ? {
+            experimentId: this.forwardRuntime.protocol.experimentId,
+            configurationHash: this.forwardRuntime.protocol.configurationHash,
+            enrollmentStart: this.forwardRuntime.protocol.enrollmentStart,
+            enrollmentEnd: this.forwardRuntime.protocol.enrollmentEnd,
+            security: this.forwardRuntime.protocol.security,
+            scope: this.forwardRuntime.protocol.scope,
+          }
+        : null,
       limitations: this.limitations,
     };
   }
@@ -889,6 +1055,7 @@ export class Engine {
       await this.researchWork;
       while (this.walletJobs.size) await new Promise((r) => setTimeout(r, 100));
       await this.quoteResearch.idle();
+      await this.forwardRuntime?.idle();
       if (this.store.workerLeaseHealthy) await this.persistLedger();
     } finally {
       try {

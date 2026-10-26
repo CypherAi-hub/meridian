@@ -181,29 +181,99 @@ function enter(ledger: PaperLedger, mint: string, id: string) {
 }
 
 describe("engine economic and audit fault boundaries", () => {
+  it("durably settles ready exits before marks or any new entry quote", async () => {
+    const f = fixture(),
+      marked = enter(f.ledger, "SYNTHETIC-MARK-MINT", "SYNTHETIC-MARK"),
+      exiting = enter(f.ledger, "SYNTHETIC-EXIT-MINT", "SYNTHETIC-EXIT");
+    f.ledger.queueExit(exiting, exiting.quantityRaw, "SYNTHETIC-EXIT", Date.now() - 3000, 2000);
+    queue(f);
+    const requests: string[] = [],
+      priorities: unknown[] = [];
+    f.engine.setQuoteProvider({
+      quote: async (input) => {
+        requests.push(input.inputMint);
+        priorities.push(input.priority);
+        if (input.inputMint === WSOL) {
+          expect(f.rows.get("ledger").trades[0].positionId).toBe(exiting.id);
+          expect(
+            f.rows.get("ledger").positions.find((p: any) => p.id === marked.id).markLamports,
+          ).toBe("9990000");
+          throw Error("SYNTHETIC_ENTRY_UNAVAILABLE");
+        }
+        return quote(input.inputMint, WSOL, input.amount, 10_000_000n);
+      },
+    });
+    await f.engine.tick();
+    expect(requests).toEqual([exiting.mint, marked.mint, WSOL]);
+    expect(priorities).toEqual(["protective_exit", "protective_exit", "entry"]);
+    expect(f.ledger.state.trades[0].positionId).toBe(exiting.id);
+  });
+  it("preserves actual captured request timestamps in recorded replay quotes", async () => {
+    const f = fixture(),
+      now = Date.now();
+    const buy = {
+      ...quote(WSOL, f.e.mint, 10_000_000n, 1000n),
+      requestedAt: now - 20,
+      observedAt: now - 10,
+    };
+    const sell = {
+      ...quote(f.e.mint, WSOL, 1000n, 10_000_000n),
+      requestedAt: now - 5,
+      observedAt: now,
+    };
+    const exec = vi.spyOn(f.engine.store, "exec").mockResolvedValue({ rows: [] } as any);
+    const snapshot = await f.engine.security.inspect(f.e, { available: true, at: now });
+    const features = (Engine.prototype as any).feature.call(f.engine, f.e, snapshot, 20);
+    await (Engine.prototype as any).capture.call(
+      f.engine,
+      { ...f.e, signature: "1".repeat(64) },
+      features,
+      snapshot,
+      buy,
+      sell,
+    );
+    const saved = JSON.parse(exec.mock.calls[0][1]![2] as string);
+    expect(saved.buy.requestedAt).toBe(now - 20);
+    expect(saved.sell.requestedAt).toBe(now - 5);
+    expect(saved.buy.observedAt).toBe(now - 10);
+  });
   it("uses the same conservative cost boundary before an entry is proposed", async () => {
-    const f = fixture(), base = f.internal.feature();
+    const f = fixture(),
+      base = f.internal.feature();
     vi.mocked(f.internal.feature).mockImplementation((...args: any[]) => ({
-      ...base, executionCostBps: args[2] ?? 20,
+      ...base,
+      executionCostBps: args[2] ?? 20,
     }));
-    f.engine.setQuoteProvider({quote: async input => input.inputMint === WSOL
-      ? quote(WSOL, input.outputMint, input.amount, 1000n)
-      : quote(input.inputMint, WSOL, input.amount, 9_869_999n)});
+    f.engine.setQuoteProvider({
+      quote: async (input) =>
+        input.inputMint === WSOL
+          ? quote(WSOL, input.outputMint, input.amount, 1000n)
+          : quote(input.inputMint, WSOL, input.amount, 9_869_999n),
+    });
     await f.internal.analyze(f.e);
     expect(f.internal.feature).toHaveBeenCalledWith(f.e, expect.anything(), 151);
     expect(f.ledger.state.pending).toHaveLength(0);
-    expect(f.engine.store.decision).toHaveBeenCalledWith(expect.objectContaining({
-      accepted: false, reasons: expect.arrayContaining(["COST_BUDGET_EXCEEDED"]),
-    }), expect.any(Number));
+    expect(f.engine.store.decision).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accepted: false,
+        reasons: expect.arrayContaining(["COST_BUDGET_EXCEEDED"]),
+      }),
+      expect.any(Number),
+    );
   });
   it("rejects a fresh fill whose exact cost is 150.001bps above the unchanged150bps cap", async () => {
-    const f = fixture(), base = f.internal.feature();
+    const f = fixture(),
+      base = f.internal.feature();
     vi.mocked(f.internal.feature).mockImplementation((...args: any[]) => ({
-      ...base, executionCostBps: args[2] ?? 20,
+      ...base,
+      executionCostBps: args[2] ?? 20,
     }));
-    f.engine.setQuoteProvider({quote: async input => input.inputMint === WSOL
-      ? quote(WSOL, input.outputMint, input.amount, 1000n)
-      : quote(input.inputMint, WSOL, input.amount, 9_869_999n)});
+    f.engine.setQuoteProvider({
+      quote: async (input) =>
+        input.inputMint === WSOL
+          ? quote(WSOL, input.outputMint, input.amount, 1000n)
+          : quote(input.inputMint, WSOL, input.amount, 9_869_999n),
+    });
     queue(f);
     await f.engine.tick();
     expect(f.internal.feature).toHaveBeenCalledWith(expect.anything(), expect.anything(), 151);

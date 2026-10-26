@@ -3,6 +3,7 @@ import { WSOL, json, type ChainEvent } from "./types.ts";
 import type { QuoteProvider } from "./paper.ts";
 import type { Quote } from "./execution.ts";
 import type { Store } from "./store.ts";
+import type { ForwardCohortCollector, ForwardProbe } from "./forward-cohort.ts";
 
 export const RESEARCH_HORIZONS_MS = [30_000, 60_000, 180_000] as const;
 export const RESEARCH_WATCH_STATE_KEY = "quote-research-horizons-v1";
@@ -12,6 +13,11 @@ const MAX_WATCHES = 10,
   BASELINE_INTERVAL_MS = 90_000,
   MAX_ADMISSION_LATENESS_MS = 5_000;
 const SCHEDULING_POLICY = "HORIZON_CAPACITY_RESERVED_V2";
+const FORWARD_SCHEDULING_POLICY = "FORWARD_BUDGET_RESERVED_V3";
+export type ForwardResearchConsumer = Pick<
+  ForwardCohortCollector,
+  "protocol" | "nextQuoteWindow" | "considerProbe" | "tick" | "idle"
+>;
 type Horizon = { horizonMs: number; targetAt: number; done: boolean };
 type Episode = {
   id: string;
@@ -79,10 +85,17 @@ export class QuoteResearchCollector {
   };
   private initialized = false;
   private initialization: Promise<void> | null = null;
+  private forwardRecoveryPending: boolean;
+  private forwardDeferrals = 0;
+  private recoveredForwardProbes = 0;
+  private lastDeferredWindow: string | null = null;
   constructor(
     private store: Store,
     private intervalMs = 30_000,
+    private forward?: ForwardResearchConsumer,
+    private canResearch: () => boolean = () => true,
   ) {
+    this.forwardRecoveryPending = !!forward;
     if (!Number.isInteger(intervalMs) || intervalMs < 30_000)
       throw Error("RESEARCH_QUOTE_RATE_TOO_HIGH");
   }
@@ -112,7 +125,8 @@ export class QuoteResearchCollector {
             !Number.isFinite(e.eventObservedAt) ||
             !Number.isFinite(e.baselineAt) ||
             e.baselineAt < 0 ||
-            (e.schedulingPolicy !== undefined && e.schedulingPolicy !== SCHEDULING_POLICY) ||
+            (e.schedulingPolicy !== undefined &&
+              ![SCHEDULING_POLICY, FORWARD_SCHEDULING_POLICY].includes(e.schedulingPolicy)) ||
             !Array.isArray(e.horizons) ||
             e.horizons.length !== 3
           )
@@ -152,6 +166,55 @@ export class QuoteResearchCollector {
   private async persist() {
     await this.store.save(RESEARCH_WATCH_STATE_KEY, this.state);
   }
+  status() {
+    return {
+      sharedMinimumTurnSpacingMs: this.intervalMs,
+      lastProviderSampleAt: this.state.lastProviderSampleAt,
+      forwardExperimentId: this.forward?.protocol.experimentId ?? null,
+      forwardRecoveryPending: this.forwardRecoveryPending,
+      forwardReservationDeferrals: this.forwardDeferrals,
+      recoveredForwardProbes: this.recoveredForwardProbes,
+      scope: "QUOTE_ONLY_NO_LEDGER_OR_TRADE_AUTHORITY",
+    };
+  }
+  /** Only explicitly tagged prospective probes are recovered. Old untagged history
+   * is never enrolled. Expired probes become explicit rejections, not new entries. */
+  private async recoverForwardProbes() {
+    if (!this.forward || !this.forwardRecoveryPending) return;
+    if (Date.now() > this.forward.protocol.enrollmentEnd) {
+      this.forwardRecoveryPending = false;
+      return;
+    }
+    for (;;) {
+      const rows = await this.store.query(
+        `SELECT r.payload FROM phantom_quote_research r
+         WHERE r.payload->>'forwardExperimentId'=$1
+           AND NOT EXISTS (SELECT 1 FROM phantom_forward_records f
+             WHERE f.experiment_id=$1 AND f.mint=r.payload->>'mint' AND f.phase='ENROLLMENT')
+         ORDER BY r.at,r.id LIMIT 100`,
+        [this.forward.protocol.experimentId],
+      );
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (!row.payload?.forwardProbe) throw Error("FORWARD_DURABLE_PROBE_MISSING");
+        const result = await this.forward.considerProbe(row.payload.forwardProbe as ForwardProbe);
+        if (result.status === "OUTSIDE_ENROLLMENT_WINDOW")
+          throw Error("FORWARD_DURABLE_PROBE_OUTSIDE_ENROLLMENT");
+        this.recoveredForwardProbes++;
+      }
+    }
+    this.forwardRecoveryPending = false;
+  }
+  private async forwardWindow() {
+    return this.forward ? this.forward.nextQuoteWindow() : null;
+  }
+  private deferForForward(window: { mint: string; phase: string; dueAt: number }) {
+    const key = `${window.mint}:${window.phase}:${window.dueAt}`;
+    if (key !== this.lastDeferredWindow) {
+      this.forwardDeferrals++;
+      this.lastDeferredWindow = key;
+    }
+  }
   private eligible(now: number) {
     return (
       !this.state.lastProviderSampleAt || now - this.state.lastProviderSampleAt >= this.intervalMs
@@ -170,7 +233,9 @@ export class QuoteResearchCollector {
     // Checking only already-due horizons admits overlapping watches that cannot
     // meet their targets even with an instantaneous, healthy quote provider.
     const targets = [
-      ...this.state.episodes.flatMap((e) => e.horizons.filter((h) => !h.done).map((h) => h.targetAt)),
+      ...this.state.episodes.flatMap((e) =>
+        e.horizons.filter((h) => !h.done).map((h) => h.targetAt),
+      ),
       ...RESEARCH_HORIZONS_MS.map((horizon) => now + horizon),
     ].sort((a, b) => a - b);
     let available = now + this.intervalMs;
@@ -197,6 +262,7 @@ export class QuoteResearchCollector {
     if (this.active || event.mint === WSOL || event.quoteMint !== WSOL) return;
     return this.start(async () => {
       await this.initialize();
+      await this.recoverForwardProbes();
       const now = Date.now();
       this.prune();
       if (
@@ -204,11 +270,17 @@ export class QuoteResearchCollector {
         this.state.episodes.length >= MAX_WATCHES ||
         this.state.episodes.some((e) => e.mint === event.mint) ||
         !this.eligible(now) ||
+        !this.canResearch() ||
         !this.baselineFits(now) ||
         (this.state.lastBaselineSampleAt &&
           now - this.state.lastBaselineSampleAt < BASELINE_INTERVAL_MS)
       )
         return;
+      const window = await this.forwardWindow();
+      if (window && now + this.intervalMs > window.dueAt) {
+        this.deferForForward(window);
+        return;
+      }
       raw(amount.toString());
       this.state.lastBaselineSampleAt = now;
       await this.reserve(now);
@@ -220,6 +292,19 @@ export class QuoteResearchCollector {
     if (this.active) return;
     await this.start(async () => {
       await this.initialize();
+      await this.recoverForwardProbes();
+      const window = await this.forwardWindow();
+      const sampledAt = Date.now();
+      if (window && sampledAt >= window.dueAt) {
+        const permit =
+          sampledAt <= window.deadlineAt && this.eligible(sampledAt) && this.canResearch();
+        if (permit) await this.reserve(sampledAt);
+        await this.forward!.tick(
+          { quote: (input) => provider.quote({ ...input, priority: "research" }) },
+          permit,
+        );
+        return;
+      }
       const now = Date.now(),
         next = this.due(now);
       if (!next) return;
@@ -239,6 +324,11 @@ export class QuoteResearchCollector {
         return;
       }
       if (!this.eligible(now)) return;
+      if (!this.canResearch()) return;
+      if (window && now + this.intervalMs > window.dueAt) {
+        this.deferForForward(window);
+        return;
+      }
       await this.reserve(now);
       await this.collectHorizon(next.e, next.h, provider, false);
     });
@@ -260,6 +350,7 @@ export class QuoteResearchCollector {
       buyVerified = false;
     try {
       buy = await provider.quote({
+        priority: "research",
         inputMint: WSOL,
         outputMint: event.mint,
         amount,
@@ -268,6 +359,7 @@ export class QuoteResearchCollector {
       validate(buy, WSOL, event.mint, amount, Date.now());
       buyVerified = true;
       sell = await provider.quote({
+        priority: "research",
         inputMint: event.mint,
         outputMint: WSOL,
         amount: raw(buy.minOutAmount),
@@ -287,7 +379,7 @@ export class QuoteResearchCollector {
     const payload: Record<string, unknown> = {
       id,
       phase: "BASELINE",
-      schedulingPolicy: SCHEDULING_POLICY,
+      schedulingPolicy: this.forward ? FORWARD_SCHEDULING_POLICY : SCHEDULING_POLICY,
       mint: event.mint,
       signature: event.signature,
       slot: event.slot,
@@ -325,6 +417,32 @@ export class QuoteResearchCollector {
         status: "UNAVAILABLE",
         error: error ?? "RESEARCH_BASELINE_UNAVAILABLE",
       });
+    const protocol = this.forward?.protocol;
+    const forwardProbe: ForwardProbe | undefined =
+      protocol &&
+      event.receivedAt >= protocol.enrollmentStart &&
+      event.receivedAt <= startedAt &&
+      startedAt >= protocol.enrollmentStart &&
+      observedAt <= protocol.enrollmentEnd
+        ? {
+            id,
+            mint: event.mint,
+            signature: event.signature,
+            slot: event.slot,
+            protocol: event.protocol,
+            kind: event.kind,
+            eventObservedAt: event.receivedAt,
+            startedAt,
+            completedAt: observedAt,
+            amountLamports: amount.toString(),
+            ...(buy && buyVerified ? { buy } : {}),
+            ...(!error && sell ? { sell } : {}),
+          }
+        : undefined;
+    if (forwardProbe) {
+      Object.assign(payload, { forwardExperimentId: protocol!.experimentId, forwardProbe });
+      this.forwardRecoveryPending = true;
+    }
     await this.write(payload);
     if (baselineEligible && buy) {
       const e: Episode = {
@@ -337,7 +455,7 @@ export class QuoteResearchCollector {
         amountLamports: amount.toString(),
         quantityRaw: buy.minOutAmount,
         buy: structuredClone(buy),
-        schedulingPolicy: SCHEDULING_POLICY,
+        schedulingPolicy: this.forward ? FORWARD_SCHEDULING_POLICY : SCHEDULING_POLICY,
         horizons: RESEARCH_HORIZONS_MS.map((horizonMs) => ({
           horizonMs,
           targetAt: buy!.observedAt + horizonMs,
@@ -347,6 +465,9 @@ export class QuoteResearchCollector {
       this.state.episodes.push(e);
       await this.persist();
     }
+    // The tagged baseline row is the durable delivery intent. A crash before this
+    // callback is reconciled before any later mint/probe can replace it.
+    if (forwardProbe) await this.recoverForwardProbes();
   }
   private async collectHorizon(e: Episode, h: Horizon, provider: QuoteProvider, expired: boolean) {
     const startedAt = Date.now();
@@ -355,6 +476,7 @@ export class QuoteResearchCollector {
     else
       try {
         sell = await provider.quote({
+          priority: "research",
           inputMint: e.mint,
           outputMint: WSOL,
           amount: raw(e.quantityRaw),
@@ -413,5 +535,6 @@ export class QuoteResearchCollector {
   }
   async idle() {
     await this.active;
+    await this.forward?.idle();
   }
 }
