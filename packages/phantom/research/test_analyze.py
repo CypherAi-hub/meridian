@@ -118,6 +118,44 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(result['status'],'INSUFFICIENT_DISTINCT_TOKENS')
         self.assertIsNone(result['mean95'])
 
+    def test_delayed_quotes_do_not_enter_the_target_time_subset(self):
+        on_time = horizon('on-time', net=-100, milliseconds=60000)
+        delayed = horizon('late', net=9000, milliseconds=60000)
+        delayed['observedAt'] = delayed['targetAt'] + 33000
+        delayed['sell']['observedAt'] = delayed['observedAt']
+        delayed['delayPastTargetMs'] = 0  # Derive timing from verified clocks.
+        result = analyze({}, [on_time, delayed])['hypotheticalQuoteHorizons']['byHorizonMs']['60000']
+        self.assertEqual(result['quoted'], 2)
+        self.assertEqual(result['medianHypotheticalReturnBps'], 4450)
+        timing = result['targetTiming']
+        self.assertEqual(timing['nearTargetQuoted'], 1)
+        self.assertEqual(timing['delayedQuoted'], 1)
+        self.assertEqual(timing['nearTargetMedianHypotheticalReturnBps'], -100)
+        self.assertEqual(timing['actualHoldingTimeMsMedian'], 77000)
+        self.assertEqual(timing['nearTargetUncertainty']['distinctTokens'], 1)
+
+    def test_target_delay_boundary_is_inclusive_and_empty_subset_unknown(self):
+        for delay, count in ((5000, 1), (5001, 0)):
+            row = horizon()
+            row['observedAt'] = row['targetAt'] + delay
+            row['sell']['observedAt'] = row['observedAt'] - 100
+            timing = analyze({}, [row])['hypotheticalQuoteHorizons']['byHorizonMs']['30000']['targetTiming']
+            self.assertEqual(timing['nearTargetQuoted'], count)
+            self.assertEqual(timing['delayedQuoted'], 1-count)
+            self.assertEqual(timing['actualHoldingTimeMsMedian'], 30000+delay-100)
+            if not count:
+                self.assertIsNone(timing['nearTargetMedianHypotheticalReturnBps'])
+
+    def test_delayed_distinct_tokens_cannot_inflate_near_target_confidence(self):
+        rows = [horizon(str(i), 'token-'+str(i)) for i in range(30)]
+        for row in rows[1:]:
+            row['observedAt'] = row['targetAt'] + 33000
+            row['sell']['observedAt'] = row['observedAt']
+        result = analyze({}, rows)['hypotheticalQuoteHorizons']['byHorizonMs']['30000']
+        self.assertEqual(result['uncertainty']['status'], 'DESCRIPTIVE_TOKEN_CLUSTER_BOOTSTRAP')
+        self.assertEqual(result['targetTiming']['nearTargetUncertainty']['status'], 'INSUFFICIENT_DISTINCT_TOKENS')
+        self.assertEqual(result['targetTiming']['nearTargetUncertainty']['distinctTokens'], 1)
+
     def test_bootstrap_clusters_many_same_token_episodes_instead_of_inflating_sample_count(self):
         records=[horizon(str(i),'same-token',net=100) for i in range(35)]
         result=analyze({},records)['hypotheticalQuoteHorizons']['byHorizonMs']['30000']['uncertainty']

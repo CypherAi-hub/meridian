@@ -20,6 +20,7 @@ WSOL = 'So11111111111111111111111111111111111111112'
 HORIZONS_MS = (30_000, 60_000, 180_000)
 MINIMUM_BOOTSTRAP_TOKENS = 30
 MAX_QUOTE_AGE_MS = 5_000
+MAX_TARGET_DELAY_MS = 5_000
 
 
 def percentile(values, q):
@@ -182,7 +183,8 @@ def horizon_result(row):
     bps = trunc_div(net * 10_000, amount)
     if integer(row['hypotheticalHorizonNetLamports']) != net or row.get('hypotheticalHorizonReturnBps') != bps:
         raise ValueError('Hypothetical quote accounting mismatch')
-    return {'mint': row['mint'], 'net': net, 'bps': bps, 'delay': observed - target}
+    return {'mint': row['mint'], 'net': net, 'bps': bps, 'delay': observed - target,
+            'actualHoldingTimeMs': row['sell']['observedAt'] - baseline}
 
 
 def cost_policy_compatibility(costs, strategy_rules):
@@ -259,12 +261,27 @@ def research_analysis(research, strategy_rules=None):
         for result in validated:
             tokens[result['mint']].append(result['bps'])
         token_means = {mint: statistics.mean(values) for mint, values in tokens.items()}
+        near_target = [r for r in validated if r['delay'] <= MAX_TARGET_DELAY_MS]
+        near_tokens = defaultdict(list)
+        for result in near_target:
+            near_tokens[result['mint']].append(result['bps'])
         by_horizon[str(horizon)] = {
             'attempts': len(matching), 'quoted': len(validated), 'unavailable': unavailable, 'invalid': invalid,
             'distinctTokens': len(tokens),
             'medianHypotheticalNetLamports': integer_median_string([r['net'] for r in validated]),
             'medianHypotheticalReturnBps': statistics.median([r['bps'] for r in validated]) if validated else None,
             'observationDelayPastTargetMsMedian': statistics.median([r['delay'] for r in validated]) if validated else None,
+            'targetTiming': {
+                'maximumNearTargetDelayMs': MAX_TARGET_DELAY_MS,
+                'nearTargetQuoted': len(near_target),
+                'delayedQuoted': len(validated) - len(near_target),
+                'actualHoldingTimeMsMedian': statistics.median([r['actualHoldingTimeMs'] for r in validated]) if validated else None,
+                'nearTargetMedianHypotheticalReturnBps': statistics.median([r['bps'] for r in near_target]) if near_target else None,
+                'nearTargetUncertainty': clustered_bootstrap(
+                    {mint: statistics.mean(values) for mint, values in near_tokens.items()},
+                    'per-token mean hypothetical quote return bps within target-delay tolerance; not realized P&L'),
+                'scope': 'Timing-stratified descriptive subset only; delayed quotes remain in all-observation totals. Provider receipt timing is measured, not guaranteed. Neither subset is an out-of-sample strategy result.',
+            },
             'unavailableReasons': dict(errors.most_common()),
             'uncertainty': clustered_bootstrap(token_means, 'per-token mean hypothetical horizon quote return bps; not realized P&L'),
         }
