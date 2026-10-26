@@ -441,10 +441,13 @@ export class SecurityReader {
         .sort((a, b) => (a > b ? -1 : a < b ? 1 : 0))
         .slice(0, 10)
         .reduce((sum, value) => sum + value, 0n);
-      e.topHolderConcentrationBps = Number((top * 10000n) / mint.supply);
+      // Round upward: a fractional excess must not be floored into a passing cap.
+      e.topHolderConcentrationBps = Number((top * 10000n + mint.supply - 1n) / mint.supply);
       e.holderSnapshotSlot = holderSlot;
       if (e.creatorAddress) {
-        e.directCreatorConcentrationBps = Number((creatorControlled * 10000n) / mint.supply);
+        e.directCreatorConcentrationBps = Number(
+          (creatorControlled * 10000n + mint.supply - 1n) / mint.supply,
+        );
         e.creatorConcentrationBps = e.directCreatorConcentrationBps;
       }
     } catch {

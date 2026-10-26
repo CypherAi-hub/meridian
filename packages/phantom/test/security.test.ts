@@ -337,6 +337,40 @@ describe("finalized mint and holder security with synthetic evidence", () => {
     expect(result.evidence.creatorConcentrationBps).toBe(400);
     expect(result.evidence.creatorAssociatedConcentrationBps).toBeNull();
   });
+  it("rejects a one-raw-token excess over the creator cap instead of flooring it away", async () => {
+    const f = baseFixture();
+    f.holders[1].account = account(tokenData(f.mint, f.creator, 100001n), TOKEN_PROGRAM_ID);
+    for (let i = 2; i < f.holders.length; i++)
+      f.holders[i].account = account(
+        tokenData(f.mint, pub(), i === f.holders.length - 1 ? 17251n : 17241n),
+        TOKEN_PROGRAM_ID,
+      );
+    const snapshot = await f.reader().inspect(f.event, { available: true, at: 1000 });
+    expect(snapshot.evidence.directCreatorConcentrationBps).toBe(1001);
+    expect(checkTokenSafety(snapshot.evidence, undefined, 1000).reasons).toContain(
+      "CREATOR_CONCENTRATION_UNKNOWN_OR_EXCESSIVE",
+    );
+  });
+  it("rejects a fractional top-ten excess while preserving the exact cap", async () => {
+    const f = baseFixture(),
+      owners = f.holders.slice(1).map(() => pub());
+    for (let i = 1; i < f.holders.length; i++)
+      f.holders[i].account = account(
+        tokenData(f.mint, owners[i - 1], i <= 10 ? 35000n : 12500n),
+        TOKEN_PROGRAM_ID,
+      );
+    expect(
+      (await f.reader().inspect(f.event, { available: true, at: 1000 })).evidence
+        .topHolderConcentrationBps,
+    ).toBe(3500);
+    f.holders[1].account = account(tokenData(f.mint, owners[0], 35001n), TOKEN_PROGRAM_ID);
+    f.holders[30].account = account(tokenData(f.mint, owners[29], 12499n), TOKEN_PROGRAM_ID);
+    const snapshot = await f.reader().inspect(f.event, { available: true, at: 1000 });
+    expect(snapshot.evidence.topHolderConcentrationBps).toBe(3501);
+    expect(checkTokenSafety(snapshot.evidence, undefined, 1000).reasons).toContain(
+      "HOLDER_CONCENTRATION_UNKNOWN_OR_EXCESSIVE",
+    );
+  });
   it.each(["incomplete", "duplicate", "wrong-owner", "uninitialized-token"] as const)(
     "rejects %s holder coverage rather than treating it as complete",
     async (kind) => {

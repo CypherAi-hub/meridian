@@ -16,7 +16,8 @@
     "kill": "node --env-file-if-exists=.env --import tsx src/cli.ts kill",
     "research": "python research/analyze.py",
     "research:test": "python -m unittest discover -s research -p 'test_*.py'",
-    "research:forward:test": "node --experimental-strip-types --test research/forward_cohort.test.ts research/forward_cohort_sql.test.ts"
+    "research:forward:test": "node --experimental-strip-types --test research/forward_cohort.test.ts research/forward_cohort_sql.test.ts",
+    "research:custody:test": "node --experimental-strip-types --test research/custody_bound.test.ts"
   },
   "dependencies": {
     "@pump-fun/pump-sdk": "4.3.1",

@@ -240,6 +240,57 @@ describe("paper settlement with synthetic quote evidence", () => {
 });
 
 describe("quote marks and delayed protective exits with synthetic data", () => {
+  it.each([null, NaN, -1, DEFAULT_RISK_LIMITS.maxImpactBps + 1])(
+    "does not turn inadmissible impact %s into liquidation equity or a trailing peak",
+    (impactBps) => {
+      const { ledger, position } = entered();
+      ledger.mark(position, quote(MINT, WSOL, 1001n, 11_000_000n, 3000), 10000n, 3000);
+      const positionPeak = position.peakLamports;
+      const portfolioPeak = ledger.state.peakEquityLamports;
+      expect(() => ledger.mark(position,
+        quote(MINT, WSOL, 1001n, 20_000_000n, 3001, { impactBps }), 10000n, 3001,
+      )).toThrow("PAPER_MARK_RISK_VETO");
+      expect(position.markLamports).toBeNull();
+      expect(ledger.equity(3001)).toBeNull();
+      expect(position.peakLamports).toBe(positionPeak);
+      expect(ledger.state.peakEquityLamports).toBe(portfolioPeak);
+      ledger.mark(position, quote(MINT, WSOL, 1001n, 17_000_000n, 3002), 10000n, 3002);
+      expect(ledger.exitReason(position, 3002)?.reason).not.toBe("TRAILING_STOP");
+    },
+  );
+  it("keeps emergency and maximum-hold intent available with an unknown liquidation value", () => {
+    const { ledger, position, governor } = entered();
+    expect(position.markLamports).toBeNull();
+    expect(ledger.exitReason(position, 302000)).toEqual({ reason: "MAX_HOLD", bps: 10000 });
+    governor.kill();
+    expect(ledger.exitReason(position, 302000)).toEqual({ reason: "EMERGENCY_SHUTDOWN", bps: 10000 });
+  });
+  it("supersedes a pending profit slice with a delayed full emergency exit without filling the old quote", () => {
+    const { ledger, position, governor } = entered();
+    const partial = ledger.queueExit(position, 500n, "PARTIAL_PROFIT", 3000, 2000)!;
+    governor.kill();
+    const full = ledger.queueRequiredExit(position, 4000, 2000)!;
+    expect(full).toMatchObject({ quantityRaw: 1001n, reason: "EMERGENCY_SHUTDOWN", readyAt: 6000 });
+    expect(full.id).not.toBe(partial.id);
+    expect(ledger.queueRequiredExit(position, 5000, 2000)).toBe(full);
+    expect(() => ledger.close(position, quote(MINT, WSOL, 500n, 6_000_000n, 5000),
+      500n, 10000n, partial.reason, 5000, partial.id)).toThrow("NOT_PENDING_OR_MISMATCH");
+    expect(() => ledger.close(position, quote(MINT, WSOL, 1001n, 10_000_000n, 5999),
+      1001n, 10000n, full.reason, 5999, full.id)).toThrow("PAPER_DELAY_NOT_OBSERVED");
+    const restored = new PaperLedger(INITIAL, new RiskGovernor(), restoreLedger(saved(ledger.state)));
+    expect(restored.state.pendingExits[0]).toEqual(full);
+    ledger.close(position, quote(MINT, WSOL, 1001n, 10_000_000n, 6000),
+      1001n, 10000n, full.reason, 6000, full.id);
+    expect(ledger.state.positions).toEqual([]);
+    expect(ledger.state.trades).toHaveLength(1);
+  });
+  it("preserves the pending slice if a required replacement has an invalid delay", () => {
+    const { ledger, position, governor } = entered();
+    const partial = ledger.queueExit(position, 500n, "PARTIAL_PROFIT", 3000, 2000)!;
+    governor.kill();
+    expect(() => ledger.queueRequiredExit(position, 4000, 1)).toThrow("MINIMUM_EXECUTION_DELAY");
+    expect(ledger.state.pendingExits).toEqual([partial]);
+  });
   it("counts a profitable partial plus a larger losing final exit as one losing completed position", () => {
     const { ledger, position } = entered();
     const originalId = position.id;

@@ -63,6 +63,71 @@ describe('historical exact-size quote replay',()=>{
    expect(report.equity).toEqual([{at:0,equityLamports:'10000'},{at:100,equityLamports:null}]);
    expect(report.metrics.unknownEquityObservations).toBe(1);expect(report.unfilledOrders[0].action).toBe('exit');
  });
+ it('records stale other inventory at a rejected fill without same-row re-entry or duplicate history',()=>{
+   // Synthetic quotes only: A becomes stale while B waits for its delayed fill.
+   const rows=[row('a-signal',0,'A'),{...row('a-fill',100,'A'),buy:quote(100,'100','10'),sell:quote(100,'10','100')},row('b-signal',150,'B'),{...row('b-rejected',300,'B'),buy:quote(300,'100','10')},{...row('a-refresh',400,'A'),sell:quote(400,'10','100')}];
+   const evaluated:string[]=[],guardHistories:string[][]=[];
+   let finalHistory:string[]=[];
+   const report=replay(rows,c=>{
+     evaluated.push(c.current.id);
+     finalHistory=c.history.map(r=>r.id);
+     // Calling this again on b-rejected would incorrectly queue a new B entry.
+     return c.current.id==='a-signal'||c.current.mint==='B'?{action:'enter',amountLamports:'100',reasons:['SYNTHETIC_SIGNAL']}:{action:'hold',reasons:[]};
+   },{...opts,maxQuoteAgeMs:100,fillGuard:c=>{
+     guardHistories.push(c.history.map(r=>r.id));
+     return {allowed:c.current.mint!=='B',reasons:['SYNTHETIC_FILL_VETO']};
+   }});
+   expect(report.equity.map(p=>p.at)).toEqual(rows.map(r=>r.at));
+   expect(report.equity.find(p=>p.at===300)?.equityLamports).toBeNull();
+   expect(report.metrics.unknownEquityObservations).toBe(1);
+   expect(report.cashLamports).toBe('9890');
+   expect(report.unresolvedPositions.map(p=>p.mint)).toEqual(['A']);
+   expect(report.unfilledOrders).toEqual([]);
+   expect(report.decisions.filter(d=>d.at===300)).toEqual([{at:300,mint:'B',action:'reject',reasons:['SYNTHETIC_FILL_VETO']}]);
+   expect(evaluated).not.toContain('b-rejected');
+   expect(guardHistories.at(-1)).toEqual(rows.slice(0,4).map(r=>r.id));
+   expect(finalHistory).toEqual(rows.map(r=>r.id));
+ });
+ it('does not queue a replacement entry on the same observation after an insufficient-cash fill rejection',()=>{
+   const rows=[row('signal',0),{...row('unfunded-entry',100),buy:quote(100,'100','10')}];
+   const evaluated:string[]=[];
+   const report=replay(rows,c=>{
+     evaluated.push(c.current.id);
+     return {action:'enter',amountLamports:'100',reasons:['SYNTHETIC_SIGNAL']};
+   },{...opts,initialCapitalLamports:'100'});
+   // The 100 input plus 10 network fee cannot be paid from 100 cash.
+   expect(report.decisions.filter(d=>d.at===100)).toEqual([{at:100,mint:'M',action:'reject',reasons:['INSUFFICIENT_CASH_AT_FILL']}]);
+   expect(evaluated).toEqual(['signal']);
+   expect(report.unfilledOrders).toEqual([]);
+   expect(report.unresolvedPositions).toEqual([]);
+   expect(report.trades).toEqual([]);
+   expect(report.cashLamports).toBe('100');
+   expect(report.equity).toEqual([{at:0,equityLamports:'100'},{at:100,equityLamports:'100'}]);
+ });
+ it('records history and unknown equity at an unfunded exit while retaining the original pending exit',()=>{
+   const freeQuote=(at:number,input:string,output:string)=>({...quote(at,input,output),networkFeeLamports:'0'});
+   const rows=[row('a-signal',0,'A'),{...row('a-fill',100,'A'),buy:freeQuote(100,'100','10'),sell:freeQuote(100,'10','100')},row('b-signal',150,'B'),{...row('b-fill',250,'B'),buy:freeQuote(250,'100','10'),sell:freeQuote(250,'10','100')},{...row('b-unfunded-exit',450,'B'),sell:{...freeQuote(450,'10','1'),networkFeeLamports:'802'}},row('later-observation',500,'C')];
+   const evaluated:string[]=[];
+   let finalHistory:string[]=[];
+   const report=replay(rows,c=>{
+     evaluated.push(c.current.id);
+     finalHistory=c.history.map(r=>r.id);
+     if(c.current.id==='a-signal'||c.current.id==='b-signal')return {action:'enter',amountLamports:'100',reasons:['SYNTHETIC_SIGNAL']};
+     if(c.current.id==='b-fill')return {action:'exit',reasons:['SYNTHETIC_PROTECTIVE_EXIT']};
+     return {action:'hold',reasons:[]};
+   },{...opts,initialCapitalLamports:'1000',maxQuoteAgeMs:200});
+   // Cash 800 + proceeds 1 cannot pay fee 802. A's last mark is also stale.
+   expect(report.equity.map(p=>p.at)).toEqual(rows.map(r=>r.at));
+   expect(report.equity.find(p=>p.at===450)?.equityLamports).toBeNull();
+   expect(report.metrics.unknownEquityObservations).toBe(2);
+   expect(report.cashLamports).toBe('800');
+   expect(report.trades).toEqual([]);
+   expect(report.unresolvedPositions.map(p=>p.mint)).toEqual(['A','B']);
+   expect(report.unfilledOrders).toEqual([{mint:'B',action:'exit',decisionAt:250,amountRaw:'10'}]);
+   expect(report.decisions.filter(d=>d.at===450)).toEqual([{at:450,mint:'B',action:'reject',reasons:['EXIT_NETWORK_FEE_UNFUNDED']}]);
+   expect(evaluated).not.toContain('b-unfunded-exit');
+   expect(finalHistory).toEqual(rows.map(r=>r.id));
+ });
  it('requires provenance before identifying input as recorded chain data',()=>{
    expect(()=>replay([row('a',0)],()=>({action:'hold',reasons:[]}),{...opts,fixtureKind:'recorded-chain'})).toThrow('provenance');
  });

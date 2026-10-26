@@ -36,6 +36,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run research:forward:test
+      - run: npm run research:custody:test
       - run: npm run typecheck
       - run: npm run build
       - run: python3 -m unittest discover -s research -p 'test_*.py'

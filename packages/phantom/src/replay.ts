@@ -113,31 +113,49 @@ export function replay(observations: readonly ReplayObservation[], evaluate: (ct
   const context=(row:ReplayObservation,prefix:Readonly<ReplayObservation>[]):ReplayContext=>freeze({now:row.at,current:row,history:Object.freeze([...prefix]),position:positions.has(row.mint)?structuredClone(positions.get(row.mint)!):null,cashLamports:cash.toString(),portfolio:{positions:structuredClone([...positions.values()]),trades:structuredClone(trades),initialCapitalLamports:opts.initialCapitalLamports,equityLamports:observedEquityAt(row.at)?.toString()??null,peakEquityLamports:observedPeak.toString()}});
   for (const row of rows) {
     lastRows.set(row.mint,row);
+    let settlementRejected=false;
     const order = pending.get(row.mint);
     if (order && row.at >= order.at + opts.minimumLatencyMs) {
       if (order.action === 'enter' && !positions.has(row.mint) && validQuote(row.buy,row.at,order.amount,opts,order.at+opts.minimumLatencyMs)) {
-        if(opts.fillGuard){const verdict=opts.fillGuard(context(row,[...history,row]),{amountLamports:order.amount.toString(),decisionAt:order.at});if(!verdict.allowed){decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:[...verdict.reasons]});pending.delete(row.mint);history.push(row);continue;}}
-        const fee=natural(row.buy.networkFeeLamports), total=order.amount+fee;
-        if (cash >= total) {
-          positions.set(row.mint,{id:`${opts.strategy}:${row.id}`,mint:row.mint,strategy:opts.strategy,regime:row.regime,quantityRaw:row.buy.outputRaw,costLamports:order.amount.toString(),entryFeeLamports:fee.toString(),openedAt:row.at,decisionAt:order.at});
-          cash-=total;
+        const verdict=opts.fillGuard?.(context(row,[...history,row]),{amountLamports:order.amount.toString(),decisionAt:order.at});
+        if(verdict&&!verdict.allowed){
+          decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:[...verdict.reasons]});
           pending.delete(row.mint);
-        } else { decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['INSUFFICIENT_CASH_AT_FILL']});pending.delete(row.mint); }
+          settlementRejected=true;
+        } else {
+          const fee=natural(row.buy.networkFeeLamports), total=order.amount+fee;
+          if (cash >= total) {
+            positions.set(row.mint,{id:`${opts.strategy}:${row.id}`,mint:row.mint,strategy:opts.strategy,regime:row.regime,quantityRaw:row.buy.outputRaw,costLamports:order.amount.toString(),entryFeeLamports:fee.toString(),openedAt:row.at,decisionAt:order.at});
+            cash-=total;
+            pending.delete(row.mint);
+          } else {
+            decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['INSUFFICIENT_CASH_AT_FILL']});
+            pending.delete(row.mint);
+            settlementRejected=true;
+          }
+        }
       } else if (order.action === 'exit') {
         const p=positions.get(row.mint);
         if (p && validQuote(row.sell,row.at,natural(p.quantityRaw),opts,order.at+opts.minimumLatencyMs)) {
           const proceeds=natural(row.sell.outputRaw), exitFee=natural(row.sell.networkFeeLamports);
-          if (cash + proceeds < exitFee) {decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['EXIT_NETWORK_FEE_UNFUNDED']});continue;}
-          cash+=proceeds-exitFee;
-          const fees=natural(p.entryFeeLamports)+exitFee;
-          trades.push({...p,closedAt:row.at,proceedsLamports:proceeds.toString(),feesLamports:fees.toString(),pnlLamports:(proceeds-natural(p.costLamports)-fees).toString(),entryLatencyMs:p.openedAt-p.decisionAt,exitLatencyMs:row.at-order.at,exitReason:order.reasons.join('; ')});
-          positions.delete(row.mint);pending.delete(row.mint);
+          if (cash + proceeds < exitFee) {
+            decisions.push({at:row.at,mint:row.mint,action:'reject',reasons:['EXIT_NETWORK_FEE_UNFUNDED']});
+            settlementRejected=true;
+          } else {
+            cash+=proceeds-exitFee;
+            const fees=natural(p.entryFeeLamports)+exitFee;
+            trades.push({...p,closedAt:row.at,proceedsLamports:proceeds.toString(),feesLamports:fees.toString(),pnlLamports:(proceeds-natural(p.costLamports)-fees).toString(),entryLatencyMs:p.openedAt-p.decisionAt,exitLatencyMs:row.at-order.at,exitReason:order.reasons.join('; ')});
+            positions.delete(row.mint);pending.delete(row.mint);
+          }
         }
       }
     }
     history.push(row);
     const observedEquity=observedEquityAt(row.at);
     equityHistory.push({at:row.at,equityLamports:observedEquity?.toString()??null});
+    // Rejected settlements still contribute one history/equity observation, but
+    // cannot trigger a replacement order from the same observation.
+    if(settlementRejected)continue;
     const decision=evaluate(context(row,history));
     if (!decision || !['enter','exit','hold','reject'].includes(decision.action) || !Array.isArray(decision.reasons)) throw new Error('Invalid replay strategy decision');
     decisions.push({at:row.at,mint:row.mint,action:decision.action,reasons:[...decision.reasons]});

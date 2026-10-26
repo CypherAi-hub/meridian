@@ -797,6 +797,19 @@ export class Engine {
     await this.persistLedger();
   }
   private async managePositions() {
+    let requiredIntentAdded = false;
+    // Persist every price-independent intent before the first provider await.
+    // One slow position must not postpone another position's delay clock.
+    for (const position of this.ledger.state.positions) {
+      const previous = this.ledger.state.pendingExits.find((exit) => exit.positionId === position.id);
+      const required = this.ledger.queueRequiredExit(
+        position,
+        Date.now(),
+        Number(process.env.PHANTOM_MIN_DELAY_MS ?? 2000),
+      );
+      if (required && required !== previous) requiredIntentAdded = true;
+    }
+    if (requiredIntentAdded) await this.persistLedger();
     const readyExits = new Set(
       this.ledger.state.pendingExits
         .filter((exit) => exit.readyAt <= Date.now())
@@ -858,6 +871,10 @@ export class Engine {
         p.markLamports = null;
         p.markAt = null;
         this.ledger.state.failures++;
+        this.ledger.recordEquity(Date.now());
+        // Unknown valuation is economic state. Checkpoint it before audit
+        // logging, which can fail independently and interrupt the tick.
+        await this.persistLedger();
         await this.decision({
           at: Date.now(),
           mint: p.mint,

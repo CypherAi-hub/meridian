@@ -294,21 +294,68 @@ export class PaperLedger {
     maxAgeMs = this.policy.maxQuoteAgeMs,
   ) {
     this.assertPosition(position);
-    this.validateFee(fee);
-    const { min } = this.validateQuote(
-      quote,
-      position.mint,
-      WSOL,
-      position.quantityRaw,
-      now,
-      this.governor.limits.maxSlippageBps,
-      Math.min(maxAgeMs, this.policy.maxQuoteAgeMs),
-    );
-    position.markLamports = min > fee ? min - fee : 0n;
-    position.markAt = quote.observedAt;
-    if (position.markLamports > position.peakLamports)
-      position.peakLamports = position.markLamports;
-    this.recordEquity(now);
+    timestamp(now);
+    try {
+      this.validateFee(fee);
+      const { min } = this.validateQuote(
+        quote,
+        position.mint,
+        WSOL,
+        position.quantityRaw,
+        now,
+        this.governor.limits.maxSlippageBps,
+        Math.min(maxAgeMs, this.policy.maxQuoteAgeMs),
+      );
+      const authorization = this.governor.authorizeExit({
+        orderId: `mark:${position.id}:${now}`,
+        mint: position.mint,
+        quantityRaw: position.quantityRaw,
+        positionQuantityRaw: position.quantityRaw,
+        feeLamports: fee,
+        quoteObservedAt: quote.observedAt,
+        slippageBps: this.governor.limits.maxSlippageBps,
+        impactBps: quote.impactBps,
+      }, now);
+      if (!authorization.allowed)
+        throw Error("PAPER_MARK_RISK_VETO:" + authorization.reasons.join(","));
+      position.markLamports = min > fee ? min - fee : 0n;
+      position.markAt = quote.observedAt;
+      if (position.markLamports > position.peakLamports)
+        position.peakLamports = position.markLamports;
+      this.recordEquity(now);
+    } catch (error) {
+      // An inadmissible replacement is unavailable valuation evidence, even if
+      // a previous mark has not yet aged out. Never turn it into a new peak.
+      position.markLamports = null;
+      position.markAt = null;
+      this.recordEquity(now);
+      throw error;
+    }
+  }
+  /** Emergency and time-limit intent does not depend on an observable price. */
+  requiredExitReason(p: PaperPosition, now: number) {
+    this.assertPosition(p);
+    timestamp(now);
+    if (this.state.killSwitch || this.governor.isKilled())
+      return { reason: "EMERGENCY_SHUTDOWN", bps: 10000 };
+    if (now - p.openedAt >= 300000) return { reason: "MAX_HOLD", bps: 10000 };
+    return null;
+  }
+  /** A pending profit slice cannot suppress a required full liquidation. A
+   * replacement is a new decision and must observe its own complete delay. */
+  queueRequiredExit(p: PaperPosition, now: number, delayMs: number): PendingExit | null {
+    const required = this.requiredExitReason(p, now);
+    if (!required) return null;
+    const existing = this.state.pendingExits.find((exit) => exit.positionId === p.id);
+    if (existing?.quantityRaw === p.quantityRaw) return existing;
+    const previous = this.state.pendingExits;
+    this.state.pendingExits = previous.filter((exit) => exit.positionId !== p.id);
+    try {
+      return this.queueExit(p, p.quantityRaw, required.reason, now, delayMs);
+    } catch (error) {
+      this.state.pendingExits = previous;
+      throw error;
+    }
   }
   exitReason(
     p: PaperPosition,
@@ -321,6 +368,8 @@ export class PaperLedger {
   ) {
     this.assertPosition(p);
     timestamp(now);
+    const required = this.requiredExitReason(p, now);
+    if (required) return required;
     if (
       p.markAt === null ||
       p.markLamports === null ||
@@ -330,9 +379,6 @@ export class PaperLedger {
       return null;
     const mark = p.markLamports,
       basis = p.costLamports + p.entryFeeLamports;
-    if (this.state.killSwitch || this.governor.isKilled())
-      return { reason: "EMERGENCY_SHUTDOWN", bps: 10000 };
-    if (now - p.openedAt >= 300000) return { reason: "MAX_HOLD", bps: 10000 };
     if (mark * 10000n <= basis * 8500n) return { reason: "STOP_LOSS", bps: 10000 };
     if (p.peakLamports > basis && mark * 10000n <= p.peakLamports * 9000n)
       return { reason: "TRAILING_STOP", bps: 10000 };

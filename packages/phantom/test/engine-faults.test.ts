@@ -181,6 +181,99 @@ function enter(ledger: PaperLedger, mint: string, id: string) {
 }
 
 describe("engine economic and audit fault boundaries", () => {
+  it("escalates a pending profit slice before requesting an emergency full-size quote", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(400000);
+    const f = fixture();
+    const position = enter(f.ledger, f.e.mint, "SYNTHETIC-PARTIAL-ESCALATION");
+    const partial = f.ledger.queueExit(position, 500n, "PARTIAL_PROFIT", 397000, 2000)!;
+    process.env.PHANTOM_KILL_SWITCH = "true";
+    const provider = vi.fn(async (input: any) => quote(input.inputMint, WSOL, input.amount, 10_000_000n));
+    f.engine.setQuoteProvider({ quote: provider });
+    await f.engine.tick();
+    expect(provider).not.toHaveBeenCalled();
+    const full = f.ledger.state.pendingExits[0];
+    expect(full).toMatchObject({ quantityRaw: 1000n, reason: "EMERGENCY_SHUTDOWN", readyAt: 402000 });
+    expect(full.id).not.toBe(partial.id);
+    vi.setSystemTime(402000);
+    await f.engine.tick();
+    expect(provider).toHaveBeenCalledWith(expect.objectContaining({ amount: 1000n }));
+    expect(f.ledger.state.positions).toEqual([]);
+    expect(f.ledger.state.trades).toHaveLength(1);
+  });
+  it("checkpoints every emergency intent before a slow earlier exit provider call", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(400000);
+    const f = fixture();
+    const first = enter(f.ledger, f.e.mint, "SYNTHETIC-FIRST-EXIT");
+    const second = enter(f.ledger, "SYNTHETIC-SECOND-MINT", "SYNTHETIC-SECOND-EXIT");
+    f.ledger.queueExit(first, first.quantityRaw, "SYNTHETIC-PRIOR-EXIT", 397000, 2000);
+    process.env.PHANTOM_KILL_SWITCH = "true";
+    let calls = 0;
+    f.engine.setQuoteProvider({ quote: async () => {
+      calls++;
+      const secondIntent = f.rows.get("ledger").pendingExits.find((x: any) => x.positionId === second.id);
+      expect(secondIntent).toMatchObject({ createdAt: 400000, readyAt: 402000, reason: "EMERGENCY_SHUTDOWN" });
+      vi.setSystemTime(410000);
+      throw Error("SYNTHETIC_SLOW_OUTAGE");
+    } });
+    await f.engine.tick();
+    expect(calls).toBe(2);
+    expect(f.ledger.state.pendingExits.find((x) => x.positionId === second.id)?.readyAt).toBe(402000);
+  });
+  it.each(["invalid-impact", "provider-outage"])("checkpoints unknown valuation after %s before a failing decision log", async (failure) => {
+    const f = fixture();
+    const position = enter(f.ledger, f.e.mint, "SYNTHETIC-VALUATION");
+    f.ledger.mark(position, quote(position.mint, WSOL, position.quantityRaw, 11_000_000n), 10000n, Date.now());
+    await f.internal.persistLedger();
+    const priorPeak = f.ledger.state.peakEquityLamports;
+    f.engine.setQuoteProvider({ quote: async () => {
+      if (failure === "provider-outage") throw Error("SYNTHETIC_PROVIDER_OUTAGE");
+      return { ...quote(position.mint, WSOL, position.quantityRaw, 20_000_000n), impactBps: null };
+    } });
+    vi.mocked(f.engine.store.decision).mockRejectedValue(Error("SYNTHETIC_AUDIT_DOWN"));
+    await expect(f.engine.tick()).rejects.toThrow("SYNTHETIC_AUDIT_DOWN");
+    expect(f.rows.get("ledger").positions[0].markLamports).toBeNull();
+    expect(f.rows.get("ledger").positions[0].markAt).toBeNull();
+    expect(f.rows.get("ledger").failures).toBe(1);
+    expect(f.rows.get("ledger").equity.at(-1).equityLamports).toBeNull();
+    expect(f.rows.get("ledger").peakEquityLamports).toBe(priorPeak.toString());
+  });
+  it.each(["emergency", "maximum-hold"])(
+    "persists %s exit intent without a mark and retains its delay across a quote outage",
+    async (kind) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(400000);
+      const f = fixture();
+      const position = enter(f.ledger, f.e.mint, "SYNTHETIC-PROTECTIVE-ENTRY");
+      if (kind === "emergency") process.env.PHANTOM_KILL_SWITCH = "true";
+      else vi.setSystemTime(700000);
+      const requestedAt = Date.now();
+      const provider = vi.fn(async () => { throw Error("SYNTHETIC_PROVIDER_OUTAGE"); });
+      f.engine.setQuoteProvider({ quote: provider });
+      await f.engine.tick();
+      expect(provider).not.toHaveBeenCalled();
+      const intent = f.ledger.state.pendingExits[0];
+      expect(intent).toMatchObject({
+        positionId: position.id, quantityRaw: position.quantityRaw,
+        reason: kind === "emergency" ? "EMERGENCY_SHUTDOWN" : "MAX_HOLD",
+        createdAt: requestedAt, readyAt: requestedAt + 2000,
+      });
+      expect(f.rows.get("ledger").pendingExits[0].id).toBe(intent.id);
+      vi.setSystemTime(requestedAt + 2000);
+      await f.engine.tick();
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(f.ledger.state.pendingExits[0]).toEqual(intent);
+      expect(f.rows.get("ledger").pendingExits[0].readyAt).toBe(requestedAt + 2000);
+      f.engine.setQuoteProvider({ quote: async input => quote(input.inputMint, WSOL, input.amount, 10_000_000n) });
+      vi.setSystemTime(requestedAt + 2001);
+      await f.engine.tick();
+      expect(f.ledger.state.positions).toHaveLength(0);
+      expect(f.ledger.state.pendingExits).toHaveLength(0);
+      expect(f.ledger.state.trades[0].exitOrderId).toBe(intent.id);
+      expect(f.ledger.state.trades[0].closedAt).toBe(requestedAt + 2001);
+    },
+  );
   it("durably settles ready exits before marks or any new entry quote", async () => {
     const f = fixture(),
       marked = enter(f.ledger, "SYNTHETIC-MARK-MINT", "SYNTHETIC-MARK"),
