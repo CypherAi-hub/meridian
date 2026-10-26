@@ -40,6 +40,10 @@ Unit/integration tests use observable state or explicitly synthetic fixtures. Ma
 
 ## External dependencies and unresolved gates
 
+The forward quote experiment is integrated into the existing worker and remains separate from orders and positions. Its fixed source-bound 72-hour manifest, 32-second entry delay, 60-second horizon and 150-bps probe cap do not certify a sniper strategy. Same-source restarts retain the original window; old-source history remains read-only. Delivery audit gaps block candidate evaluation. The strict SecurityReader's always-unverified creator associations are an implementation blocker for all paper entries, independent of market costs. A scoped evidence implementation is still required; no safety threshold was changed.
+
+The local Jupiter queue now gives protective exits first priority and applies pacing/backoff, but cannot coordinate an organisation-wide allowance shared with other processes. Ready exits also run before marks and entries in the paper tick. Keep the deployed cohort source frozen while collecting; use a separate checkout for subsequent noncritical changes.
+
 1. Authenticated Helius RPC is now configured on Windows. Yellowstone streaming still needs a real endpoint/token for runtime throughput and replay validation. Full all-program transaction enrichment cannot be assumed complete merely because the typed-event observer is fast.
 2. A dedicated loopback PostgreSQL 18.4 validation server now tests real migrations, exact JSON amounts, deduplication, competing workers, interrupted writes, and terminated advisory-lock backends. Worker SQL is fenced through the actual lock-holding session; lease loss permanently suspends the old worker and engine settlement. CI runs these tests against its own PostgreSQL 18 service. The running research worker still uses its original PGlite warehouse; no data migration or production PostgreSQL deployment is claimed.
 3. Jupiter is now configured and verified on Windows. Pump native-SOL reserve quotes remain a constrained alternative. User-supplied keys are kept out of source, logs, artifacts, and the Mac coordination messages.

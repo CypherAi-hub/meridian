@@ -1,56 +1,118 @@
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
-import { BN } from '@coral-xyz/anchor';
-import { PUMP_SDK, GLOBAL_PDA, PUMP_FEE_CONFIG_PDA, bondingCurvePda, PUMP_PROGRAM_ID, PUMP_FEE_PROGRAM_ID,
-  getBuyV3TokenAmountFromQuoteAmount, getSellSolAmountFromTokenAmount,
-  type Global, type FeeConfig, type BondingCurve } from '@pump-fun/pump-sdk';
-import { PUMP_AMM_SDK, buyQuoteInput, sellBaseInput, type SwapSolanaState } from '@pump-fun/pump-swap-sdk';
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, NATIVE_MINT, getAssociatedTokenAddressSync,
-  unpackMint, unpackAccount, getExtensionTypes, ExtensionType } from '@solana/spl-token';
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile, rename, readdir } from "node:fs/promises";
+import { join } from "node:path";
+import { BN } from "@coral-xyz/anchor";
 import {
-  ComputeBudgetProgram, PublicKey, TransactionMessage, VersionedTransaction,
-  type Connection, type Keypair, type TransactionInstruction,
-} from '@solana/web3.js';
-import bs58 from 'bs58';
+  PUMP_SDK,
+  GLOBAL_PDA,
+  PUMP_FEE_CONFIG_PDA,
+  bondingCurvePda,
+  PUMP_PROGRAM_ID,
+  PUMP_FEE_PROGRAM_ID,
+  getBuyV3TokenAmountFromQuoteAmount,
+  getSellSolAmountFromTokenAmount,
+  type Global,
+  type FeeConfig,
+  type BondingCurve,
+} from "@pump-fun/pump-sdk";
+import {
+  PUMP_AMM_SDK,
+  buyQuoteInput,
+  sellBaseInput,
+  type SwapSolanaState,
+} from "@pump-fun/pump-swap-sdk";
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  NATIVE_MINT,
+  getAssociatedTokenAddressSync,
+  unpackMint,
+  unpackAccount,
+  getExtensionTypes,
+  ExtensionType,
+} from "@solana/spl-token";
+import {
+  ComputeBudgetProgram,
+  PublicKey,
+  TransactionMessage,
+  VersionedTransaction,
+  type Connection,
+  type Keypair,
+  type TransactionInstruction,
+} from "@solana/web3.js";
+import bs58 from "bs58";
+import { JupiterQuoteLane, type QuotePriority } from "./jupiter-quote-lane.ts";
+export type { QuotePriority } from "./jupiter-quote-lane.ts";
 
 export type Quote = {
-  inputMint: string; outputMint: string; inAmount: string; outAmount: string;
-  minOutAmount: string; impactBps: number | null; observedAt: number;
-  contextSlot: number | null; route: string[]; requestId?: string;
+  inputMint: string;
+  outputMint: string;
+  inAmount: string;
+  outAmount: string;
+  minOutAmount: string;
+  impactBps: number | null;
+  observedAt: number;
+  /** Actual provider request start, when captured; never the queue admission time. */
+  requestedAt?: number;
+  contextSlot: number | null;
+  route: string[];
+  requestId?: string;
   /** Jupiter's platform fee is already embedded in the quote; do not subtract it twice. */
-  feeBps?: number; feeMint?: string;
-  source?: 'JUPITER' | 'PUMP_ONCHAIN' | 'PUMPSWAP_ONCHAIN';
+  feeBps?: number;
+  feeMint?: string;
+  source?: "JUPITER" | "PUMP_ONCHAIN" | "PUMPSWAP_ONCHAIN";
   /** Actual accessible quote reserves, never virtual reserves, when available. */
   liquidityLamports?: string;
 };
 
 export const EXTERNAL_INTEGRATIONS = {
-  jupiter: { version: 'Swap V2', endpoint: 'https://api.jup.ag/swap/v2/order', mode: 'QUOTE_ONLY',
-    docs: 'https://developers.jup.ag/docs/api-reference/swap/order' },
-  pump: { sdk: '@pump-fun/pump-sdk@4.3.1', program: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-    supported: ['buy_exact_quote_in_v3', 'sell_v3'], limitation: 'Unsigned builders only; cashback and unverified state rejected.' },
-  pumpSwap: { sdk: '@pump-fun/pump-swap-sdk@2.2.0', program: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
-    supported: ['buy_exact_quote_in_v2', 'sell_v2'], limitation: 'Requires verified on-chain SwapSolanaState.' },
-  live: { status: 'NOT_ENABLED_BY_CLI', limitation: 'Guarded signing/submission primitive exists; unattended live operation is not certified.' },
+  jupiter: {
+    version: "Swap V2",
+    endpoint: "https://api.jup.ag/swap/v2/order",
+    mode: "QUOTE_ONLY",
+    docs: "https://developers.jup.ag/docs/api-reference/swap/order",
+  },
+  pump: {
+    sdk: "@pump-fun/pump-sdk@4.3.1",
+    program: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    supported: ["buy_exact_quote_in_v3", "sell_v3"],
+    limitation: "Unsigned builders only; cashback and unverified state rejected.",
+  },
+  pumpSwap: {
+    sdk: "@pump-fun/pump-swap-sdk@2.2.0",
+    program: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+    supported: ["buy_exact_quote_in_v2", "sell_v2"],
+    limitation: "Requires verified on-chain SwapSolanaState.",
+  },
+  live: {
+    status: "NOT_ENABLED_BY_CLI",
+    limitation:
+      "Guarded signing/submission primitive exists; unattended live operation is not certified.",
+  },
 } as const;
 
 export function rawAmount(value: unknown, allowZero = false): bigint {
-  if (typeof value !== 'string' && typeof value !== 'bigint') throw new Error('AMOUNT_MUST_BE_INTEGER_STRING_OR_BIGINT');
+  if (typeof value !== "string" && typeof value !== "bigint")
+    throw new Error("AMOUNT_MUST_BE_INTEGER_STRING_OR_BIGINT");
   const text = String(value);
-  if (!/^(0|[1-9][0-9]*)$/.test(text)) throw new Error('INVALID_UNSIGNED_INTEGER');
+  if (!/^(0|[1-9][0-9]*)$/.test(text)) throw new Error("INVALID_UNSIGNED_INTEGER");
   const result = BigInt(text);
-  if ((!allowZero && result === 0n) || result > 18_446_744_073_709_551_615n) throw new Error('AMOUNT_OUTSIDE_U64');
+  if ((!allowZero && result === 0n) || result > 18_446_744_073_709_551_615n)
+    throw new Error("AMOUNT_OUTSIDE_U64");
   return result;
 }
 
 function bps(value: number, maximum = 10_000) {
-  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) throw new Error('INVALID_BASIS_POINTS');
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum)
+    throw new Error("INVALID_BASIS_POINTS");
   return value;
 }
-function address(value: string) { return new PublicKey(value).toBase58(); }
+function address(value: string) {
+  return new PublicKey(value).toBase58();
+}
 function record(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('MALFORMED_PROVIDER_RESPONSE');
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("MALFORMED_PROVIDER_RESPONSE");
   return value as Record<string, unknown>;
 }
 
@@ -60,58 +122,156 @@ export class JupiterQuoteClient {
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
   private readonly clock: () => number;
-  constructor(options: { apiKey?: string; fetch?: typeof fetch; timeoutMs?: number; now?: () => number } = {}) {
+  private readonly lane: JupiterQuoteLane;
+  constructor(
+    options: {
+      apiKey?: string;
+      fetch?: typeof fetch;
+      timeoutMs?: number;
+      now?: () => number;
+      minimumIntervalMs?: number;
+      maxPending?: number;
+      lane?: JupiterQuoteLane;
+    } = {},
+  ) {
     this.apiKey = options.apiKey ?? process.env.JUPITER_API_KEY;
     this.fetcher = options.fetch ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 6_000;
     this.clock = options.now ?? Date.now;
-    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1) throw new Error('INVALID_TIMEOUT');
-  }
-  async quote(input: { inputMint: string; outputMint: string; amount: bigint; slippageBps?: number }): Promise<Quote> {
-    if (!this.apiKey) throw new Error('JUPITER_API_KEY_REQUIRED');
-    const inputMint = address(input.inputMint), outputMint = address(input.outputMint);
-    if (inputMint === outputMint) throw new Error('SAME_INPUT_OUTPUT_MINT');
-    const amount = rawAmount(input.amount), slippage = bps(input.slippageBps ?? 100);
-    const params = new URLSearchParams({ inputMint, outputMint, amount: amount.toString(), slippageBps: String(slippage),
-      swapMode: 'ExactIn', maxSupportedTransactionVersion: '0' });
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const response = await this.fetcher(`${EXTERNAL_INTEGRATIONS.jupiter.endpoint}?${params}`, {
-        headers: { 'x-api-key': this.apiKey, accept: 'application/json' }, signal: controller.signal,
+    if (
+      !Number.isSafeInteger(this.timeoutMs) ||
+      this.timeoutMs < 1 ||
+      this.timeoutMs > 2_147_483_647
+    )
+      throw new Error("INVALID_TIMEOUT");
+    // Quote timestamps can be injected independently in contract tests. The local
+    // pacing lane uses its own wall clock and cannot govern another API consumer.
+    this.lane =
+      options.lane ??
+      new JupiterQuoteLane({
+        minimumIntervalMs: options.minimumIntervalMs,
+        maxPending: options.maxPending,
       });
-      if (!response.ok) throw new Error(`JUPITER_HTTP_${response.status}`);
-      const data = record(await response.json());
-      if (data.error || data.errorCode) throw new Error('JUPITER_QUOTE_UNAVAILABLE');
-      if (data.inputMint !== inputMint || data.outputMint !== outputMint || rawAmount(data.inAmount) !== amount) {
-        throw new Error('JUPITER_QUOTE_REQUEST_MISMATCH');
+  }
+  async quote(input: {
+    inputMint: string;
+    outputMint: string;
+    amount: bigint;
+    slippageBps?: number;
+    priority?: QuotePriority;
+  }): Promise<Quote> {
+    if (!this.apiKey) throw new Error("JUPITER_API_KEY_REQUIRED");
+    const inputMint = address(input.inputMint),
+      outputMint = address(input.outputMint);
+    if (inputMint === outputMint) throw new Error("SAME_INPUT_OUTPUT_MINT");
+    const amount = rawAmount(input.amount),
+      slippage = bps(input.slippageBps ?? 100);
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount: amount.toString(),
+      slippageBps: String(slippage),
+      swapMode: "ExactIn",
+      maxSupportedTransactionVersion: "0",
+    });
+    return this.lane.schedule(input.priority ?? "analysis", this.timeoutMs, async (signal) => {
+      try {
+        const requestedAt = this.clock();
+        if (!Number.isSafeInteger(requestedAt) || requestedAt < 0)
+          throw Error("JUPITER_QUOTE_CLOCK_INVALID");
+        const response = await this.fetcher(`${EXTERNAL_INTEGRATIONS.jupiter.endpoint}?${params}`, {
+          headers: {
+            "x-api-key": this.apiKey!,
+            accept: "application/json",
+          },
+          signal,
+        });
+        this.lane.observeResponse(response.status, response.headers);
+        if (!response.ok) {
+          try {
+            await response.body?.cancel();
+          } catch {
+            /* Do not expose provider response bodies. */
+          }
+          throw new Error(`JUPITER_HTTP_${response.status}`);
+        }
+        if (signal.aborted) throw Error("JUPITER_QUOTE_TIMEOUT");
+        const data = record(await response.json());
+        if (signal.aborted) throw Error("JUPITER_QUOTE_TIMEOUT");
+        const observedAt = this.clock();
+        if (!Number.isSafeInteger(observedAt) || observedAt < requestedAt)
+          throw Error("JUPITER_QUOTE_CLOCK_INVALID");
+        if (data.error || data.errorCode) throw new Error("JUPITER_QUOTE_UNAVAILABLE");
+        if (
+          data.inputMint !== inputMint ||
+          data.outputMint !== outputMint ||
+          rawAmount(data.inAmount) !== amount
+        ) {
+          throw new Error("JUPITER_QUOTE_REQUEST_MISMATCH");
+        }
+        const out = rawAmount(data.outAmount);
+        // The provider threshold must be at least our configured minimum. A missing threshold
+        // is not evidence of a route executable within the slippage cap.
+        const minimum = rawAmount(data.otherAmountThreshold);
+        const configuredMinimum = (out * BigInt(10_000 - slippage)) / 10_000n;
+        if (minimum > out || minimum < configuredMinimum)
+          throw new Error("JUPITER_SLIPPAGE_CAP_VIOLATION");
+        // Current V2 docs: priceImpact is percentage points (-0.1 means -0.1%).
+        // priceImpactPct is deprecated and deliberately not used as a fallback.
+        const impact =
+          typeof data.priceImpact === "number" && Number.isFinite(data.priceImpact)
+            ? Math.ceil(Math.abs(data.priceImpact) * 100)
+            : null;
+        const route = Array.isArray(data.routePlan)
+          ? data.routePlan.flatMap((leg) => {
+              const swap = record(record(leg).swapInfo);
+              return typeof swap.label === "string" ? [swap.label] : [];
+            })
+          : [];
+        if (!route.length && typeof data.router === "string") route.push(data.router);
+        if (!route.length) throw new Error("JUPITER_ROUTE_MISSING");
+        return {
+          inputMint,
+          outputMint,
+          inAmount: amount.toString(),
+          outAmount: out.toString(),
+          minOutAmount: minimum.toString(),
+          source: "JUPITER",
+          impactBps: impact,
+          requestedAt,
+          observedAt,
+          contextSlot: null,
+          route,
+          ...(typeof data.requestId === "string" ? { requestId: data.requestId } : {}),
+          ...(typeof data.feeBps === "number" && Number.isFinite(data.feeBps)
+            ? { feeBps: data.feeBps }
+            : {}),
+          ...(typeof data.feeMint === "string" ? { feeMint: data.feeMint } : {}),
+        };
+      } catch (error) {
+        if (signal.aborted) throw new Error("JUPITER_QUOTE_TIMEOUT");
+        // Only fixed local validation codes escape this boundary. Transport/JSON
+        // errors may contain URLs, response bodies or keys and must stay private.
+        const safeCodes = new Set([
+          "AMOUNT_MUST_BE_INTEGER_STRING_OR_BIGINT",
+          "INVALID_UNSIGNED_INTEGER",
+          "AMOUNT_OUTSIDE_U64",
+          "MALFORMED_PROVIDER_RESPONSE",
+          "JUPITER_QUOTE_UNAVAILABLE",
+          "JUPITER_QUOTE_REQUEST_MISMATCH",
+          "JUPITER_SLIPPAGE_CAP_VIOLATION",
+          "JUPITER_ROUTE_MISSING",
+          "JUPITER_QUOTE_TIMEOUT",
+          "JUPITER_QUOTE_CLOCK_INVALID",
+        ]);
+        if (
+          error instanceof Error &&
+          (safeCodes.has(error.message) || /^JUPITER_HTTP_\d{1,3}$/.test(error.message))
+        )
+          throw Error(error.message);
+        throw Error("JUPITER_QUOTE_PROVIDER_UNAVAILABLE");
       }
-      const out = rawAmount(data.outAmount);
-      // The provider threshold must be at least our configured minimum. A missing threshold
-      // is not evidence of a route executable within the slippage cap.
-      const minimum = rawAmount(data.otherAmountThreshold);
-      const configuredMinimum = out * BigInt(10_000 - slippage) / 10_000n;
-      if (minimum > out || minimum < configuredMinimum) throw new Error('JUPITER_SLIPPAGE_CAP_VIOLATION');
-      // Current V2 docs: priceImpact is percentage points (-0.1 means -0.1%).
-      // priceImpactPct is deprecated and deliberately not used as a fallback.
-      const impact = typeof data.priceImpact === 'number' && Number.isFinite(data.priceImpact)
-        ? Math.ceil(Math.abs(data.priceImpact) * 100) : null;
-      const route = Array.isArray(data.routePlan) ? data.routePlan.flatMap((leg) => {
-        const swap = record(record(leg).swapInfo);
-        return typeof swap.label === 'string' ? [swap.label] : [];
-      }) : [];
-      if (!route.length && typeof data.router === 'string') route.push(data.router);
-      if (!route.length) throw new Error('JUPITER_ROUTE_MISSING');
-      return { inputMint, outputMint, inAmount: amount.toString(), outAmount: out.toString(), minOutAmount: minimum.toString(), source: 'JUPITER',
-        impactBps: impact, observedAt: this.clock(), contextSlot: null, route,
-        ...(typeof data.requestId === 'string' ? { requestId: data.requestId } : {}),
-        ...(typeof data.feeBps === 'number' && Number.isFinite(data.feeBps) ? { feeBps: data.feeBps } : {}),
-        ...(typeof data.feeMint === 'string' ? { feeMint: data.feeMint } : {}),
-      };
-    } catch (error) {
-      if (controller.signal.aborted) throw new Error('JUPITER_QUOTE_TIMEOUT');
-      throw error;
-    } finally { clearTimeout(timer); }
+    });
   }
 }
 
