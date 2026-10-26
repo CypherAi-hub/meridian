@@ -1,8 +1,12 @@
-# Meridian
+# Omni
 
-Editorial paper-only research desk for Solana meme-coin tape.
+Solana market terminal with real pool charts, contract search, manual paper orders, and automated paper research. Formerly Meridian.
 
-Real data. Paper fills only. No wallet. No live broadcast. No autonomous trading. No ML yet.
+Real market data. Simulated fills only. The three automated paper experiments and the manual account keep separate balances and histories. Wallet signing and funded execution remain locked. No trained model or profitability is claimed.
+
+Double-click `Run-Omni.cmd` on Windows after installing Node.js 22+ and Docker Desktop. Open `http://localhost:8080`. See [the Omni terminal guide](docs/OMNI-TERMINAL.md) for charts and paper orders and [Windows setup](docs/WINDOWS-SELFHOST.md) for the persistent local database.
+
+The repository name, database, Docker project, environment variables, and older launcher filenames retain Meridian identifiers so existing installations keep their data. There is no need to rename a working installation or reset its warehouse.
 
 V3.3A.2 manufactures new training-grade experience going forward. Historical sparse rows stay historical. Collection epochs isolate preview/legacy from production.
 

@@ -18,6 +18,7 @@ import { Route as ApiQuoteRouteImport } from './routes/api/quote'
 import { Route as ApiResearchRouteImport } from './routes/api/research'
 import { Route as ApiSniperRouteImport } from './routes/api/sniper'
 import { Route as ApiTapeRouteImport } from './routes/api/tape'
+import { Route as ApiTerminalRouteImport } from './routes/api/terminal'
 import { Route as ApiTickRouteImport } from './routes/api/tick'
 import { Route as ApiHealthLiveRouteImport } from './routes/api/health.live'
 import { Route as ApiHealthMigrationsRouteImport } from './routes/api/health.migrations'
@@ -69,6 +70,11 @@ const ApiTapeRoute = ApiTapeRouteImport.update({
   path: '/api/tape',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiTerminalRoute = ApiTerminalRouteImport.update({
+  id: '/api/terminal',
+  path: '/api/terminal',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiTickRoute = ApiTickRouteImport.update({
   id: '/api/tick',
   path: '/api/tick',
@@ -105,6 +111,7 @@ export interface FileRoutesByFullPath {
   '/api/research': typeof ApiResearchRoute
   '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
+  '/api/terminal': typeof ApiTerminalRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
   '/api/health/migrations': typeof ApiHealthMigrationsRoute
@@ -121,6 +128,7 @@ export interface FileRoutesByTo {
   '/api/research': typeof ApiResearchRoute
   '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
+  '/api/terminal': typeof ApiTerminalRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
   '/api/health/migrations': typeof ApiHealthMigrationsRoute
@@ -138,6 +146,7 @@ export interface FileRoutesById {
   '/api/research': typeof ApiResearchRoute
   '/api/sniper': typeof ApiSniperRoute
   '/api/tape': typeof ApiTapeRoute
+  '/api/terminal': typeof ApiTerminalRoute
   '/api/tick': typeof ApiTickRoute
   '/api/health/live': typeof ApiHealthLiveRoute
   '/api/health/migrations': typeof ApiHealthMigrationsRoute
@@ -156,6 +165,7 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/sniper'
     | '/api/tape'
+    | '/api/terminal'
     | '/api/tick'
     | '/api/health/live'
     | '/api/health/migrations'
@@ -172,6 +182,7 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/sniper'
     | '/api/tape'
+    | '/api/terminal'
     | '/api/tick'
     | '/api/health/live'
     | '/api/health/migrations'
@@ -188,6 +199,7 @@ export interface FileRouteTypes {
     | '/api/research'
     | '/api/sniper'
     | '/api/tape'
+    | '/api/terminal'
     | '/api/tick'
     | '/api/health/live'
     | '/api/health/migrations'
@@ -205,6 +217,7 @@ export interface RootRouteChildren {
   ApiResearchRoute: typeof ApiResearchRoute
   ApiSniperRoute: typeof ApiSniperRoute
   ApiTapeRoute: typeof ApiTapeRoute
+  ApiTerminalRoute: typeof ApiTerminalRoute
   ApiTickRoute: typeof ApiTickRoute
 }
 
@@ -273,6 +286,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiTapeRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/terminal': {
+      id: '/api/terminal'
+      path: '/api/terminal'
+      fullPath: '/api/terminal'
+      preLoaderRoute: typeof ApiTerminalRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/tick': {
       id: '/api/tick'
       path: '/api/tick'
@@ -339,6 +359,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiResearchRoute: ApiResearchRoute,
   ApiSniperRoute: ApiSniperRoute,
   ApiTapeRoute: ApiTapeRoute,
+  ApiTerminalRoute: ApiTerminalRoute,
   ApiTickRoute: ApiTickRoute,
 }
 export const routeTree = rootRouteImport

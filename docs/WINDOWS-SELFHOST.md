@@ -1,19 +1,23 @@
-# Run Meridian on your Windows PC
+# Run Omni on your Windows PC
 
-This runs the Meridian web app, PostgreSQL database, and optional research worker on your own computer. Railway, Neon, and Vercel are not required. Collection still uses outside market-data services; missing provider keys mean reduced coverage, and provider limits still apply. No paid provider credentials are bundled.
+This runs the Omni web app, PostgreSQL database, and paper research worker on your own computer. Railway, Neon, and Vercel are not required. Collection still uses outside market-data services; missing provider keys mean reduced coverage, and provider limits still apply. No paid provider credentials are bundled. Omni is the new interface name; existing Meridian database and Docker identifiers are preserved for compatibility.
+
+For an existing installation, keep its folder and `.env.selfhost`, take a backup, copy in the updated source, and run `Run-Omni.cmd`. Do not delete or recreate the warehouse volume. All schema migrations are additive.
 
 ## First run
 
 1. Install Docker Desktop with its WSL 2 Linux-container backend and Node.js 22 or newer. Complete any Windows restart Docker requests, then open Docker Desktop and wait for its engine to be ready.
-2. Extract the Meridian folder somewhere permanent, such as `C:\Meridian`. Open PowerShell in that folder.
-3. Double-click `Start-Meridian.cmd`, or run:
+2. Extract the Omni folder somewhere permanent, such as `C:\Omni`. Open PowerShell in that folder. Existing `C:\Meridian` installations may keep their current location.
+3. Double-click `Run-Omni.cmd` to start the interface and paper worker, or run:
 
 ```powershell
 node scripts/selfhost.mjs init
-node scripts/selfhost.mjs up
+node scripts/selfhost.mjs collect
 ```
 
-The first build downloads dependencies and can take several minutes. Open http://localhost:8080 on the PC. `up` starts the database and interface; it does not start collection on a fresh installation. If a worker was already running, `up` leaves it running; use `pause` to stop collection.
+The first build downloads dependencies and can take several minutes. Open http://localhost:8080 on the PC. `collect` starts the database, interface, and paper order worker. `up` starts just the database and interface on a fresh installation. If a worker was already running, `up` leaves it running; use `pause` to stop collection. Manual paper orders also need the worker; stopping it stops simulated fills.
+
+The Terminal page provides contract/ticker search, real pool candles, a watchlist and a manual paper buy/sell ticket. Automations holds the three separate paper experiments. Settings holds saved future payout preferences. See `docs/OMNI-TERMINAL.md` for details.
 
 The UI and warehouse are separate processes. The database uses a persistent Docker volume. The web app runs a built Node server, not the development preview. Database migrations finish before the interface starts.
 

@@ -173,7 +173,7 @@ export function sniperRejects(
     reasons.push("CONTRACT_AUTHORITY_UNKNOWN_OR_ENABLED");
   return reasons;
 }
-function quoteValid(q: QuoteObs, r: SwapRequest, now: number, notBefore: number, c: SniperConfig) {
+export function quoteValid(q: QuoteObs, r: SwapRequest, now: number, notBefore: number, c: SniperConfig) {
   return (
     q.available &&
     ["QUOTE_ONLY", "ROUTABLE"].includes(q.routeState ?? "") &&

@@ -1,3 +1,4 @@
+import { advanceManualSession, manualWatchMints } from "./manual.server";
 import { advanceSniperSuite, sniperWatchMints } from "./sniper.server";
 import { applyTape } from "./engine";
 import { ingestFastPath, ingestSlowEnrichment, ingestTape } from "./ingest.server";
@@ -82,7 +83,8 @@ export async function runTick(): Promise<DeskSnapshot> {
     await restoreRateBudgets();
     const prev = await loadDesk();
     try {
-      const sniperMints = await sniperWatchMints();
+      await advanceManualSession();
+      const sniperMints = [...new Set([...await manualWatchMints(), ...await sniperWatchMints()])];
       const youngest = prev.tokens.filter(t => t.createdAt != null && Date.now()-t.createdAt < 900_000).sort((a,b)=>(b.createdAt??0)-(a.createdAt??0)).slice(0,3).map(t=>t.address);
       const watch = [...new Set([...sniperMints, ...youngest, ...activeMints(prev)])];
       const held = prev.positions.map((p) => p.tokenAddress);
@@ -213,7 +215,8 @@ export async function runActiveTick(scheduledAt = Date.now()): Promise<DeskSnaps
     const held = prev.positions.map((p) => p.tokenAddress);
     const batch = nextLabelBatch(pendingMints, g.__meridianLabelCursor__ ?? 0);
     g.__meridianLabelCursor__ = batch.cursor;
-    const sniperMints = await sniperWatchMints();
+    await advanceManualSession();
+    const sniperMints = [...new Set([...await manualWatchMints(), ...await sniperWatchMints()])];
     const mints = [...new Set([...sniperMints, ...held, ...batch.mints])];
     if (!mints.length) return prev;
     try {

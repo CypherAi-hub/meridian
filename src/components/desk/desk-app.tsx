@@ -64,7 +64,7 @@ export function DeskApp() {
     <div className="flex min-h-dvh flex-col bg-bg text-fg">
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
-          <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
+          <h1 className="font-sans text-lg font-medium tracking-tight">Omni</h1>
           <p className="hidden text-xs text-muted lg:block">V3.3B · warehouse replay</p>
         </div>
         <Badge variant={desk.worker.db === "neon" ? "up" : "warn"}>
