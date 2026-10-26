@@ -158,6 +158,159 @@ describe("frozen point-in-time strategy adapter", () => {
     expect(report.unresolvedPositions).toHaveLength(0);
     expect(report.decisions.some((d) => d.reasons.includes("MALICIOUS_CONFIGURATION"))).toBe(true);
   });
+  it("rechecks the unchanged 150bps strategy cap when current captured cost rises to 151bps", () => {
+    const later = row("fill", 1100);
+    later.features = { ...later.features, executionCostBps: 151 };
+    const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+    expect(evaluate(ctx(row("decision"))).action).toBe("enter");
+    const report = replay([row("decision"), later], evaluate, {
+      ...opts,
+      fillGuard: evaluate.fillGuard,
+    });
+    expect(report.unresolvedPositions).toEqual([]);
+    expect(report.cashLamports).toBe(opts.initialCapitalLamports);
+    expect(
+      report.decisions.some((d) => d.at === 1100 && d.reasons.includes("COST_BUDGET_EXCEEDED")),
+    ).toBe(true);
+  });
+  it.each([
+    ["9869999", "10000", "10000"],
+    ["9879999", "5000", "25000"],
+  ])(
+    "vetoes legacy rounded150bps using exact paired proceeds %s and captured per-leg fees",
+    (proceeds, buyFee, sellFee) => {
+      const later = row("fill", 1100, proceeds);
+      later.features = { ...later.features, executionCostBps: 150 };
+      later.buy!.networkFeeLamports = buyFee;
+      later.sell!.networkFeeLamports = sellFee;
+      const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+      const report = replay([row("decision"), later], evaluate, {
+        ...opts,
+        fillGuard: evaluate.fillGuard,
+      });
+      expect(report.unresolvedPositions).toEqual([]);
+      expect(report.cashLamports).toBe(opts.initialCapitalLamports);
+      expect(
+        report.decisions.some((d) => d.at === 1100 && d.reasons.includes("COST_BUDGET_EXCEEDED")),
+      ).toBe(true);
+    },
+  );
+  it("permits exact150bps equality with a valid delayed paired quote", () => {
+    const later = row("fill", 1100, "9870000");
+    later.features = { ...later.features, executionCostBps: 150 };
+    const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+    const report = replay([row("decision"), later], evaluate, {
+      ...opts,
+      fillGuard: evaluate.fillGuard,
+    });
+    expect(report.unresolvedPositions).toHaveLength(1);
+    expect(report.unresolvedPositions[0].openedAt).toBe(1100);
+    expect(report.cashLamports).toBe("989990000");
+  });
+  it.each([
+    "missing-sell",
+    "mismatched-input",
+    "pre-buy-sell",
+    "pre-buy-request",
+    "stale-pair",
+    "future-sell",
+    "invalid-fee",
+    "missing-cost-feature",
+  ] as const)("fails closed for %s current cost evidence at delayed fill", (fault) => {
+    const later = row("fill", 1100);
+    if (fault === "missing-sell") delete later.sell;
+    if (fault === "mismatched-input") later.sell!.inputRaw = "999";
+    if (fault === "pre-buy-sell") later.sell!.observedAt = 1099;
+    if (fault === "pre-buy-request") later.sell!.requestedAt = 1099;
+    if (fault === "stale-pair") {
+      later.at = 6100;
+      later.features = features(6100);
+      later.buy!.observedAt = 0;
+      later.sell!.observedAt = 0;
+    }
+    if (fault === "future-sell") later.sell!.observedAt = 1101;
+    if (fault === "invalid-fee") later.sell!.networkFeeLamports = "-1";
+    if (fault === "missing-cost-feature") {
+      const features: Record<string, number | null> = { ...later.features };
+      delete features.executionCostBps;
+      later.features = features;
+    }
+    const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+    const guard = evaluate.fillGuard(ctx(later), { amountLamports: "10000000", decisionAt: 1000 });
+    expect(guard.allowed).toBe(false);
+    expect(guard.reasons).toContain(
+      fault === "missing-cost-feature"
+        ? "FEATURE_UNAVAILABLE:executionCostBps"
+        : "EXACT_SIZE_ROUND_TRIP_COST_UNAVAILABLE",
+    );
+  });
+  it.each([
+    ["launch_sniper", "independentBuyerUnits", 4, "INSUFFICIENT_INDEPENDENT_BUYERS"],
+    ["launch_sniper", "organicScore", null, "FEATURE_UNAVAILABLE:organicScore"],
+    ["launch_sniper", "uniqueBuyerAcceleration", 0, "BUYER_ACCELERATION_REQUIRED"],
+    ["launch_sniper", "verifiedLaunchAgeMs", 120001, "VERIFIED_RECENT_LAUNCH_REQUIRED"],
+    ["momentum_breakout", "liquidityGrowing", 0, "GROWING_LIQUIDITY_REQUIRED"],
+    ["early_reversal", "priceAccelerationBps", 0, "PRICE_RECOVERY_REQUIRED"],
+    [
+      "smart_wallet_confirmation",
+      "smartBuyers",
+      1,
+      "TWO_OUT_OF_SAMPLE_SUCCESSFUL_WALLETS_REQUIRED",
+    ],
+  ] as const)(
+    "rechecks %s signal %s before settling a delayed entry",
+    (strategy, feature, value, reason) => {
+      const later = row("fill", 1100);
+      later.features = { ...later.features, [feature]: value };
+      const evaluate = createReplayStrategy(researchReplayConfiguration(strategy, 0));
+      expect(evaluate(ctx(row("decision"))).action).toBe("enter");
+      const report = replay([row("decision"), later], evaluate, {
+        ...opts,
+        strategy,
+        fillGuard: evaluate.fillGuard,
+      });
+      expect(report.unresolvedPositions).toEqual([]);
+      expect(report.cashLamports).toBe(opts.initialCapitalLamports);
+      expect(report.decisions.some((d) => d.at === 1100 && d.reasons.includes(reason))).toBe(true);
+    },
+  );
+  it("rechecks adaptive validated coverage for the current regime at delayed fill", () => {
+    const config = researchReplayConfiguration("launch_sniper", 0);
+    config.strategy = "adaptive";
+    config.validated = [
+      {
+        id: "synthetic-approved",
+        strategy: "launch_sniper",
+        regime: "trend",
+        validatedAt: 500,
+        trainingEndsAt: 100,
+        validationStartsAt: 200,
+        validationEndsAt: 400,
+        validationTrades: 30,
+        outOfSampleNetLamports: "100",
+        outOfSampleMaxDrawdownBps: 100,
+        configurationHash: replayConfigurationHash({ ...config, strategy: "launch_sniper" }),
+        validationArtifactHash: "a".repeat(64),
+        approved: true,
+      },
+    ];
+    const evaluate = createReplayStrategy(config),
+      later = row("fill", 1100);
+    later.regime = "unvalidated-regime";
+    expect(evaluate(ctx(row("decision"))).action).toBe("enter");
+    const report = replay([row("decision"), later], evaluate, {
+      ...opts,
+      fillGuard: evaluate.fillGuard,
+    });
+    expect(report.unresolvedPositions).toEqual([]);
+    expect(
+      report.decisions.some(
+        (d) =>
+          d.at === 1100 &&
+          d.reasons.includes("NO_PREVALIDATED_CONFIGURATION_FOR_REGIME_STAND_DOWN"),
+      ),
+    ).toBe(true);
+  });
   it("runs entry, quote-valued take profit, delayed exit and exact P&L end to end", () => {
     const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
     const report = replay(

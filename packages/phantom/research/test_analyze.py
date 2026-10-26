@@ -196,6 +196,20 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(report['profitabilityConclusion'], 'UNPROVEN')
         self.assertEqual(state['strategyRules']['maximumCostBps'], 150)
 
+    def test_policy_comparison_does_not_classify_a_rounded150_001bps_sample_as_within150(self):
+        row = baseline()
+        row.update(amountLamports='10000000', modeledNetworkFeesLamports='20000',
+                   conservativeRoundTripCostBps=150, conservativeRoundTripNetLamports='-150001')
+        row['buy'] = quote(WSOL, 'token', 10000000, 100, 1000)
+        row['sell'] = quote('token', WSOL, 100, 9869999, 1000)
+        result = analyze({'strategyRules': {'maximumCostBps': 150}}, [row])['researchQuotes']
+        self.assertEqual(result['conservativeRoundTripCostBpsMedian'], 150)
+        comparison = result['strategyCostPolicyCompatibility']
+        self.assertEqual(comparison['withinBudgetCount'], 0)
+        self.assertEqual(comparison['overBudgetCount'], 1)
+        self.assertAlmostEqual(comparison['maximumExcessBps'], .001)
+        self.assertEqual(comparison['comparisonArithmetic'], 'EXACT_UNROUNDED_QUOTE_AMOUNTS')
+
     def test_policy_comparison_excludes_horizons_and_invalid_baselines(self):
         h = horizon(net=500)
         h['conservativeRoundTripCostBps'] = 9999

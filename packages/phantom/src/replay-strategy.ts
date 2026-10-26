@@ -17,6 +17,7 @@ import {
   type TokenSafetyEvidence,
 } from "./risk.ts";
 import type { ReplayContext, ReplayDecision, ReplayObservation, ReplayQuote } from "./replay.ts";
+import { conservativeCostBps } from "./costs.ts";
 
 type SerializedRisk = {
   [K in keyof RiskLimits]: RiskLimits[K] extends bigint ? string : RiskLimits[K];
@@ -309,13 +310,30 @@ function signalsAt(ctx: ReplayContext): SignalFeatures {
   };
 }
 function quoteValid(q: ReplayQuote | undefined, now: number, amount: bigint, maxAge: number) {
-  return (
-    !!q &&
-    q.observedAt <= now &&
-    now - q.observedAt <= maxAge &&
-    raw(q.inputRaw) === amount &&
-    raw(q.outputRaw) > 0n
-  );
+  if (
+    !q ||
+    !Number.isFinite(q.observedAt) ||
+    q.observedAt < 0 ||
+    q.observedAt > now ||
+    now - q.observedAt > maxAge
+  )
+    return false;
+  if (
+    q.requestedAt !== undefined &&
+    (!Number.isFinite(q.requestedAt) || q.requestedAt < 0 || q.requestedAt > q.observedAt)
+  )
+    return false;
+  try {
+    return (
+      raw(q.inputRaw) === amount &&
+      raw(q.outputRaw) > 0n &&
+      raw(q.networkFeeLamports) >= 0n &&
+      Number.isFinite(q.priceImpactBps) &&
+      q.priceImpactBps >= 0
+    );
+  } catch {
+    return false;
+  }
 }
 const day = (at: number) => new Date(at).toISOString().slice(0, 10);
 
@@ -370,7 +388,70 @@ export function createReplayStrategy(input: ReplayStrategyConfig) {
     if (!ctx.portfolio) reasons.push("PORTFOLIO_RISK_STATE_UNAVAILABLE");
     return reasons;
   };
-  const fillGuard = (ctx: ReplayContext, order: { amountLamports: string; decisionAt: number }) => {
+  // The initial decision and delayed settlement share signal/adaptive checks. Neither
+  // calls evaluate(), so a pending fill cannot bypass deterioration or recurse.
+  const entrySignals = (ctx: ReplayContext, amount: bigint) => {
+    const reasons = common(ctx);
+    const required = [
+      "observations",
+      "independentBuyerUnits",
+      "organicScore",
+      "creatorSelling",
+      "creatorPriorAdverseOutcomes",
+      "liquidityLamports",
+      "executionCostBps",
+      "netInflowLamports",
+    ];
+    for (const key of required)
+      if (value(ctx, key) == null) reasons.push(`FEATURE_UNAVAILABLE:${key}`);
+    let selected: StrategyId | "adaptive" = config.strategy;
+    if (selected === "adaptive") {
+      const candidates = (config.validated ?? []).map((c) => ({
+        ...c,
+        outOfSampleNetLamports: BigInt(c.outOfSampleNetLamports),
+      }));
+      const result = selectValidatedStrategy(candidates, ctx.current.regime, ctx.now);
+      if (!result.selected) return { selected: null, reasons: [...reasons, ...result.reasons] };
+      if (
+        result.selected.configurationHash !==
+        replayConfigurationHash({ ...config, strategy: result.selected.strategy })
+      )
+        return { selected: null, reasons: [...reasons, "VALIDATION_CONFIGURATION_HASH_MISMATCH"] };
+      selected = result.selected.strategy;
+    }
+    const signals = signalsAt(ctx),
+      buy = ctx.current.buy,
+      sell = ctx.current.sell;
+    // A stored numeric feature may have been rounded down by an older capture. Only
+    // an exact current round-trip pair can prove the cost of this pending entry.
+    if (
+      !quoteValid(buy, ctx.now, amount, limits.maxQuoteAgeMs) ||
+      !buy ||
+      !quoteValid(sell, ctx.now, raw(buy.outputRaw), limits.maxQuoteAgeMs) ||
+      !sell ||
+      sell.observedAt < buy.observedAt ||
+      (sell.requestedAt !== undefined && sell.requestedAt < buy.observedAt) ||
+      buy.priceImpactBps > limits.maxImpactBps ||
+      sell.priceImpactBps > limits.maxImpactBps
+    ) {
+      reasons.push("EXACT_SIZE_ROUND_TRIP_COST_UNAVAILABLE");
+      signals.executionCostBps = null;
+    } else {
+      const exactCost = conservativeCostBps(
+        amount,
+        raw(sell.outputRaw),
+        raw(buy.networkFeeLamports) + raw(sell.networkFeeLamports),
+      );
+      signals.executionCostBps = Math.max(signals.executionCostBps ?? 0, exactCost);
+    }
+    const decision = evaluateStrategies(signals, rules).find((d) => d.strategy === selected)!;
+    if (!decision.enter) reasons.push(...decision.reasons);
+    return { selected, reasons };
+  };
+  const portfolioGuard = (
+    ctx: ReplayContext,
+    order: { amountLamports: string; decisionAt: number },
+  ) => {
     const reasons = common(ctx),
       portfolio = ctx.portfolio,
       amount = raw(order.amountLamports),
@@ -424,6 +505,15 @@ export function createReplayStrategy(input: ReplayStrategyConfig) {
     );
     return { allowed: verdict.allowed, reasons: verdict.reasons };
   };
+  const fillGuard = (ctx: ReplayContext, order: { amountLamports: string; decisionAt: number }) => {
+    const signal = entrySignals(ctx, raw(order.amountLamports)),
+      guard = portfolioGuard(ctx, order);
+    const reasons = [...new Set([...signal.reasons, ...(!guard.allowed ? guard.reasons : [])])];
+    return {
+      allowed: signal.reasons.length === 0 && guard.allowed,
+      reasons: reasons.length ? reasons : guard.reasons,
+    };
+  };
   const evaluate = (ctx: ReplayContext): ReplayDecision => {
     if (ctx.position) {
       const p = ctx.position,
@@ -474,44 +564,22 @@ export function createReplayStrategy(input: ReplayStrategyConfig) {
         reasons: reasons.length ? reasons : ["EXIT_LIMITS_NOT_TRIGGERED"],
       };
     }
-    const reasons = common(ctx);
-    const required = [
-      "observations",
-      "independentBuyerUnits",
-      "organicScore",
-      "creatorSelling",
-      "creatorPriorAdverseOutcomes",
-      "liquidityLamports",
-      "executionCostBps",
-      "netInflowLamports",
-    ];
-    for (const key of required)
-      if (value(ctx, key) == null) reasons.push(`FEATURE_UNAVAILABLE:${key}`);
-    let selected = config.strategy;
-    if (selected === "adaptive") {
-      const candidates = (config.validated ?? []).map((c) => ({
-        ...c,
-        outOfSampleNetLamports: BigInt(c.outOfSampleNetLamports),
-      }));
-      const result = selectValidatedStrategy(candidates, ctx.current.regime, ctx.now);
-      if (!result.selected) return { action: "reject", reasons: [...reasons, ...result.reasons] };
-      // A validation record cannot silently select rules from a different frozen configuration.
-      if (
-        result.selected.configurationHash !==
-        replayConfigurationHash({ ...config, strategy: result.selected.strategy })
-      )
-        return { action: "reject", reasons: ["VALIDATION_CONFIGURATION_HASH_MISMATCH"] };
-      selected = result.selected.strategy;
-    }
-    const d = evaluateStrategies(signalsAt(ctx), rules).find((d) => d.strategy === selected)!;
-    if (!d.enter) reasons.push(...d.reasons);
-    const guard = fillGuard(ctx, { amountLamports: config.entryLamports, decisionAt: ctx.now });
+    const signal = entrySignals(ctx, raw(config.entryLamports)),
+      reasons = signal.reasons;
+    const guard = portfolioGuard(ctx, {
+      amountLamports: config.entryLamports,
+      decisionAt: ctx.now,
+    });
     if (!guard.allowed) reasons.push(...guard.reasons);
     return {
       action: reasons.length ? "reject" : "enter",
       reasons: reasons.length
         ? [...new Set(reasons)]
-        : [`FROZEN_CONFIG:${config.id}`, `STRATEGY:${selected}`, "FINAL_FILL_RECHECK_REQUIRED"],
+        : [
+            `FROZEN_CONFIG:${config.id}`,
+            `STRATEGY:${signal.selected}`,
+            "FINAL_FILL_RECHECK_REQUIRED",
+          ],
       amountLamports: config.entryLamports,
     };
   };
