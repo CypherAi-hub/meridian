@@ -1,7 +1,7 @@
 import bs58 from 'bs58';
 import type { SubscribeRequest, SubscribeUpdate, SubscribeUpdateTransaction } from '@triton-one/yellowstone-grpc';
 import { PROGRAMS, type RpcTransaction } from './decoder.ts';
-import { type Health, type ChainEvent } from './types.ts';
+import { WSOL, type Health, type ChainEvent } from './types.ts';
 import type { Store } from './store.ts';
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -45,6 +45,24 @@ interface WebSocketLike { onopen: (() => void) | null; onmessage: ((event: { dat
 export interface FinalizedLogEnvelope { signature: string; slot: number; logs: string[]; receivedAt: number; commitment: 'finalized'; }
 export interface TypedLogMetrics { received: number; processed: number; dropped: number; errors: number; queueDepth: number; latencyMs: { p50: number | null; p95: number | null }; }
 export interface SolanaStreamOptions { websocket?: (url: string) => WebSocketLike; reconnectMs?: number; retryMs?: number; attempts?: number; maxQueue?: number; pageSize?: number; maxPages?: number; backfillIntervalMs?: number; onLogs?: (envelope: FinalizedLogEnvelope) => Promise<ChainEvent[] | void> | ChainEvent[] | void; isWatchedMint?: (mint: string) => boolean; maxLogQueue?: number; }
+/** Admission priority affects enrichment only, never evidence validity or order authorization.
+ * Empty/unknown layouts and non-SOL pairs retain the background full-fetch fallback.
+ * Equal priorities remain FIFO; a new item may evict only a strictly lower priority.
+ */
+export const ENRICHMENT_PRIORITY = Object.freeze({ BACKGROUND: 0, SOL_ACTIVITY: 1, WATCHED_SOL_TRADE: 2, SOL_POOL: 3, SOL_LAUNCH: 4 });
+export function enrichmentPriority(events: readonly ChainEvent[], isWatchedMint?: (mint: string) => boolean): number {
+  let priority: number = ENRICHMENT_PRIORITY.BACKGROUND;
+  for (const event of events) {
+    // Pump represents native SOL using Pubkey::default(); normal decoders normalize it to WSOL.
+    const sol = event.quoteMint === WSOL || (event.protocol === 'pump' && event.quoteMint === '11111111111111111111111111111111');
+    if (!sol) continue;
+    if (event.kind === 'launch') priority = Math.max(priority, ENRICHMENT_PRIORITY.SOL_LAUNCH);
+    else if (event.kind === 'pool') priority = Math.max(priority, ENRICHMENT_PRIORITY.SOL_POOL);
+    else if (['buy', 'sell', 'swap'].includes(event.kind) && isWatchedMint?.(event.mint)) priority = Math.max(priority, ENRICHMENT_PRIORITY.WATCHED_SOL_TRADE);
+    else priority = Math.max(priority, ENRICHMENT_PRIORITY.SOL_ACTIVITY);
+  }
+  return priority;
+}
 interface Pending { signature: string; receivedAt: number; priority: number; resolve: (ok: boolean) => void; }
 type SignatureRow = { signature: string; slot: number; err: unknown };
 export class SolanaStream {
@@ -80,10 +98,7 @@ export class SolanaStream {
         let priority = 0;
         try {
           const observations = await this.options.onLogs?.(envelope);
-          if (Array.isArray(observations)) for (const event of observations) {
-            if (event.kind === 'launch' || event.kind === 'pool') priority = Math.max(priority, 3);
-            else if (this.options.isWatchedMint?.(event.mint)) priority = Math.max(priority, 2);
-          }
+          if (Array.isArray(observations)) priority = enrichmentPriority(observations, this.options.isWatchedMint);
           this.typedMetrics.processed++;
           this.typedLatencies.push(Math.max(0, Date.now() - envelope.receivedAt)); if (this.typedLatencies.length > 2048) this.typedLatencies.shift();
           this.logSeen.set(envelope.signature, Date.now()); if (this.logSeen.size > 10_000) this.logSeen.delete(this.logSeen.keys().next().value!);

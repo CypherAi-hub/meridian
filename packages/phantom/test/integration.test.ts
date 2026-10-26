@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "../src/engine.ts";
 import { decodeTransaction, type RpcTransaction } from "../src/decoder.ts";
+import { DEFAULT_STRATEGY_RULES } from "../src/intelligence.ts";
 
 test("recorded finalized transaction survives decode -> SQL dedup -> read-only API -> restart, with unsupported-schema entry veto", async () => {
   const dir = mkdtempSync(join(tmpdir(), "phantom-integration-"));
@@ -42,6 +43,10 @@ test("recorded finalized transaction survives decode -> SQL dedup -> read-only A
     const response = await fetch(engine.url + "/state");
     expect(response.status).toBe(200);
     const state = await response.json();
+    expect(state.strategyRules.maximumCostBps).toBe(DEFAULT_STRATEGY_RULES.maximumCostBps);
+    expect(state.strategyRules.minimumLiquidityLamports).toBe(
+      String(DEFAULT_STRATEGY_RULES.minimumLiquidityLamports),
+    );
     expect(state.events).toHaveLength(1);
     expect(state.events[0].signature).toBe(tx.transaction.signatures[0]);
     expect(state.events[0].slot).toBe(tx.slot);

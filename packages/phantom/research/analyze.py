@@ -185,7 +185,37 @@ def horizon_result(row):
     return {'mint': row['mint'], 'net': net, 'bps': bps, 'delay': observed - target}
 
 
-def research_analysis(research):
+def cost_policy_compatibility(costs, strategy_rules):
+    """Compare verified baseline costs with the actual exposed policy; never tune it."""
+    budget = strategy_rules.get('maximumCostBps') if isinstance(strategy_rules, dict) else None
+    comparison = {
+        'status': 'UNAVAILABLE_POLICY_COMPARISON',
+        'policySource': 'state.strategyRules.maximumCostBps',
+        'configuredMaximumCostBps': None,
+        'validatedBaselineSamples': len(costs),
+        'withinBudgetCount': None,
+        'overBudgetCount': None,
+        'medianExcessBpsAmongOverBudget': None,
+        'maximumExcessBps': None,
+        'scope': 'Verified BASELINE quote costs only, not entry eligibility, execution guarantees, realized P&L, or profitability. Horizon outcomes are excluded.',
+        'policyAutomaticallyChanged': False,
+    }
+    if not finite(budget) or not 0 <= budget <= 10_000:
+        comparison['unavailableReason'] = 'STRATEGY_RULES_OR_MAXIMUM_COST_MISSING_OR_INVALID'
+        return comparison
+    excesses = [cost - budget for cost in costs if cost > budget]
+    comparison.update({
+        'status': 'AVAILABLE' if costs else 'NO_VALIDATED_BASELINE_COST_SAMPLES',
+        'configuredMaximumCostBps': budget,
+        'withinBudgetCount': sum(cost <= budget for cost in costs),
+        'overBudgetCount': len(excesses),
+        'medianExcessBpsAmongOverBudget': statistics.median(excesses) if excesses else None,
+        'maximumExcessBps': max(excesses) if excesses else (0 if costs else None),
+    })
+    return comparison
+
+
+def research_analysis(research, strategy_rules=None):
     baselines = [row for row in research if row.get('phase', 'BASELINE') == 'BASELINE']
     costs, invalid_baselines, unavailable_baselines = [], 0, 0
     for row in baselines:
@@ -244,6 +274,7 @@ def research_analysis(research):
             'invalid': invalid_baselines,
             'conservativeRoundTripCostBpsMedian': statistics.median(costs) if costs else None,
             'conservativeRoundTripCostBpsP95': percentile(costs, .95),
+            'strategyCostPolicyCompatibility': cost_policy_compatibility(costs, strategy_rules),
             'scope': 'BASELINE sequential quote costs only. Modeled expenses, no orders or fills; horizon outcomes excluded.',
         },
         'hypotheticalQuoteHorizons': {
@@ -264,7 +295,7 @@ def analyze(state, research):
     for row in closed:
         token_pnl[row['mint']] += row['pnlLamports']
     confidence = clustered_bootstrap(token_pnl, 'token-grouped net realized lamports') if token_pnl else None
-    research_report = research_analysis(research)
+    research_report = research_analysis(research, state.get('strategyRules'))
     return {
         'generatedAt': datetime.now(timezone.utc).isoformat(),
         'mode': state.get('mode'), 'sourceHealth': state.get('health'),

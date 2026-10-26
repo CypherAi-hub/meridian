@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import bs58 from 'bs58';
 import type { SubscribeRequest, SubscribeUpdateTransaction } from '@triton-one/yellowstone-grpc';
 import { PROGRAMS, decodeLogNotification, type RpcTransaction } from '../src/decoder.ts';
-import { Rpc, SolanaStream, normalizeYellowstoneTransaction, startYellowstone } from '../src/stream.ts';
-import type { Health, ChainEvent } from '../src/types.ts';
+import { Rpc, SolanaStream, normalizeYellowstoneTransaction, startYellowstone, enrichmentPriority, ENRICHMENT_PRIORITY } from '../src/stream.ts';
+import { WSOL, type Health, type ChainEvent } from '../src/types.ts';
 
 // Transport responses and chain transactions in this file are SYNTHETIC fixtures.
 const signature = (n: number) => bs58.encode(new Uint8Array(64).fill(n));
@@ -152,11 +152,66 @@ describe('independent bounded finalized typed-log path', () => {
     const ws = wsFixture(), fetched: string[] = []; let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const rpc = rpcMock(async (method, params) => { if (method === 'getSignaturesForAddress') return []; fetched.push(String(params[0])); if (fetched.length === 1) await gate; const value = tx(1); value.transaction.signatures = [String(params[0])]; return value; });
-    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, { websocket: () => ws.socket, maxQueue: 2, onLogs: e => [{ kind: e.signature === signature(5) ? 'launch' : 'buy', mint: e.signature === signature(4) ? 'watched' : 'other' } as ChainEvent], isWatchedMint: mint => mint === 'watched', backfillIntervalMs: 1_000_000 });
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, { websocket: () => ws.socket, maxQueue: 2, onLogs: e => [{ kind: e.signature === signature(5) ? 'launch' : 'buy', mint: e.signature === signature(4) ? 'watched' : 'other', protocol: 'pump', quoteMint: WSOL } as ChainEvent], isWatchedMint: mint => mint === 'watched', backfillIntervalMs: 1_000_000 });
     stream.start(); ws.notify(signature(1)); await vi.waitFor(() => expect(fetched).toHaveLength(1));
     for (const n of [2, 3, 4, 5]) ws.notify(signature(n));
     await vi.waitFor(() => expect(stream.logMetrics().processed).toBe(5)); release();
     await vi.waitFor(() => expect(fetched).toHaveLength(3)); expect(fetched).toEqual([signature(1), signature(5), signature(4)]);
+    await stream.stop();
+  });
+  it('keeps SOL launches ahead of non-SOL launches/pools and preserves FIFO admission for equal-priority launches', async () => {
+    const ws = wsFixture(), h = health(), fetched: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const rpc = rpcMock(async (method, params) => {
+      if (method === 'getSignaturesForAddress') return [];
+      fetched.push(String(params[0]));
+      if (fetched.length === 1) await gate;
+      const value = tx(1); value.transaction.signatures = [String(params[0])]; return value;
+    });
+    const observations = new Map([
+      [2, { kind: 'pool', quoteMint: 'SYNTHETIC-NON-SOL' }],
+      [3, { kind: 'launch', quoteMint: 'SYNTHETIC-NON-SOL' }],
+      [4, { kind: 'pool', quoteMint: WSOL }],
+      [5, { kind: 'launch', quoteMint: WSOL }],
+      [6, { kind: 'launch', quoteMint: WSOL }],
+      [7, { kind: 'launch', quoteMint: WSOL }],
+      [8, { kind: 'launch', quoteMint: 'SYNTHETIC-NON-SOL' }],
+    ]);
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), h, async () => undefined, {
+      websocket: () => ws.socket, maxQueue: 2, backfillIntervalMs: 1_000_000,
+      onLogs: e => {
+        const n = Array.from({ length: 8 }, (_, i) => i + 1).find(n => signature(n) === e.signature)!;
+        const fields = observations.get(n);
+        return fields ? [{ ...fields, protocol: 'pump', mint: 'SYNTHETIC-MINT' } as ChainEvent] : [];
+      },
+    });
+    stream.start(); ws.notify(signature(1));
+    await vi.waitFor(() => expect(fetched).toEqual([signature(1)]));
+    for (const n of [2, 3, 4, 5, 6, 7, 8]) ws.notify(signature(n));
+    await vi.waitFor(() => expect(stream.logMetrics().processed).toBe(8));
+    expect(h.queueDepth).toBe(2);
+    expect(h.backfillGaps).toBeGreaterThan(0);
+    expect(h.status).toBe('DEGRADED');
+    release();
+    await vi.waitFor(() => expect(fetched).toHaveLength(3));
+    expect(fetched).toEqual([signature(1), signature(5), signature(6)]);
+    await stream.stop();
+  });
+  it('still fetches undecodable logs and non-SOL observations instead of treating them as complete history', async () => {
+    const ws = wsFixture(), fetched: string[] = [];
+    const rpc = rpcMock(async (method, params) => {
+      if (method === 'getSignaturesForAddress') return [];
+      fetched.push(String(params[0]));
+      const value = tx(1); value.transaction.signatures = [String(params[0])]; return value;
+    });
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, {
+      websocket: () => ws.socket, backfillIntervalMs: 1_000_000,
+      onLogs: e => e.signature === signature(1) ? [] : [{ kind: 'pool', protocol: 'pumpswap', mint: 'SYNTHETIC-MINT', quoteMint: 'SYNTHETIC-NON-SOL' } as ChainEvent],
+    });
+    stream.start(); ws.notify(signature(1)); ws.notify(signature(2));
+    await vi.waitFor(() => expect(fetched).toEqual([signature(1), signature(2)]));
+    expect(stream.logMetrics().processed).toBe(2);
     await stream.stop();
   });
   it('bounds the fast callback queue separately and surfaces dropped observations as a coverage gap', async () => {
@@ -179,6 +234,31 @@ describe('independent bounded finalized typed-log path', () => {
     const ws = wsFixture(), onLogs = vi.fn(async () => []), rpc = rpcMock(async (method, params) => { if (method === 'getSignaturesForAddress') return []; const value = tx(1); value.transaction.signatures = [String(params[0])]; return value; });
     const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, { websocket: () => ws.socket, onLogs, backfillIntervalMs: 1_000_000 });
     stream.start(); ws.notify(signature(1)); ws.notify(signature(1)); await vi.waitFor(() => expect(stream.logMetrics().processed).toBe(1)); expect(onLogs).toHaveBeenCalledOnce(); await stream.stop();
+  });
+});
+
+describe('SOL-only enrichment scope with synthetic typed observations', () => {
+  const event = (kind: ChainEvent['kind'], quoteMint = WSOL, protocol: ChainEvent['protocol'] = 'pump') => ({ kind, quoteMint, protocol, mint: 'SYNTHETIC-MINT' } as ChainEvent);
+  it('prioritizes native SOL and WSOL launches above SOL pools and watched SOL trades', () => {
+    expect(enrichmentPriority([event('launch')])).toBe(ENRICHMENT_PRIORITY.SOL_LAUNCH);
+    expect(enrichmentPriority([event('launch', '11111111111111111111111111111111')])).toBe(ENRICHMENT_PRIORITY.SOL_LAUNCH);
+    expect(enrichmentPriority([event('pool')])).toBe(ENRICHMENT_PRIORITY.SOL_POOL);
+    expect(enrichmentPriority([event('sell')], () => true)).toBe(ENRICHMENT_PRIORITY.WATCHED_SOL_TRADE);
+    expect(enrichmentPriority([event('buy')], () => false)).toBe(ENRICHMENT_PRIORITY.SOL_ACTIVITY);
+    expect(ENRICHMENT_PRIORITY.SOL_LAUNCH).toBeGreaterThan(ENRICHMENT_PRIORITY.SOL_POOL);
+    expect(ENRICHMENT_PRIORITY.SOL_POOL).toBeGreaterThan(ENRICHMENT_PRIORITY.WATCHED_SOL_TRADE);
+  });
+  it('does not promote unsupported quotes through launch/pool kinds or watched mint membership', () => {
+    const watched = vi.fn(() => true);
+    for (const kind of ['launch', 'pool', 'buy', 'sell'] as const)
+      expect(enrichmentPriority([event(kind, 'SYNTHETIC-NON-SOL')], watched)).toBe(ENRICHMENT_PRIORITY.BACKGROUND);
+    expect(enrichmentPriority([event('launch', '11111111111111111111111111111111', 'pumpswap')], watched)).toBe(ENRICHMENT_PRIORITY.BACKGROUND);
+    expect(watched).not.toHaveBeenCalled();
+  });
+  it('uses the highest eligible SOL leg in mixed transactions and keeps unknown layouts at background', () => {
+    expect(enrichmentPriority([event('launch', 'SYNTHETIC-NON-SOL'), event('buy')])).toBe(ENRICHMENT_PRIORITY.SOL_ACTIVITY);
+    expect(enrichmentPriority([event('pool'), event('launch')])).toBe(ENRICHMENT_PRIORITY.SOL_LAUNCH);
+    expect(enrichmentPriority([])).toBe(ENRICHMENT_PRIORITY.BACKGROUND);
   });
 });
 

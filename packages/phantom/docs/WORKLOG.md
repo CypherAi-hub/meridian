@@ -23,10 +23,12 @@ The complete original specification remains in `PHANTOM-SPEC.md`. The active obj
 7. Wallet funding analysis accepts committed top-level transfers; caught failed inner transfers cannot create relationships. Cache version 2 retains raw reviewed candidates and reapplies the current related-wallet set without refreshing old evidence timestamps.
 8. Completed-position metrics aggregate full leg history before pagination. A profitable partial followed by a larger final loss is one losing position; incomplete legacy attribution stays unknown. Python uses the full authoritative aggregates, not a truncated exit-leg list.
 9. Creator-associated concentration is explicitly unverified until evidence exists. Direct creator balances are a lower bound, not a complete association check. Neither safety rules nor research outputs are loosened to manufacture trades.
+10. Enrichment admission now prioritizes SOL launches above SOL pools and watched SOL trades. Unsupported non-SOL pools cannot fill the same priority tier and block a supported launch. Empty/unknown layouts still receive full-fetch fallback; eviction and coverage gaps remain explicit.
+11. Python compares validated baseline costs with the actual exposed strategy cost policy. The original 150-bps budget remains unchanged; missing policy evidence is unavailable, and horizon outcomes never enter this comparison. Typical observed quoted costs have exceeded that budget, explaining another rejection gate without implying profitability at a higher budget.
 
 ## Validation and next steps
 
-The latest recorded full check passed **282 TypeScript/Vitest tests and 17 Python tests**, plus TypeScript checking. The dashboard's production build passed. Re-run relevant checks after additional code changes; do not treat these numbers as certification of the full objective.
+The latest recorded full check passed **287 TypeScript/Vitest tests and 23 Python tests**, plus TypeScript checking. The dashboard's production build passed. Re-run relevant checks after additional code changes; do not treat these numbers as certification of the full objective.
 
 Actual collection produced dozens of real baseline quote pairs and real horizon quotes, but **zero completed paper positions** at the last review. The Python report says `INSUFFICIENT_OUT_OF_SAMPLE_EVIDENCE` and `UNPROVEN`. Preserve that distinction. A positive quote-only round trip is not profit.
 

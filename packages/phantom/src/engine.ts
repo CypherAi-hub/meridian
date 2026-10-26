@@ -10,6 +10,7 @@ import {
   WalletIntelligence,
   featuresAt,
   evaluateStrategies,
+  DEFAULT_STRATEGY_RULES,
   type TradeObservation,
 } from "./intelligence.ts";
 import { RiskGovernor, DEFAULT_RISK_LIMITS, checkTokenSafety } from "./risk.ts";
@@ -840,6 +841,7 @@ export class Engine {
     return {
       application: "PHANTOM",
       sourceVersion: this.sourceVersion,
+      strategyRules: { ...DEFAULT_STRATEGY_RULES },
       mode: "PAPER",
       startedAt: this.startedAt,
       now: Date.now(),

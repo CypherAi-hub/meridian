@@ -21,6 +21,14 @@ def horizon(identity='episode', mint='token', net=-220, milliseconds=30000):
     return dict(id=identity+':horizon:'+str(milliseconds), episodeId=identity, phase='HORIZON', scope='RESEARCH_QUOTE_ONLY_NO_TRADE', status='QUOTED', mint=mint, horizonMs=milliseconds, baselineAt=1000, targetAt=target, observedAt=target+1000, amountLamports='10000', hypotheticalTokenQuantityRaw='100', modeledNetworkFeesLamports='20', baselineBuy=quote(WSOL,mint,10000,100,1000), sell=quote(mint,WSOL,100,10020+net,target+1000), hypotheticalHorizonNetLamports=str(net), hypotheticalHorizonReturnBps=net)
 
 
+def baseline_with_cost(cost, identity='baseline'):
+    row = baseline(identity)
+    row['sell'] = quote('token', WSOL, 100, 10020-cost, 1000)
+    row['conservativeRoundTripNetLamports'] = str(-cost)
+    row['conservativeRoundTripCostBps'] = cost
+    return row
+
+
 class ResearchEvidenceTests(unittest.TestCase):
     def test_no_closed_positions_is_unknown_performance(self):
         result=analyze({'mode':'PAPER','completedPositions':[],'trades':[],'decisions':[]},[])
@@ -136,6 +144,64 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(result['quoted'],0)
         self.assertEqual(result['invalid'],1)
         self.assertIsNone(result['conservativeRoundTripCostBpsMedian'])
+
+    def test_actual_cost_policy_budget_is_inclusive_at_the_boundary(self):
+        state = {'strategyRules': {'maximumCostBps': 150}}
+        rows = [baseline_with_cost(149, 'below'), baseline_with_cost(150, 'equal'), baseline_with_cost(151, 'above')]
+        report = analyze(state, rows)
+        result = report['researchQuotes']['strategyCostPolicyCompatibility']
+        self.assertEqual(result['configuredMaximumCostBps'], 150)
+        self.assertEqual(result['withinBudgetCount'], 2)
+        self.assertEqual(result['overBudgetCount'], 1)
+        self.assertEqual(result['medianExcessBpsAmongOverBudget'], 1)
+        self.assertFalse(result['policyAutomaticallyChanged'])
+        self.assertEqual(report['profitabilityConclusion'], 'UNPROVEN')
+        self.assertEqual(state['strategyRules']['maximumCostBps'], 150)
+
+    def test_policy_comparison_excludes_horizons_and_invalid_baselines(self):
+        h = horizon(net=500)
+        h['conservativeRoundTripCostBps'] = 9999
+        invalid = baseline_with_cost(200, 'bad')
+        invalid['conservativeRoundTripCostBps'] = 0
+        result = analyze({'strategyRules': {'maximumCostBps': 150}}, [baseline_with_cost(200), h, invalid])['researchQuotes']['strategyCostPolicyCompatibility']
+        self.assertEqual(result['validatedBaselineSamples'], 1)
+        self.assertEqual(result['withinBudgetCount'], 0)
+        self.assertEqual(result['overBudgetCount'], 1)
+        self.assertEqual(result['medianExcessBpsAmongOverBudget'], 50)
+
+    def test_missing_or_invalid_cost_policy_is_unavailable_without_a_default(self):
+        invalid_rules = [None, [], {}, {'maximumCostBps': None}, {'maximumCostBps': '150'}, {'maximumCostBps': True}, {'maximumCostBps': -1}, {'maximumCostBps': 10001}, {'maximumCostBps': float('inf')}, {'maximumCostBps': float('nan')}]
+        for rules in invalid_rules:
+            state = {} if rules is None else {'strategyRules': rules}
+            result = analyze(state, [baseline()])['researchQuotes']['strategyCostPolicyCompatibility']
+            self.assertEqual(result['status'], 'UNAVAILABLE_POLICY_COMPARISON')
+            self.assertIsNone(result['configuredMaximumCostBps'])
+            self.assertIsNone(result['withinBudgetCount'])
+            self.assertIsNone(result['overBudgetCount'])
+            self.assertEqual(result['validatedBaselineSamples'], 1)
+
+    def test_valid_policy_with_no_validated_samples_keeps_cost_estimates_unknown(self):
+        result = analyze({'strategyRules': {'maximumCostBps': 150}}, [])['researchQuotes']['strategyCostPolicyCompatibility']
+        self.assertEqual(result['status'], 'NO_VALIDATED_BASELINE_COST_SAMPLES')
+        self.assertEqual(result['withinBudgetCount'], 0)
+        self.assertEqual(result['overBudgetCount'], 0)
+        self.assertIsNone(result['medianExcessBpsAmongOverBudget'])
+        self.assertIsNone(result['maximumExcessBps'])
+
+    def test_zero_and_upper_bound_policy_are_read_from_state(self):
+        for budget in (0, 10000):
+            result = analyze({'strategyRules': {'maximumCostBps': budget}}, [baseline_with_cost(0)])['researchQuotes']['strategyCostPolicyCompatibility']
+            self.assertEqual(result['status'], 'AVAILABLE')
+            self.assertEqual(result['configuredMaximumCostBps'], budget)
+            self.assertEqual(result['withinBudgetCount'], 1)
+            self.assertEqual(result['maximumExcessBps'], 0)
+
+    def test_finite_fractional_policy_is_preserved_without_integer_coercion(self):
+        result = analyze({'strategyRules': {'maximumCostBps': 150.5}}, [baseline_with_cost(150), baseline_with_cost(151)])['researchQuotes']['strategyCostPolicyCompatibility']
+        self.assertEqual(result['configuredMaximumCostBps'], 150.5)
+        self.assertEqual(result['withinBudgetCount'], 1)
+        self.assertEqual(result['overBudgetCount'], 1)
+        self.assertEqual(result['medianExcessBpsAmongOverBudget'], 0.5)
 
 
 if __name__=='__main__':
