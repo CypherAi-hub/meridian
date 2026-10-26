@@ -15,6 +15,8 @@ type JupQuote = {
   priceImpactPct?: string | number;
   routePlan?: { swapInfo?: { label?: string } }[];
   error?: string;
+  errorCode?: number;
+  errorMessage?: string;
 };
 
 const ENDPOINTS = ["https://api.jup.ag/swap/v1/quote"];
@@ -41,6 +43,14 @@ function impactOf(body: JupQuote) {
   const n = Number(body.priceImpactPct);
   if (!Number.isFinite(n)) return null;
   return n > 1 ? n / 100 : n;
+}
+
+function positiveRawU64(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9]\d{0,19}$/.test(value) &&
+    BigInt(value) <= 18446744073709551615n
+  );
 }
 
 function failedQuote(
@@ -84,6 +94,7 @@ async function quoteOnce(opts: {
 }): Promise<QuoteObs> {
   const t0 = Date.now();
   const ingestedAt = t0;
+  if (!positiveRawU64(opts.amount)) return failedQuote(opts, "invalid quote input amount", 0);
   const circuit = breakerFor("jupiter");
   const key = deskSettings().jupiterApiKey;
   const budget = budgetFor("jupiter", key ? JUPITER_KEYED_BUDGET : undefined);
@@ -119,19 +130,21 @@ async function quoteOnce(opts: {
         continue;
       }
       const body = (await r.json()) as JupQuote;
-      const labels = (body.routePlan ?? [])
-        .map((x) => x.swapInfo?.label)
-        .filter((x): x is string => Boolean(x));
-      const inAmount = body.inAmount ?? opts.amount;
-      const outAmount = body.outAmount ?? "0";
       if (body.inputMint !== opts.inputMint || body.outputMint !== opts.outputMint) {
         return failedQuote(opts, "quote token identity mismatch", latencyMs);
       }
-      const ok = Boolean(outAmount && Number(outAmount) > 0);
-      if (!ok) {
-        circuit.failure("no route");
-        return failedQuote(opts, body.error ?? "no route", latencyMs);
-      }
+      if (body.error || body.errorMessage || body.errorCode != null)
+        return failedQuote(opts, "provider reported quote error", latencyMs);
+      // Exact size must be confirmed by the response, never inferred from our request.
+      if (!positiveRawU64(body.inAmount) || body.inAmount !== opts.amount)
+        return failedQuote(opts, "quote input amount mismatch or missing", latencyMs);
+      if (!positiveRawU64(body.outAmount))
+        return failedQuote(opts, "invalid quote output amount", latencyMs);
+      const inAmount = body.inAmount,
+        outAmount = body.outAmount;
+      const labels = (body.routePlan ?? [])
+        .map((x) => x.swapInfo?.label)
+        .filter((x): x is string => Boolean(x));
       circuit.success();
       budget.onSuccess();
       return {
