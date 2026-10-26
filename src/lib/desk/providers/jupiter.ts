@@ -5,6 +5,7 @@ import { breakerFor } from "../circuit";
 import { classifyRouteFailure, routeStateFromFailure } from "../routes";
 import { deskSettings } from "../config";
 import { budgetFor, parseRetryAfter, JUPITER_KEYED_BUDGET } from "../rate-budget";
+import { impliedQuotePrice } from "../quote-price.ts";
 
 type JupQuote = {
   inputMint?: string;
@@ -16,9 +17,7 @@ type JupQuote = {
   error?: string;
 };
 
-const ENDPOINTS = [
-  "https://api.jup.ag/swap/v1/quote",
-];
+const ENDPOINTS = ["https://api.jup.ag/swap/v1/quote"];
 
 export const providerCounters = {
   jupiter429: 0,
@@ -44,31 +43,6 @@ function impactOf(body: JupQuote) {
   return n > 1 ? n / 100 : n;
 }
 
-function impliedPrice(opts: {
-  inMint: string;
-  outMint: string;
-  inAmount: string;
-  outAmount: string;
-  inDecimals: number;
-  outDecimals: number;
-  solPriceUsd: number;
-}): number | null {
-  const inn = Number(opts.inAmount);
-  const out = Number(opts.outAmount);
-  if (!inn || !out) return null;
-  const inUi = inn / 10 ** opts.inDecimals;
-  const outUi = out / 10 ** opts.outDecimals;
-  if (opts.inMint === WSOL) {
-    const usdIn = inUi * opts.solPriceUsd;
-    return usdIn / outUi;
-  }
-  if (opts.outMint === WSOL) {
-    const usdOut = outUi * opts.solPriceUsd;
-    return usdOut / inUi;
-  }
-  return null;
-}
-
 function failedQuote(
   opts: { inputMint: string; outputMint: string; amount: string; notionalUsd: number },
   message: string,
@@ -77,7 +51,14 @@ function failedQuote(
 ): QuoteObs {
   const reason = classifyRouteFailure(message, httpStatus);
   const state = routeStateFromFailure(reason);
-  const q = blankQuote(opts.inputMint, opts.outputMint, opts.amount, opts.notionalUsd, message, latencyMs);
+  const q = blankQuote(
+    opts.inputMint,
+    opts.outputMint,
+    opts.amount,
+    opts.notionalUsd,
+    message,
+    latencyMs,
+  );
   q.available = false;
   q.routeState = state;
   q.failureReason = reason;
@@ -138,7 +119,9 @@ async function quoteOnce(opts: {
         continue;
       }
       const body = (await r.json()) as JupQuote;
-      const labels = (body.routePlan ?? []).map((x) => x.swapInfo?.label).filter((x): x is string => Boolean(x));
+      const labels = (body.routePlan ?? [])
+        .map((x) => x.swapInfo?.label)
+        .filter((x): x is string => Boolean(x));
       const inAmount = body.inAmount ?? opts.amount;
       const outAmount = body.outAmount ?? "0";
       if (body.inputMint !== opts.inputMint || body.outputMint !== opts.outputMint) {
@@ -159,7 +142,7 @@ async function quoteOnce(opts: {
         outAmount,
         notionalUsd: opts.notionalUsd,
         priceImpactPct: impactOf(body),
-        impliedPriceUsd: impliedPrice({
+        impliedPriceUsd: impliedQuotePrice({
           inMint: opts.inputMint,
           outMint: opts.outputMint,
           inAmount,
@@ -247,6 +230,17 @@ export async function quoteSolUsdc(): Promise<QuoteObs> {
 }
 
 /** Exact-size quote-only adapter for the independent paper sniper. Never builds a swap. */
-export async function quotePaperSwap(opts: { inputMint: string; outputMint: string; amount: string; inDecimals: number; outDecimals: number; notionalUsd: number }): Promise<QuoteObs> {
-  return quoteOnce({ ...opts, solPriceUsd: 0 });
+export async function quotePaperSwap(opts: {
+  inputMint: string;
+  outputMint: string;
+  amount: string;
+  inDecimals: number;
+  outDecimals: number;
+  notionalUsd: number;
+}): Promise<QuoteObs> {
+  const q = await quoteOnce({ ...opts, solPriceUsd: 0 });
+  // An exit's USDC quote amount is known; the original entry size is not its notional.
+  if (q.available && opts.outputMint === USDC)
+    q.notionalUsd = Number(q.outAmount) / 10 ** opts.outDecimals;
+  return q;
 }

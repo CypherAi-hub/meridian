@@ -1,6 +1,32 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+test("partial paper exit audit uses its actual USDC output and price", () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--import",
+      "./scripts/desk-loader.mjs",
+      "--input-type=module",
+      "-e",
+      `
+    import assert from 'node:assert/strict';
+    const {USDC,WSOL}=await import('./src/lib/desk/schema.ts');
+    globalThis.fetch=async(url,opts)=>{
+      assert.equal(opts.method??'GET','GET');
+      const u=new URL(url); assert.equal(u.pathname,'/swap/v1/quote');
+      return Response.json({inputMint:WSOL,outputMint:USDC,inAmount:'125000000',outAmount:'12500000'});
+    };
+    const {quotePaperSwap}=await import('./src/lib/desk/providers/jupiter.ts');
+    const q=await quotePaperSwap({inputMint:WSOL,outputMint:USDC,amount:'125000000',inDecimals:9,outDecimals:6,notionalUsd:25});
+    assert.equal(q.available,true); assert.equal(q.notionalUsd,12.5); assert.equal(q.impliedPriceUsd,100);
+  `,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
 for (const mismatch of [false, true])
   test(`paper quote adapter ${mismatch ? "rejects mismatched token identity" : "only requests exact-size read-only quotes"}`, () => {
     const code = `

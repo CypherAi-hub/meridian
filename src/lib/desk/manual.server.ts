@@ -3,6 +3,7 @@ import {
   newManualBook,
   manualMetrics,
   queueManualOrder,
+  isManualOrderRetry,
   advanceManual,
   type ManualBook,
 } from "./manual.ts";
@@ -91,6 +92,15 @@ export async function manualControl(input: {
     });
   if (input.action !== "order" || !["BUY", "SELL"].includes(input.side ?? ""))
     throw Error("Unsupported manual paper action");
+  const intent = {
+    requestId: input.requestId ?? "",
+    side: input.side as "BUY" | "SELL",
+    mint,
+    amountUsdc: input.amountUsdc,
+    percent: input.percent,
+  };
+  const saved = await load();
+  if (isManualOrderRetry(saved, intent)) return saved;
   const rpc = await solanaRpc<{
     result?: { value: { owner: string; data: [string, string] } | null };
     error?: { message: string };
@@ -109,13 +119,9 @@ export async function manualControl(input: {
     queueManualOrder(
       s,
       {
-        requestId: input.requestId ?? "",
-        side: input.side as "BUY" | "SELL",
-        mint,
+        ...intent,
         symbol: t?.symbol ?? mint.slice(0, 6),
         decimals: parsed.decimals,
-        amountUsdc: input.amountUsdc,
-        percent: input.percent,
       },
       Date.now(),
     ),

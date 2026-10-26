@@ -6,6 +6,7 @@ import {
   advanceManual,
   manualMetrics,
   usdAtomic,
+  isManualOrderRetry,
 } from "./manual.ts";
 import { USDC, type QuoteObs } from "./schema.ts";
 import type { SwapRequest } from "./sniper.ts";
@@ -72,6 +73,13 @@ test("manual buys wait for latency and debit actual notional plus modeled costs"
   assert.equal(s.positions[0].rawQty, "99000000");
   assert.equal(s.cashAtomic, "974917500");
   assert.equal(s.fills[0].costBasisAtomic, "25082500");
+});
+test("filled order retries resolve their saved intent and reject changed details", async () => {
+  const s = await entered();
+  assert.equal(isManualOrderRetry(s, buy()), true);
+  assert.equal(queueManualOrder(s, buy(), T + 90000), s);
+  assert.throws(() => isManualOrderRetry(s, buy("request-0001", "50")), /different order/);
+  assert.equal(isManualOrderRetry(s, buy("request-new-0001")), false);
 });
 test("partial sells use exact raw quantity and proportional entry costs", async () => {
   let s = await entered();

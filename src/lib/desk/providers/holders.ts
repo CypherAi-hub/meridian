@@ -8,6 +8,8 @@ import { makeHolderJob, takeHolderJobs, type HolderLookupJob } from "../holder-q
 import { budgetFor, parseRetryAfter } from "../rate-budget.ts";
 
 export type HolderObs = {
+  /** When this observation was received, preserved across cache reads/retries. */
+  observedAt?: number;
   holders: number | null;
   top10Pct: number | null;
   top20Pct: number | null;
@@ -55,17 +57,26 @@ function health(
   };
 }
 
-function asPct(n: number | null | undefined) {
-  if (n == null || !Number.isFinite(n)) return null;
-  return n > 1 ? n / 100 : n;
+function percentFraction(n: number) {
+  return n / 100;
 }
 
 function valid(obs: HolderObs | null): obs is HolderObs {
   return Boolean(obs && (obs.top10Pct != null || obs.holders != null) && obs.status === "VALID");
 }
 
-export function peekHolderCache(mint: string): { at: number; ttl: number; value: HolderObs } | null {
+export function peekHolderCache(
+  mint: string,
+): { at: number; ttl: number; value: HolderObs } | null {
   return cache.get(mint) ?? null;
+}
+
+function cachedObservation(hit: CacheEntry, now: number): HolderObs {
+  return {
+    ...hit.value,
+    observedAt: hit.value.observedAt ?? hit.at,
+    ...(now - hit.at >= hit.ttl && valid(hit.value) ? { status: "STALE" as const } : {}),
+  };
 }
 
 export function applyHolderObs(
@@ -74,14 +85,21 @@ export function applyHolderObs(
   eventTime: number,
   ingestedAt: number,
 ): TokenSnapshot {
+  // Receiving a cached value again is not a new security observation.
+  eventTime = h.observedAt ?? eventTime;
+  ingestedAt = h.observedAt ?? ingestedAt;
   const src = h.source;
   const st = h.status === "STALE" ? "STALE" : h.status === "VALID" ? "VALID" : "UNKNOWN";
   return {
     ...t,
     holders:
-      h.holders != null ? field(h.holders, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.holders,
+      h.holders != null
+        ? field(h.holders, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st)
+        : t.holders,
     top10Pct:
-      h.top10Pct != null ? field(h.top10Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st) : t.top10Pct,
+      h.top10Pct != null
+        ? field(h.top10Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st)
+        : t.top10Pct,
     top20Pct:
       h.top20Pct != null
         ? field(h.top20Pct, eventTime, ingestedAt, src === "rugcheck" ? "rugcheck" : src, st)
@@ -111,15 +129,34 @@ export function parseRugcheckReport(body: {
 }): HolderObs | null {
   const items = body.topHolders ?? [];
   if (!items.length) return null;
-  const top10 = items.slice(0, 10).reduce((a, it) => a + (Number(it.pct) || 0), 0);
-  const top20 = items.slice(0, 20).reduce((a, it) => a + (Number(it.pct) || 0), 0);
-  const largest = Number(items[0]?.pct) || 0;
+  return parseHolderPercentages(
+    items.map((it) => it.pct),
+    body.totalHolders,
+    "rugcheck",
+  );
+}
+
+function parseHolderPercentages(
+  values: Array<number | undefined>,
+  holders: number | undefined,
+  source: HolderObs["source"],
+): HolderObs | null {
+  if (
+    !values.length ||
+    values.some((n) => typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 100)
+  )
+    return null;
+  // These provider fields are percentage points, including values below 1%.
+  const sorted = [...(values as number[])].sort((a, b) => b - a);
+  const top10 = sorted.slice(0, 10).reduce((a, n) => a + n, 0);
+  const top20 = sorted.slice(0, 20).reduce((a, n) => a + n, 0);
+  if (top20 > 100 + 1e-8) return null;
   return {
-    holders: body.totalHolders ?? null,
-    top10Pct: asPct(top10),
-    top20Pct: asPct(top20),
-    largestPct: asPct(largest),
-    source: "rugcheck",
+    holders: Number.isSafeInteger(holders) && holders! >= 0 ? holders! : null,
+    top10Pct: Math.min(1, percentFraction(top10)),
+    top20Pct: Math.min(1, percentFraction(top20)),
+    largestPct: percentFraction(sorted[0]),
+    source,
     status: "VALID",
     errors: [],
   };
@@ -146,19 +183,15 @@ async function birdeyeHolders(mint: string): Promise<HolderObs | null> {
   };
   const items = body.data?.items ?? [];
   if (items.length) {
-    const top10 = items.slice(0, 10).reduce((a, it) => a + (Number(it.percentage) || 0), 0);
-    const top20 = items.slice(0, 20).reduce((a, it) => a + (Number(it.percentage) || 0), 0);
-    const largest = Number(items[0]?.percentage) || 0;
-    circuit.success();
-    return {
-      holders: body.data?.holder ?? body.data?.total ?? null,
-      top10Pct: asPct(top10),
-      top20Pct: asPct(top20),
-      largestPct: asPct(largest),
-      source: "birdeye",
-      status: "VALID",
-      errors: [],
-    };
+    const parsed = parseHolderPercentages(
+      items.map((it) => it.percentage),
+      body.data?.holder ?? body.data?.total,
+      "birdeye",
+    );
+    if (parsed) {
+      circuit.success();
+      return parsed;
+    }
   }
   circuit.failure("empty");
   return null;
@@ -169,7 +202,9 @@ async function heliusHolders(mint: string): Promise<HolderObs | null> {
   if (!key) return null;
   const circuit = breakerFor("helius:holders");
   if (!circuit.canCall()) throw new Error("circuit open");
-  const rpc = deskSettings().heliusRpcUrl ?? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
+  const rpc =
+    deskSettings().heliusRpcUrl ??
+    `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
   const r = await fetch(rpc, {
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json" },
@@ -200,9 +235,19 @@ async function heliusHolders(mint: string): Promise<HolderObs | null> {
 }
 
 function uiAmount(acc: { uiAmount?: number | null; amount?: string; decimals?: number }) {
-  if (acc.uiAmount != null && Number.isFinite(acc.uiAmount)) return acc.uiAmount;
-  if (acc.amount && acc.decimals != null) return Number(acc.amount) / 10 ** acc.decimals;
-  return 0;
+  if (acc.uiAmount != null)
+    return Number.isFinite(acc.uiAmount) && acc.uiAmount >= 0 ? acc.uiAmount : null;
+  if (
+    acc.amount &&
+    /^\d+$/.test(acc.amount) &&
+    Number.isInteger(acc.decimals) &&
+    acc.decimals! >= 0 &&
+    acc.decimals! <= 18
+  ) {
+    const amount = Number(acc.amount) / 10 ** acc.decimals!;
+    return Number.isFinite(amount) ? amount : null;
+  }
+  return null;
 }
 
 async function fromLargest(
@@ -211,9 +256,12 @@ async function fromLargest(
   source: HolderObs["source"],
 ): Promise<HolderObs | null> {
   if (!accounts.length) return null;
-  const top10 = accounts.slice(0, 10).reduce((a, b) => a + uiAmount(b), 0);
-  const top20 = accounts.slice(0, 20).reduce((a, b) => a + uiAmount(b), 0);
-  const largest = uiAmount(accounts[0] ?? {});
+  const amounts = accounts.map(uiAmount);
+  if (amounts.some((n) => n === null)) return null;
+  const sorted = (amounts as number[]).sort((a, b) => b - a);
+  const top10 = sorted.slice(0, 10).reduce((a, n) => a + n, 0);
+  const top20 = sorted.slice(0, 20).reduce((a, n) => a + n, 0);
+  const largest = sorted[0];
   let supply = 0;
   try {
     const s = await solanaRpc<{
@@ -225,11 +273,12 @@ async function fromLargest(
       params: [mint],
     });
     const v = s.result?.value;
-    supply = v?.uiAmount ?? (v?.amount && v.decimals != null ? Number(v.amount) / 10 ** v.decimals : 0);
+    supply = v ? (uiAmount(v) ?? 0) : 0;
   } catch {
-    supply = accounts.reduce((a, b) => a + uiAmount(b), 0);
+    // The largest accounts are only part of supply; never invent a denominator.
+    return null;
   }
-  if (!supply) return null;
+  if (!Number.isFinite(supply) || supply <= 0 || top20 > supply * (1 + 1e-8)) return null;
   return {
     holders: null,
     top10Pct: Math.min(1, top10 / supply),
@@ -297,11 +346,11 @@ export async function getHolderConcentration(
   const hit = cache.get(mint);
   const age = hit ? Date.now() - hit.at : Infinity;
   if (hit && age < hit.ttl) {
-    return hit.value;
+    return cachedObservation(hit, Date.now());
   }
   const staleFallback =
     hit && (hit.value.status === "VALID" || hit.value.status === "STALE")
-      ? { ...hit.value, status: "STALE" as const }
+      ? { ...cachedObservation(hit, Date.now()), status: "STALE" as const }
       : null;
   const errors: { provider: string; error: string }[] = [];
   const settings = deskSettings();
@@ -317,8 +366,9 @@ export async function getHolderConcentration(
     try {
       const result = await p.run();
       if (valid(result)) {
-        const value = { ...result, errors };
-        cache.set(mint, { at: Date.now(), ttl, value });
+        const observedAt = Date.now();
+        const value = { ...result, observedAt, errors };
+        cache.set(mint, { at: observedAt, ttl, value });
         return value;
       }
       errors.push({ provider: p.name, error: "empty" });
@@ -328,11 +378,12 @@ export async function getHolderConcentration(
   }
 
   if (staleFallback) {
-    cache.set(mint, { at: Date.now(), ttl: Math.min(ttl, 30_000), value: staleFallback });
-    return staleFallback;
+    const value = { ...staleFallback, errors };
+    cache.set(mint, { at: Date.now(), ttl: Math.min(ttl, 30_000), value });
+    return value;
   }
 
-  const unknown: HolderObs = unknownHolderObs(errors);
+  const unknown: HolderObs = { ...unknownHolderObs(errors), observedAt: Date.now() };
   cache.set(mint, { at: Date.now(), ttl: UNKNOWN_TTL, value: unknown });
   return unknown;
 }
@@ -355,11 +406,16 @@ export async function enrichHolders(
       }),
     );
   const pri = new Set(opts?.priority ?? []);
-  const boosted = jobs.map((j) => (pri.has(j.mint) ? { ...j, priority: Math.min(j.priority, 1) } : j));
+  const boosted = jobs.map((j) =>
+    pri.has(j.mint) ? { ...j, priority: Math.min(j.priority, 1) } : j,
+  );
   const targets = takeHolderJobs(boosted, MAX_PER_TICK);
   const results = await Promise.all(
     targets.map(async (job) => {
-      return { address: job.mint, h: await getHolderConcentration(job.mint, { bucket: job.bucket }) };
+      return {
+        address: job.mint,
+        h: await getHolderConcentration(job.mint, { bucket: job.bucket }),
+      };
     }),
   );
   const by = new Map(results.map((r) => [r.address, r.h]));
@@ -377,9 +433,7 @@ export async function enrichHolders(
   const next = tokens.map((t) => {
     const fetched = by.get(t.address);
     const cached = !fetched ? cache.get(t.address) : null;
-    const h = fetched ?? cached?.value;
-    const eventAt = fetched ? eventTime : cached?.at ?? eventTime;
-    const ingestedAtTick = fetched ? ingestedAt : cached?.at ?? ingestedAt;
+    const h = fetched ?? (cached ? cachedObservation(cached, eventTime) : null);
     if (!h) return t;
     if (h.source === "birdeye" && valid(h)) birdeyeOk = true;
     if (h.source === "helius" && valid(h)) heliusOk = true;
@@ -391,7 +445,7 @@ export async function enrichHolders(
       if (e.provider === "solana") rpcErr = e.error;
       if (e.provider === "rugcheck") rugErr = e.error;
     }
-    return applyHolderObs(t, h, eventAt, ingestedAtTick);
+    return applyHolderObs(t, h, eventTime, ingestedAt);
   });
 
   const lagMs = Date.now() - t0;
@@ -399,8 +453,20 @@ export async function enrichHolders(
     tokens: next,
     lagMs,
     sources: [
-      health("birdeye", birdeyeOk, lagMs, birdeyeOk ? "top10" : birdeyeErr, !settings.birdeyeApiKey && !birdeyeOk),
-      health("helius", heliusOk, lagMs, heliusOk ? "top10" : heliusErr, !settings.heliusApiKey && !heliusOk),
+      health(
+        "birdeye",
+        birdeyeOk,
+        lagMs,
+        birdeyeOk ? "top10" : birdeyeErr,
+        !settings.birdeyeApiKey && !birdeyeOk,
+      ),
+      health(
+        "helius",
+        heliusOk,
+        lagMs,
+        heliusOk ? "top10" : heliusErr,
+        !settings.heliusApiKey && !heliusOk,
+      ),
       health("solana", rpcOk, lagMs, rpcOk ? "largest accounts" : rpcErr),
       health("rugcheck", rugOk, lagMs, rugOk ? "topHolders" : rugErr),
     ],

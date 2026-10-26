@@ -74,6 +74,28 @@ export function usdAtomic(value: string): string {
 }
 const cost = (notional: bigint) => notional + (notional * 25n) / 10000n + 20000n;
 const output = (raw: string) => (BigInt(raw) * 9900n) / 10000n;
+export type ManualOrderIntent = {
+  requestId: string;
+  side: "BUY" | "SELL";
+  mint: string;
+  amountUsdc?: string;
+  percent?: number;
+};
+/** A retry must resolve from the saved intent, even when providers are unavailable. */
+export function isManualOrderRetry(book: ManualBook, input: ManualOrderIntent): boolean {
+  if (!/^[\w-]{8,100}$/.test(input.requestId)) throw Error("A valid request ID is required");
+  const existing = book.orders.find((o) => o.requestId === input.requestId);
+  if (!existing) return false;
+  if (
+    existing.mint !== input.mint ||
+    existing.side !== input.side ||
+    (input.side === "BUY"
+      ? existing.amountAtomic !== usdAtomic(input.amountUsdc ?? "")
+      : existing.percent !== input.percent)
+  )
+    throw Error("Request ID already used for a different order");
+  return true;
+}
 export function queueManualOrder(
   book: ManualBook,
   input: {
@@ -87,19 +109,7 @@ export function queueManualOrder(
   },
   now: number,
 ): ManualBook {
-  if (!/^[\w-]{8,100}$/.test(input.requestId)) throw Error("A valid request ID is required");
-  const existing = book.orders.find((o) => o.requestId === input.requestId);
-  if (existing) {
-    if (
-      existing.mint !== input.mint ||
-      existing.side !== input.side ||
-      (input.side === "BUY"
-        ? existing.amountAtomic !== usdAtomic(input.amountUsdc ?? "")
-        : existing.percent !== input.percent)
-    )
-      throw Error("Request ID already used for a different order");
-    return book;
-  }
+  if (isManualOrderRetry(book, input)) return book;
   if (book.orders.length >= 5000) throw Error("Paper order history limit reached");
   if (book.orders.some((o) => o.mint === input.mint && o.status === "PENDING"))
     throw Error("A paper order for this token is already pending");
