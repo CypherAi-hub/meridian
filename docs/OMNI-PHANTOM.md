@@ -12,6 +12,8 @@ Run the PHANTOM paper worker and Omni on the same Windows computer. Native Node 
 
 The bridge has a 4.5-second request timeout, four-MiB response limit, two-second server cache and shared in-flight request. The client polls every three seconds. A dead or incompatible source produces a readable unavailable state rather than a fabricated feed. Endpoint errors do not forward provider URLs, credentials or response bodies.
 
+`state.now` preserves the upstream clock and `state.sampledAt` records Omni's server receipt time. Failed polling never renews the last successful snapshot timestamp. Retained observations keep aging while the source is disconnected.
+
 The root integration has no dependency on `packages/phantom` or its Node modules. Its code and dependency lifecycle remain owned by the PHANTOM package. The package can be merged beside this UI without replacing the root app, private `.env`, research data, or existing paper histories.
 
 ## Evidence and display semantics

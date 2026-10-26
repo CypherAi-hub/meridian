@@ -65,8 +65,10 @@ export function usePhantomReport() {
         const data = (await r.json()) as PhantomReport;
         if (active) {
           setReport(data);
-          if (data.state) setSnapshot(data.state);
-          setReceivedAt(Date.now());
+          if (data.state) {
+            setSnapshot(data.state);
+            setReceivedAt(Date.now());
+          }
           setError("");
         }
       } catch {
@@ -124,7 +126,7 @@ export function LaunchEngine({
     (d) => strategy === "all" || d.strategy === strategy,
   );
   const strategies = [...new Set(display?.decisions.map((d) => d.strategy) ?? [])];
-  const timeNow = state && receivedAt ? state.now + now - receivedAt : now;
+  const timeNow = state && receivedAt ? state.sampledAt + now - receivedAt : now;
   const statusLabel =
     status === "live"
       ? "Observing Solana"
@@ -146,7 +148,7 @@ export function LaunchEngine({
           <h1>
             Watch the chain<span>.</span>
           </h1>
-          <p>Verified activity, observed signals, and a separate paper account.</p>
+          <p>Observed chain activity, recorded signals, and a separate paper account.</p>
         </div>
         <div className="omni-live-heading-right">
           <span className={"omni-live-status " + (status === "live" ? "running" : "waiting")}>
@@ -185,7 +187,13 @@ export function LaunchEngine({
         <div>
           <span>Completed position net</span>
           <strong
-            className={state?.completedNetLamports?.startsWith("-") ? "negative" : "positive"}
+            className={
+              state?.completedNetLamports == null
+                ? ""
+                : state.completedNetLamports.startsWith("-")
+                  ? "negative"
+                  : "positive"
+            }
           >
             {phantomSol(state?.completedNetLamports)}
             <small> SOL</small>
@@ -210,7 +218,13 @@ export function LaunchEngine({
               <h2>Launch radar</h2>
               <span className={"omni-feed-live " + (status === "live" && !frozen ? "" : "muted")}>
                 <i />
-                {frozen ? "VIEW PAUSED" : fresh ? "READ ONLY" : "LAST SNAPSHOT"}
+                {frozen
+                  ? "VIEW PAUSED"
+                  : fresh
+                    ? "READ ONLY"
+                    : state
+                      ? "LAST SNAPSHOT"
+                      : "NOT CONNECTED"}
               </span>
             </div>
             <button

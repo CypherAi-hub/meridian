@@ -170,7 +170,10 @@ test("large balances stay exact and non-SOL quote mints remain explicit", () => 
   assert.equal(phantomSol("-21", 9), "−0.000000021");
 });
 test("upstream snapshot time and observation age control freshness", () => {
-  assert.equal(parsePhantomState(sample(), T + 20000).status, "stale");
+  const late = parsePhantomState(sample(), T + 20000);
+  assert.equal(late.status, "stale");
+  assert.equal(late.state!.now, T);
+  assert.equal(late.state!.sampledAt, T + 20000);
   const s = sample();
   s.events = [];
   s.health.lastEventAt = T - 70000;

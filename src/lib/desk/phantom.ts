@@ -122,6 +122,7 @@ export type PhantomPosition = z.infer<typeof positionSchema>;
 export type PhantomCompleted = z.infer<typeof completedSchema>;
 export type PhantomState = {
   now: number;
+  sampledAt: number;
   startedAt: number;
   sourceVersion: string | null;
   health: z.infer<typeof healthSchema>;
@@ -271,6 +272,7 @@ export function parsePhantomState(input: unknown, receivedAt: number): PhantomRe
         : "Read-only paper engine connected.",
     state: {
       now: source.now,
+      sampledAt: receivedAt,
       startedAt: source.startedAt,
       sourceVersion:
         source.sourceVersion && /^[a-f0-9]{40,64}$/i.test(source.sourceVersion)
