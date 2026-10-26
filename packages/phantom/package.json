@@ -1,0 +1,48 @@
+{
+  "name": "@meridian/phantom",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "paper": "node --env-file-if-exists=.env --import tsx src/cli.ts paper",
+    "replay": "node --env-file-if-exists=.env --import tsx src/cli.ts replay",
+    "migrate": "node --env-file-if-exists=.env --import tsx src/cli.ts migrate",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dashboard": "next dev dashboard --hostname 127.0.0.1 --port 8791",
+    "build": "next build dashboard",
+    "export:replay": "node --env-file-if-exists=.env --import tsx src/cli.ts export-replay",
+    "walk-forward": "node --env-file-if-exists=.env --import tsx src/cli.ts walk-forward",
+    "kill": "node --env-file-if-exists=.env --import tsx src/cli.ts kill",
+    "research": "python research/analyze.py",
+    "research:test": "python -m unittest discover -s research -p 'test_*.py'",
+    "research:forward:test": "node --experimental-strip-types --test research/forward_cohort.test.ts research/forward_cohort_sql.test.ts"
+  },
+  "dependencies": {
+    "@pump-fun/pump-sdk": "4.3.1",
+    "@pump-fun/pump-swap-sdk": "2.2.0",
+    "@triton-one/yellowstone-grpc": "9.0.1",
+    "@solana/web3.js": "1.98.4",
+    "@solana/spl-token": "0.4.15",
+    "@coral-xyz/anchor": "0.31.1",
+    "bs58": "6.0.0",
+    "pg": "8.23.1",
+    "next": "16.4.3",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "zod": "4.6.7",
+    "@electric-sql/pglite": "0.5.4"
+  },
+  "devDependencies": {
+    "vitest": "5.0.5",
+    "tsx": "4.23.15",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.16.5",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19.2.0"
+  },
+  "overrides": {
+    "jayson": "5.0.0",
+    "toml": "5.0.1"
+  }
+}
