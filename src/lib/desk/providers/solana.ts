@@ -48,9 +48,11 @@ function decodeB64(data: string) {
   return buf;
 }
 
-function parseMint(dataB64: string) {
+export const LEGACY_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+export function parseMintAccount(dataB64: string, owner: string | undefined) {
   const buf = decodeB64(dataB64);
-  if (buf.length < 82) return null;
+  // Extension-bearing Token-2022 accounts need a dedicated extension audit.
+  if (owner !== LEGACY_TOKEN_PROGRAM || buf.length !== 82 || buf[45] !== 1) return null;
   return {
     mintAuth: u32(buf, 0) !== 0,
     freezeAuth: u32(buf, 46) !== 0,
@@ -87,10 +89,12 @@ export async function enrichSolana(tokens: TokenSnapshot[]): Promise<{
       slice.map((t, i) => {
         const acc = accounts[i];
         const data = acc?.data?.[0];
-        const mint = data ? parseMint(data) : null;
+        const mint = data ? parseMintAccount(data, acc?.owner) : null;
         const next: TokenSnapshot = {
           ...t,
           decimals: mint?.decimals ?? t.decimals,
+          mintSafety: {program:acc?.owner??"UNKNOWN",initialized:Boolean(mint),supported:Boolean(mint),
+            ...(!mint?{reason:acc?.owner===LEGACY_TOKEN_PROGRAM?"INVALID_OR_UNINITIALIZED_MINT":"UNSUPPORTED_TOKEN_PROGRAM"}:{})},
           mintAuth: mint ? field(mint.mintAuth, eventTime, ingestedAt, "solana") : t.mintAuth,
           freezeAuth: mint ? field(mint.freezeAuth, eventTime, ingestedAt, "solana") : t.freezeAuth,
         };

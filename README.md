@@ -1,8 +1,14 @@
-# Meridian
+# Omni
 
-Editorial paper-only research desk for Solana meme-coin tape.
+Solana market terminal with real pool charts, contract search, manual paper orders, and automated paper research. Formerly Meridian.
 
-Real data. Paper fills only. No wallet. No live broadcast. No autonomous trading. No ML yet.
+Real market data. Simulated fills only. The three automated paper experiments and the manual account keep separate balances and histories. Wallet signing and funded execution remain locked. No trained model or profitability is claimed.
+
+Double-click `Run-Omni.cmd` on Windows after installing Node.js 22+ and Docker Desktop. Open `http://localhost:8080`. See [the Omni terminal guide](docs/OMNI-TERMINAL.md) for charts and paper orders and [Windows setup](docs/WINDOWS-SELFHOST.md) for the persistent local database.
+
+The repository name, database, Docker project, environment variables, and older launcher filenames retain Meridian identifiers so existing installations keep their data. There is no need to rename a working installation or reset its warehouse.
+
+The default **Live bot** screen shows persisted automatic paper decisions, current open exposure and independent strategy accounts. Its separate **On-chain pool** view shows a recent public Solana transaction-signature sample. Paper fills and blockchain transactions keep distinct labels. See [the feed contract](docs/OMNI-LIVE-API.md). Windows installations can use `Enable-Omni-Autostart.cmd` for start after user sign-in; actual Windows startup must be verified on that PC.
 
 V3.3A.2 manufactures new training-grade experience going forward. Historical sparse rows stay historical. Collection epochs isolate preview/legacy from production.
 
@@ -38,3 +44,11 @@ node --experimental-strip-types scripts/audit-corpus.mjs input.json new-audit.js
 Each record must contain its immutable frozen decision and full outcome path separately. The audit independently checks the one-hour path including leading/trailing gaps, first +10%/-10% hit, source timestamps, and source values for seven explicitly listed inputs. It excludes legacy labels and never rewrites the warehouse. It emits both source and accepted-dataset SHA-256 hashes. This is a path/input audit, not complete production certification or a training authorization.
 
 This branch adds no fitting function or model execution path. The separate preview already contains V3.4 split, embargo, grading, baseline, and model-lock modules; those must be reconciled before model work. This audit does not check Grade A/B, route coverage, or all collection gates, and its accepted rows must never be treated as a certified training set. The existing gates and 72-hour soak remain required.
+
+## Run on your own Windows PC
+
+See [Windows self-host instructions](docs/WINDOWS-SELFHOST.md). The Docker Compose setup runs PostgreSQL and the built web app locally, with an optional paper-only worker and persistent storage.
+
+## Future funded-mode preparation
+
+The local capital policy stores public payout preferences and previews distributions of net realized paper profit while protecting principal. Live actions remain locked. See [funding preparation](docs/FUTURE-FUNDING.md).

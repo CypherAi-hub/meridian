@@ -40,6 +40,7 @@ export async function ingestTape(opts?: {
   focus?: string | null;
   watch?: string[];
   pending?: string[];
+  reserveQuotes?: boolean;
 }): Promise<MarketTape> {
   const key = `${[...(opts?.held ?? [])].sort().join(",")}|${opts?.focus ?? ""}|${[...(opts?.watch ?? [])].sort().join(",")}`;
   if (cache && cache.key === key && Date.now() - cache.at < TTL && cache.tape.tokens.length) return cache.tape;
@@ -103,6 +104,7 @@ export async function ingestSlowEnrichment(opts: {
   mints: string[];
   held?: string[];
   pending?: string[];
+  reserveQuotes?: boolean;
 }): Promise<MarketTape> {
   const t0 = Date.now();
   const want = new Set(opts.mints);
@@ -118,7 +120,7 @@ export async function ingestSlowEnrichment(opts: {
     }),
   );
   const holders = await enrichHolders(targets, { jobs, priority: opts.mints });
-  const quoted = await quotePriorityTargets(holders.tokens, opts.tape.solPriceUsd, {
+  const quoted = opts.reserveQuotes ? holders.tokens : await quotePriorityTargets(holders.tokens, opts.tape.solPriceUsd, {
     held,
     pending,
     focus: want,
@@ -242,6 +244,7 @@ async function ingestOnce(opts?: {
   focus?: string | null;
   watch?: string[];
   pending?: string[];
+  reserveQuotes?: boolean;
 }): Promise<MarketTape> {
   const t0 = Date.now();
   const pin = [...new Set([...(opts?.held ?? []), ...(opts?.focus ? [opts.focus] : []), ...(opts?.watch ?? [])])].slice(
@@ -295,7 +298,7 @@ async function ingestOnce(opts?: {
 
   const jupBudget = budgetFor("jupiter", deskSettings().jupiterApiKey ? JUPITER_KEYED_BUDGET : undefined);
   let jupProbe = null as Awaited<ReturnType<typeof quoteSolUsdc>> | null;
-  if (!solPrice) {
+  if (!solPrice && !opts?.reserveQuotes) {
     jupProbe = await quoteSolUsdc();
     if (jupProbe.available && Number(jupProbe.outAmount) > 0) {
       solPrice = Number(jupProbe.outAmount) / 1e6 / 0.01;
@@ -313,7 +316,7 @@ async function ingestOnce(opts?: {
     }),
   );
   const holders = await enrichHolders(sol.tokens, { jobs, priority: pin });
-  const quoted = await quotePriorityTargets(holders.tokens, solPrice, {
+  const quoted = opts?.reserveQuotes ? holders.tokens : await quotePriorityTargets(holders.tokens, solPrice, {
     held,
     pending,
     focus: new Set(pin),

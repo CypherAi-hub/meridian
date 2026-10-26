@@ -1,0 +1,1 @@
+{"source":"Solana mainnet getTransaction (finalized, json, maxSupportedTransactionVersion=0)","signature":"5rDXhYfpZh38wiJrBGSv3Wbaktqp66YfigXtuMY6wxP9dxhjwHvDGcoJA5GAyr7xz3Y9bVHWqmAFBC7aEFMLr4w9","slot":461770647,"synthetic":false,"capturedDate":"2026-10-26","note":"Public chain fixture. No signer secrets. Separate generated fixtures in decoder.test.ts are synthetic."}

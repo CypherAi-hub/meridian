@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "Meridian";
+const APP_NAME = "Omni";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -11,10 +11,10 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: APP_NAME },
-      { name: "theme-color", content: "#0a0b0d" },
+      { name: "theme-color", content: "#080c12" },
       {
         name: "description",
-        content: "Event-driven Solana paper desk. Models score. The governor decides.",
+        content: "Omni — a Solana trading workspace. Live market charts, manual paper orders, and automated strategy research.",
       },
     ],
     links: [

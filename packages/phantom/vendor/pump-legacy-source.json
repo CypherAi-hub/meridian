@@ -1,0 +1,9 @@
+{
+  "commit": "e0687ae9b7e064a0f54efc7297c65eecfbba3a8f",
+  "url": "https://github.com/pump-fun/pump-public-docs/tree/e0687ae9b7e064a0f54efc7297c65eecfbba3a8f",
+  "files": [
+    "pump-2026-09-12.json",
+    "pump_amm-2026-09-12.json"
+  ],
+  "reason": "Official pre-V3 schemas retained to decode successful pre-upgrade instruction/event layouts without padding or invented fields."
+}

@@ -1,0 +1,71 @@
+name: meridian-selfhost
+x-app: &app
+  image: meridian-selfhost:local
+  build:
+    context: .
+    dockerfile: Dockerfile.selfhost
+  restart: unless-stopped
+  init: true
+  environment: &environment
+    DATABASE_URL: postgresql://meridian:${POSTGRES_PASSWORD:?Run node scripts/selfhost.mjs init first}@db:5432/meridian
+    MERIDIAN_ENV: production
+    MERIDIAN_EXECUTION_MODE: PAPER
+    VITE_AUTH_ENABLED: "false"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: meridian
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run node scripts/selfhost.mjs init first}
+    volumes:
+      - warehouse:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["node", "scripts/migrate.mjs"]
+    depends_on:
+      db:
+        condition: service_healthy
+  web:
+    <<: *app
+    environment:
+      <<: *environment
+      HOST: 0.0.0.0
+      PORT: "8080"
+      MERIDIAN_WORKER: "0"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  worker:
+    <<: *app
+    profiles: ["collect"]
+    command: ["npm", "run", "worker"]
+    environment:
+      <<: *environment
+      UNIVERSE_INTERVAL_MS: "60000"
+      ACTIVE_INTERVAL_MS: "10000"
+      MAX_ACTIVE_WATCHES: "10"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+volumes:
+  warehouse:

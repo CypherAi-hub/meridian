@@ -1,3 +1,5 @@
+import { CapitalPanel } from "./capital-panel";
+import { SniperPanel } from "./sniper-panel";
 import { TrainingReadinessPanel } from "./training-readiness";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
@@ -62,7 +64,7 @@ export function DeskApp() {
     <div className="flex min-h-dvh flex-col bg-bg text-fg">
       <header className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-6">
         <div className="flex items-baseline gap-3">
-          <h1 className="font-sans text-lg font-medium tracking-tight">Meridian</h1>
+          <h1 className="font-sans text-lg font-medium tracking-tight">Omni</h1>
           <p className="hidden text-xs text-muted lg:block">V3.3B · warehouse replay</p>
         </div>
         <Badge variant={desk.worker.db === "neon" ? "up" : "warn"}>
@@ -132,6 +134,8 @@ export function DeskApp() {
         ))}
       </div>
 
+      <SniperPanel />
+      <CapitalPanel />
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_minmax(280px,0.9fr)]">
         <section className={cn("min-h-0 border-b border-border lg:border-b-0 lg:border-r", hide(tab, "scan"))}>
           <SectionHead
