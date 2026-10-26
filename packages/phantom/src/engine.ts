@@ -603,6 +603,7 @@ export class Engine {
   }
   async tick() {
     if (this.stopped) return;
+    if (!(await this.workerLeaseAvailable())) return;
     this.ledger.state.killSwitch = this.killed();
     for (const order of [...this.ledger.state.pending]) {
       if (Date.now() < order.readyAt) continue;
@@ -660,6 +661,7 @@ export class Engine {
           throw Error("SIGNAL_NO_LONGER_VALID_AT_FILL");
         this.ledger.state.killSwitch = this.killed();
         if (this.stopped) throw Error("WORKER_STOPPING_NO_ENTRY");
+        if (!(await this.workerLeaseAvailable())) return;
         const verdict = this.ledger.fill(
           order,
           quote,
@@ -707,6 +709,7 @@ export class Engine {
             amount: pending.quantityRaw,
             slippageBps: pending.slippageBps,
           });
+          if (!(await this.workerLeaseAvailable())) return;
           this.ledger.close(
             p,
             quote,
@@ -725,6 +728,7 @@ export class Engine {
           amount: p.quantityRaw,
           slippageBps: 100,
         });
+        if (!(await this.workerLeaseAvailable())) return;
         this.ledger.mark(p, quote, 10_000n, Date.now());
         await this.persistLedger();
         const event = this.events.find((e) => e.mint === p.mint);
@@ -756,6 +760,15 @@ export class Engine {
     }
     this.ledger.recordEquity(Date.now());
     await this.persistLedger();
+  }
+  private async workerLeaseAvailable() {
+    try {
+      this.store.assertWorkerLease();
+      return true;
+    } catch {
+      await this.latchSuspension("DATABASE_WORKER_LEASE_LOST_ALL_SETTLEMENT_SUSPENDED");
+      return false;
+    }
   }
   private async latchSuspension(reason: string) {
     this.suspensionReason = reason;
@@ -870,14 +883,21 @@ export class Engine {
     this.ledger.governor.kill();
     if (this.timer) clearInterval(this.timer);
     if (this.researchTimer) clearInterval(this.researchTimer);
-    await this.source?.stop();
-    await this.work;
-    await this.tickWork;
-    await this.researchWork;
-    while (this.walletJobs.size) await new Promise((r) => setTimeout(r, 100));
-    await this.quoteResearch.idle();
-    await this.persistLedger();
-    await new Promise<void>((r) => this.stateServer?.close(() => r()));
-    await this.store.close();
+    try {
+      await this.source?.stop();
+      await this.work;
+      await this.tickWork;
+      await this.researchWork;
+      while (this.walletJobs.size) await new Promise((r) => setTimeout(r, 100));
+      await this.quoteResearch.idle();
+      if (this.store.workerLeaseHealthy) await this.persistLedger();
+    } finally {
+      try {
+        if (this.stateServer?.listening)
+          await new Promise<void>((r) => this.stateServer!.close(() => r()));
+      } finally {
+        await this.store.close();
+      }
+    }
   }
 }

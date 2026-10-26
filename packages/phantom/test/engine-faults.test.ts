@@ -181,6 +181,58 @@ function enter(ledger: PaperLedger, mint: string, id: string) {
 }
 
 describe("engine economic and audit fault boundaries", () => {
+  it("suspends without settling an entry when the worker lease is lost during repricing", async () => {
+    const f = fixture();
+    queue(f);
+    let healthy = true,
+      requests = 0;
+    vi.spyOn(f.engine.store, "assertWorkerLease").mockImplementation(() => {
+      if (!healthy) throw Error("PHANTOM_WORKER_LEASE_LOST");
+    });
+    const provider = f.internal.quote;
+    f.engine.setQuoteProvider({
+      quote: async (input) => {
+        const result = await provider.quote(input);
+        if (++requests === 4) healthy = false;
+        return result;
+      },
+    });
+    await f.engine.tick();
+    expect(requests).toBe(4);
+    expect(f.ledger.state.positions).toEqual([]);
+    expect(f.ledger.state.cashLamports).toBe(1_000_000_000n);
+    expect(f.ledger.state.pending).toHaveLength(1);
+    expect(f.ledger.state.killSwitch).toBe(true);
+    expect(f.rows.get("suspension").reason).toBe(
+      "DATABASE_WORKER_LEASE_LOST_ALL_SETTLEMENT_SUSPENDED",
+    );
+  });
+  it("preserves unresolved inventory when the worker lease is lost during an exit quote", async () => {
+    const f = fixture();
+    enter(f.ledger, f.e.mint, "SYNTHETIC-LEASE-EXIT");
+    const position = f.ledger.state.positions[0];
+    f.ledger.queueExit(position, position.quantityRaw, "stop_loss", Date.now() - 3000, 2000);
+    const cash = f.ledger.state.cashLamports,
+      quantity = position.quantityRaw;
+    let healthy = true;
+    vi.spyOn(f.engine.store, "assertWorkerLease").mockImplementation(() => {
+      if (!healthy) throw Error("PHANTOM_WORKER_LEASE_LOST");
+    });
+    const provider = f.internal.quote;
+    f.engine.setQuoteProvider({
+      quote: async (input) => {
+        const result = await provider.quote(input);
+        healthy = false;
+        return result;
+      },
+    });
+    await f.engine.tick();
+    expect(f.ledger.state.positions[0].quantityRaw).toBe(quantity);
+    expect(f.ledger.state.cashLamports).toBe(cash);
+    expect(f.ledger.state.trades).toEqual([]);
+    expect(f.ledger.state.pendingExits).toHaveLength(1);
+    expect(f.ledger.state.killSwitch).toBe(true);
+  });
   it("persists a filled position before audit capture and preserves it when capture fails", async () => {
     const f = fixture();
     queue(f);
