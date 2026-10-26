@@ -306,5 +306,7 @@ export function phantomSol(value: string | null | undefined, precision = 5): str
   if (value == null) return "—";
   const n = BigInt(value),
     abs = n < 0n ? -n : n;
+  if (precision < 9 && abs > 0n && abs < 10n ** BigInt(9 - precision))
+    return `${n < 0n ? "−" : ""}0.${abs.toString().padStart(9, "0").replace(/0+$/, "")}`;
   return `${n < 0n ? "−" : ""}${abs / 1000000000n}.${(abs % 1000000000n).toString().padStart(9, "0").slice(0, precision)}`;
 }

@@ -353,6 +353,10 @@ export function LaunchEngine({
                         <p>
                           Token raw amount: {e.amountRaw ?? "unknown"}
                           <br />
+                          Quote raw amount: {e.quoteAmountRaw ?? "unknown"}
+                          <br />
+                          Quote mint: {e.quoteMint ?? "unknown"}
+                          <br />
                           Quantity evidence: {e.quantityEvidence ?? "unknown"}
                           <br />
                           These are on-chain observations, not this bot’s fills.
