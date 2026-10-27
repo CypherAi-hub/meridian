@@ -1571,6 +1571,7 @@ export class Engine {
       now: Date.now(),
       health: {
         ...this.health,
+        ...(this.rpc.usageExhausted ? { lastError: "RPC_PROVIDER_USAGE_EXHAUSTED" } : {}),
         typedLogs: this.rpcSource?.logMetrics() ?? null,
         typedObserved: this.typedObserved,
         status:

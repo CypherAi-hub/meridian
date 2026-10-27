@@ -632,7 +632,11 @@ export function LaunchEngine({
             {health?.lastError && (
               <details>
                 <summary>Latest source issue</summary>
-                <p>{health.lastError}</p>
+                <p>
+                  {health.lastError === "RPC_PROVIDER_USAGE_EXHAUSTED"
+                    ? "The data provider has reached its usage allowance. Restore provider access and restart the worker after review. New observations are unavailable; existing books and history are retained."
+                    : health.lastError}
+                </p>
               </details>
             )}
           </section>

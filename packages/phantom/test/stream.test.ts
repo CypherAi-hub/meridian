@@ -22,6 +22,24 @@ function checkpointStore(slot: string | null = null) {
 }
 
 describe('public RPC budget and errors', () => {
+  it('latches the observed hard usage denial without retries or later provider calls', async () => {
+    const send = vi.fn(async () => new Response('max usage reached', { status: 429 }));
+    const pause = vi.fn(async () => undefined);
+    const rpc = new Rpc('https://secret-token.synthetic.invalid', 0, { fetch: send as typeof fetch, sleep: pause });
+    const outcomes = await Promise.allSettled([rpc.call('getHealth', []), rpc.call('getTransaction', [])]);
+    expect(outcomes.map(x => x.status)).toEqual(['rejected', 'rejected']);
+    for (const outcome of outcomes) if (outcome.status === 'rejected') expect(outcome.reason.message).toBe('RPC_PROVIDER_USAGE_EXHAUSTED');
+    expect(rpc.usageExhausted).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(pause).not.toHaveBeenCalled();
+  });
+  it('does not classify a generic transient 429 or a different HTTP error as account exhaustion', async () => {
+    for (const [status, body] of [[429, 'too many requests'], [503, 'max usage reached']] as const) {
+      const rpc = new Rpc('https://synthetic.invalid', 0, { retries: 0, fetch: vi.fn(async () => new Response(body, { status })) as typeof fetch });
+      await expect(rpc.call('getHealth', [])).rejects.toThrow(`RPC_getHealth_HTTP_${status}`);
+      expect(rpc.usageExhausted).toBe(false);
+    }
+  });
   it('serializes requests across Retry-After 429 cooldown instead of flooding retries', async () => {
     let now = 0; const pauses: number[] = [], sent: number[] = [];
     let calls = 0;
@@ -160,6 +178,45 @@ function wsFixture() {
   const socket = { onopen: null as (() => void) | null, onmessage: null as ((event: { data: unknown }) => void) | null, onerror: null as (() => void) | null, onclose: null as (() => void) | null, send: vi.fn(), close: vi.fn() };
   return { socket, notify: (s: string, slot = 123, logs: string[] = []) => socket.onmessage?.({ data: JSON.stringify({ method: 'logsNotification', params: { result: { context: { slot }, value: { signature: s, logs, err: null } } } }) }) };
 }
+
+describe('observed provider usage exhaustion and durable coverage', () => {
+  it('closes the socket, releases queued work, retains cursors and stops reconnect/backfill requests', async () => {
+    const ws = wsFixture(), store = cursorStore(signature(1)), h = health();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const send = vi.fn(async () => { await gate; return new Response('max usage reached', { status: 429 }); });
+    const rpc = new Rpc('https://synthetic.invalid', 0, { fetch: send as typeof fetch });
+    const factory = vi.fn(() => ws.socket);
+    const receive = vi.fn(async () => undefined);
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', store, h, receive, { websocket: factory, reconnectMs: 1 });
+    stream.start();
+    const first = (stream as any).enqueue(signature(2));
+    const queued = (stream as any).enqueue(signature(3));
+    release();
+    expect(await first).toBe(false); expect(await queued).toBe(false);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ws.socket.close).toHaveBeenCalledOnce();
+    expect(ws.socket.onclose).toBeNull();
+    expect(h.lastError).toBe('RPC_PROVIDER_USAGE_EXHAUSTED');
+    expect(h.backfillGaps).toBeGreaterThan(0);
+    expect(h.queueDepth).toBe(0);
+    expect(store.cursors.get(PROGRAMS[0])).toBe(signature(1));
+    await stream.backfill();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(send).toHaveBeenCalledTimes(1); expect(factory).toHaveBeenCalledOnce();
+    expect(receive).not.toHaveBeenCalled();
+    await stream.stop();
+  });
+  it('does not open another stream after another owner of the shared RPC discovered the usage limit', async () => {
+    const rpc = new Rpc('https://synthetic.invalid', 0, { fetch: vi.fn(async () => new Response('max usage reached', { status: 429 })) as typeof fetch });
+    await expect(rpc.call('getHealth', [])).rejects.toThrow('RPC_PROVIDER_USAGE_EXHAUSTED');
+    const factory = vi.fn(() => wsFixture().socket), h = health();
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), h, async () => undefined, { websocket: factory });
+    stream.start(); await stream.backfill(); await stream.stop();
+    expect(factory).not.toHaveBeenCalled();
+    expect(h.lastError).toBe('RPC_PROVIDER_USAGE_EXHAUSTED');
+  });
+});
 describe('independent bounded finalized typed-log path', () => {
   it('uses actorless SOL hints to order full enrichment while retaining zero invented trade events', async () => {
     const ws = wsFixture(), fetched: string[] = [];

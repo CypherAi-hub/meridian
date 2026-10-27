@@ -9,17 +9,29 @@ export interface RpcOptions { fetch?: typeof fetch; sleep?: (ms: number) => Prom
 /** One serialized lane, including HTTP backoff, prevents retry storms on public RPCs. */
 export class Rpc {
   private next = 0; private sequence = 0; private lane: Promise<unknown> = Promise.resolve();
+  private exhausted = false;
+  get usageExhausted() { return this.exhausted; }
   constructor(readonly url: string, readonly intervalMs = 1000, private options: RpcOptions = {}) {}
   call<T>(method: string, params: unknown[]): Promise<T> {
     const turn = this.lane.then(() => this.request<T>(method, params));
     this.lane = turn.catch(() => undefined); return turn;
   }
   private async request<T>(method: string, params: unknown[]): Promise<T> {
+    if (this.exhausted) throw Error('RPC_PROVIDER_USAGE_EXHAUSTED');
     const pause = this.options.sleep ?? sleep, now = this.options.now ?? Date.now, send = this.options.fetch ?? fetch;
     for (let attempt = 0; ; attempt++) {
       if (this.next > now()) await pause(this.next - now());
       this.next = now() + this.intervalMs;
       const response = await send(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++this.sequence, method, params }), signal: AbortSignal.timeout(12_000) });
+      if (response.status === 429) {
+        // This exact account-usage denial was observed on the configured provider.
+        // Ordinary transient throttling retains the existing Retry-After behavior.
+        const body = await response.text();
+        if (body.trim().toLowerCase() === 'max usage reached') {
+          this.exhausted = true;
+          throw Error('RPC_PROVIDER_USAGE_EXHAUSTED');
+        }
+      }
       const retryable = response.status === 429 || response.status === 503;
       if (retryable && attempt < (this.options.retries ?? 3)) {
         const header = response.headers.get('retry-after');
@@ -27,7 +39,7 @@ export class Rpc {
         const cooldown = Math.min(60_000, Math.max((response.status === 429 ? 10_000 : 1000) * 2 ** attempt, Number.isFinite(requested) ? requested : 0));
         this.next = now() + cooldown;
         // Consume response to release connections; do not print provider bodies or credential-bearing URLs.
-        await response.arrayBuffer(); continue;
+        if (!response.bodyUsed) await response.arrayBuffer(); continue;
       }
       if (!response.ok) throw Error(`RPC_${method}_HTTP_${response.status}`);
       const body = await response.json() as { result?: T; error?: { code?: number } };
@@ -77,8 +89,26 @@ export class SolanaStream {
   private logQueue: FinalizedLogEnvelope[] = []; private logQueued = new Set<string>(); private logSeen = new Map<string, number>(); private logBusy = false;
   private typedMetrics: Omit<TypedLogMetrics, 'latencyMs'> = { received: 0, processed: 0, priorityHints: 0, dropped: 0, errors: 0, queueDepth: 0 }; private typedLatencies: number[] = [];
   private busy = false; private timer: ReturnType<typeof setInterval> | null = null; private reconnect: ReturnType<typeof setTimeout> | null = null; private backfilling: Promise<void> | null = null;
-  constructor(private rpc: Pick<Rpc, 'call'>, private wsUrl: string, private store: Pick<Store, 'cursor'>, readonly health: Health, private receive: Receive, private options: SolanaStreamOptions = {}) {}
-  private error(error: unknown) { this.health.errors++; this.health.status = 'DEGRADED'; this.health.lastError = error instanceof Error ? error.message : 'STREAM_ERROR'; }
+  private usagePaused = false;
+  constructor(private rpc: Pick<Rpc, 'call'> & Partial<Pick<Rpc, 'usageExhausted'>>, private wsUrl: string, private store: Pick<Store, 'cursor'>, readonly health: Health, private receive: Receive, private options: SolanaStreamOptions = {}) {}
+  private pauseForUsageLimit() {
+    if (this.usagePaused) return;
+    this.usagePaused = true;
+    if (this.timer) clearInterval(this.timer);
+    if (this.reconnect) clearTimeout(this.reconnect);
+    this.timer = null; this.reconnect = null;
+    const socket = this.ws; this.ws = null;
+    if (socket) { socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null; socket.close(); }
+    this.logQueue.length = 0; this.logQueued.clear(); this.typedMetrics.queueDepth = 0;
+    for (const item of this.queue.splice(0)) { this.queued.delete(item.signature); item.resolve(false); }
+    this.health.queueDepth = 0;
+    this.gap('provider-usage', 'RPC_PROVIDER_USAGE_EXHAUSTED');
+  }
+  private error(error: unknown) {
+    this.health.errors++;
+    if (this.rpc.usageExhausted) { this.pauseForUsageLimit(); return; }
+    this.health.status = 'DEGRADED'; this.health.lastError = error instanceof Error ? error.message : 'STREAM_ERROR';
+  }
   private gap(key: string, reason: string) {
     if (!this.gaps.has(key) || key === 'queue-overflow') this.gapRevision++;
     if (this.gaps.size < 128 || this.gaps.has(key)) this.gaps.add(key); else this.untrackedGaps = true;
@@ -98,7 +128,7 @@ export class SolanaStream {
   private async drainLogs(): Promise<void> {
     if (this.logBusy) return; this.logBusy = true;
     try {
-      while (!this.stopped && this.logQueue.length) {
+      while (!this.stopped && !this.usagePaused && this.logQueue.length) {
         const envelope = this.logQueue.shift()!; this.typedMetrics.queueDepth = this.logQueue.length;
         let priority = 0;
         try {
@@ -139,7 +169,7 @@ export class SolanaStream {
       if (at >= 0 && this.queue[at].priority < priority) { const [item] = this.queue.splice(at, 1); item.priority = priority; const before = this.queue.findIndex(x => x.priority < priority); this.queue.splice(before < 0 ? this.queue.length : before, 0, item); }
       return existing;
     }
-    if (this.stopped) return Promise.resolve(false);
+    if (this.stopped || this.usagePaused) return Promise.resolve(false);
     if (this.queue.length >= (this.options.maxQueue ?? 500)) {
       const lowest = this.queue.at(-1);
       if (lowest && priority > lowest.priority) { this.queue.pop(); this.queued.delete(lowest.signature); lowest.resolve(false); this.gap('queue-overflow', 'LOW_PRIORITY_ENRICHMENT_EVICTED_BACKFILL_REQUIRED'); }
@@ -153,7 +183,7 @@ export class SolanaStream {
   private async drain() {
     if (this.busy) return; this.busy = true;
     try {
-      while (!this.stopped && this.queue.length) {
+      while (!this.stopped && !this.usagePaused && this.queue.length) {
         const item = this.queue.shift()!; this.health.queueDepth = this.queue.length;
         let ok = false;
         for (let attempt = 0; attempt < (this.options.attempts ?? 4) && !this.stopped; attempt++) {
@@ -163,18 +193,19 @@ export class SolanaStream {
             if (tx.transaction?.signatures?.[0] !== item.signature || !Number.isSafeInteger(tx.slot)) throw Error('RPC_TRANSACTION_ID_MISMATCH');
             validateTransactionLayout(tx);
             await this.receive(tx, item.receivedAt, 'finalized'); ok = true; break;
-          } catch (e) { this.error(e); if (attempt + 1 < (this.options.attempts ?? 4)) await sleep((this.options.retryMs ?? 500) * 2 ** attempt); }
+          } catch (e) { this.error(e); if (this.usagePaused) break; if (attempt + 1 < (this.options.attempts ?? 4)) await sleep((this.options.retryMs ?? 500) * 2 ** attempt); }
         }
         if (ok) { this.seen.set(item.signature, Date.now()); if (this.seen.size > 10_000) this.seen.delete(this.seen.keys().next().value!); this.resolved(item.signature); }
-        else this.gap(item.signature, 'TRANSACTION_PROCESSING_FAILED_CURSOR_NOT_ADVANCED');
+        else this.gap(item.signature, this.usagePaused ? 'RPC_PROVIDER_USAGE_EXHAUSTED' : 'TRANSACTION_PROCESSING_FAILED_CURSOR_NOT_ADVANCED');
         this.queued.delete(item.signature); item.resolve(ok);
       }
     } finally { this.busy = false; }
   }
   /** Cursor is a completed durable boundary, not an enqueue watermark. */
   backfill(): Promise<void> {
+    if (this.rpc.usageExhausted) this.pauseForUsageLimit();
     if (this.backfilling) return this.backfilling;
-    if (this.stopped) return Promise.resolve();
+    if (this.stopped || this.usagePaused) return Promise.resolve();
     this.backfilling = this.runBackfill().finally(() => { this.backfilling = null; }); return this.backfilling;
   }
   private async runBackfill() {
@@ -216,7 +247,8 @@ export class SolanaStream {
     } catch (e) { this.error(e); }
   }
   private connect() {
-    if (this.stopped) return;
+    if (this.rpc.usageExhausted) this.pauseForUsageLimit();
+    if (this.stopped || this.usagePaused) return;
     try {
       const socket = this.options.websocket?.(this.wsUrl) ?? new WebSocket(this.wsUrl) as unknown as WebSocketLike;
       this.ws = socket;
@@ -240,7 +272,7 @@ export class SolanaStream {
       socket.onclose = () => this.scheduleReconnect();
     } catch (e) { this.error(e); this.scheduleReconnect(); }
   }
-  private scheduleReconnect() { if (this.stopped || this.reconnect) return; this.health.status = 'RECONNECTING'; this.reconnect = setTimeout(() => { this.reconnect = null; this.connect(); }, this.options.reconnectMs ?? 2000); }
+  private scheduleReconnect() { if (this.stopped || this.usagePaused || this.reconnect) return; this.health.status = 'RECONNECTING'; this.reconnect = setTimeout(() => { this.reconnect = null; this.connect(); }, this.options.reconnectMs ?? 2000); }
   start() { if (this.started) return; this.started = true; this.connect(); this.timer = setInterval(() => { void this.backfill(); }, this.options.backfillIntervalMs ?? 30_000); }
   async stop() { this.stopped = true; if (this.timer) clearInterval(this.timer); if (this.reconnect) clearTimeout(this.reconnect); this.ws?.close(); this.logQueue.length = 0; this.logQueued.clear(); this.typedMetrics.queueDepth = 0; for (const pending of this.queue.splice(0)) { this.queued.delete(pending.signature); pending.resolve(false); } while (this.busy || this.logBusy) await sleep(20); await this.backfilling; }
 }
