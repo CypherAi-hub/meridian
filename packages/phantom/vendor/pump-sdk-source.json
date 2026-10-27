@@ -1,0 +1,22 @@
+{
+  "verifiedAt": "2026-10-26",
+  "files": [
+    {
+      "package": "@pump-fun/pump-sdk",
+      "version": "4.3.1",
+      "sourcePath": "src/idl/pump.json",
+      "target": "pump-sdk-4.3.1.json",
+      "sha256": "c53b8f5d39887afd27cc40a256527a421c2d91b64a9014dc4952a261f4f36a01",
+      "repository": "git+https://github.com/pump-fun/pump-sdk.git"
+    },
+    {
+      "package": "@pump-fun/pump-swap-sdk",
+      "version": "2.2.0",
+      "sourcePath": "src/idl/pump_amm.json",
+      "target": "pump-amm-sdk-2.2.0.json",
+      "sha256": "c2f8ce0bc0a740d9125644b2d95494c97199fce1604802f5ab0497184bdcce61",
+      "repository": "git+https://github.com/pump-fun/pump-swap-sdk.git"
+    }
+  ],
+  "note": "Pinned official npm package IDLs. PumpSDK4.3.1 also contains the identical PumpAMM IDL hash as PumpSwapSDK2.2.0. SDK4.3.1 TradeEvent exactly roundtrips the captured405byte mainnet event; instruction still uses official historical two-u64 variant. No bytes padded or fields invented."
+}

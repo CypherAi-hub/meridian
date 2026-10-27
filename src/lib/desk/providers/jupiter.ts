@@ -5,20 +5,21 @@ import { breakerFor } from "../circuit";
 import { classifyRouteFailure, routeStateFromFailure } from "../routes";
 import { deskSettings } from "../config";
 import { budgetFor, parseRetryAfter, JUPITER_KEYED_BUDGET } from "../rate-budget";
+import { impliedQuotePrice } from "../quote-price.ts";
 
 type JupQuote = {
+  inputMint?: string;
+  outputMint?: string;
   inAmount?: string;
   outAmount?: string;
   priceImpactPct?: string | number;
   routePlan?: { swapInfo?: { label?: string } }[];
   error?: string;
+  errorCode?: number;
+  errorMessage?: string;
 };
 
-const ENDPOINTS = [
-  "https://lite-api.jup.ag/swap/v1/quote",
-  "https://public.jupiterapi.com/quote",
-  "https://quote-api.jup.ag/v6/quote",
-];
+const ENDPOINTS = ["https://api.jup.ag/swap/v1/quote"];
 
 export const providerCounters = {
   jupiter429: 0,
@@ -44,29 +45,12 @@ function impactOf(body: JupQuote) {
   return n > 1 ? n / 100 : n;
 }
 
-function impliedPrice(opts: {
-  inMint: string;
-  outMint: string;
-  inAmount: string;
-  outAmount: string;
-  inDecimals: number;
-  outDecimals: number;
-  solPriceUsd: number;
-}): number | null {
-  const inn = Number(opts.inAmount);
-  const out = Number(opts.outAmount);
-  if (!inn || !out) return null;
-  const inUi = inn / 10 ** opts.inDecimals;
-  const outUi = out / 10 ** opts.outDecimals;
-  if (opts.inMint === WSOL) {
-    const usdIn = inUi * opts.solPriceUsd;
-    return usdIn / outUi;
-  }
-  if (opts.outMint === WSOL) {
-    const usdOut = outUi * opts.solPriceUsd;
-    return usdOut / inUi;
-  }
-  return null;
+function positiveRawU64(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9]\d{0,19}$/.test(value) &&
+    BigInt(value) <= 18446744073709551615n
+  );
 }
 
 function failedQuote(
@@ -77,7 +61,14 @@ function failedQuote(
 ): QuoteObs {
   const reason = classifyRouteFailure(message, httpStatus);
   const state = routeStateFromFailure(reason);
-  const q = blankQuote(opts.inputMint, opts.outputMint, opts.amount, opts.notionalUsd, message, latencyMs);
+  const q = blankQuote(
+    opts.inputMint,
+    opts.outputMint,
+    opts.amount,
+    opts.notionalUsd,
+    message,
+    latencyMs,
+  );
   q.available = false;
   q.routeState = state;
   q.failureReason = reason;
@@ -103,6 +94,7 @@ async function quoteOnce(opts: {
 }): Promise<QuoteObs> {
   const t0 = Date.now();
   const ingestedAt = t0;
+  if (!positiveRawU64(opts.amount)) return failedQuote(opts, "invalid quote input amount", 0);
   const circuit = breakerFor("jupiter");
   const key = deskSettings().jupiterApiKey;
   const budget = budgetFor("jupiter", key ? JUPITER_KEYED_BUDGET : undefined);
@@ -114,9 +106,7 @@ async function quoteOnce(opts: {
   }
   let last = "quote failed";
   let lastStatus: number | undefined;
-  const endpoints = key
-    ? ["https://api.jup.ag/swap/v1/quote", ...ENDPOINTS]
-    : ENDPOINTS;
+  const endpoints = ENDPOINTS;
   for (const base of endpoints) {
     const url = `${base}?inputMint=${opts.inputMint}&outputMint=${opts.outputMint}&amount=${opts.amount}&slippageBps=50`;
     try {
@@ -140,14 +130,21 @@ async function quoteOnce(opts: {
         continue;
       }
       const body = (await r.json()) as JupQuote;
-      const labels = (body.routePlan ?? []).map((x) => x.swapInfo?.label).filter((x): x is string => Boolean(x));
-      const inAmount = body.inAmount ?? opts.amount;
-      const outAmount = body.outAmount ?? "0";
-      const ok = Boolean(outAmount && Number(outAmount) > 0);
-      if (!ok) {
-        circuit.failure("no route");
-        return failedQuote(opts, body.error ?? "no route", latencyMs);
+      if (body.inputMint !== opts.inputMint || body.outputMint !== opts.outputMint) {
+        return failedQuote(opts, "quote token identity mismatch", latencyMs);
       }
+      if (body.error || body.errorMessage || body.errorCode != null)
+        return failedQuote(opts, "provider reported quote error", latencyMs);
+      // Exact size must be confirmed by the response, never inferred from our request.
+      if (!positiveRawU64(body.inAmount) || body.inAmount !== opts.amount)
+        return failedQuote(opts, "quote input amount mismatch or missing", latencyMs);
+      if (!positiveRawU64(body.outAmount))
+        return failedQuote(opts, "invalid quote output amount", latencyMs);
+      const inAmount = body.inAmount,
+        outAmount = body.outAmount;
+      const labels = (body.routePlan ?? [])
+        .map((x) => x.swapInfo?.label)
+        .filter((x): x is string => Boolean(x));
       circuit.success();
       budget.onSuccess();
       return {
@@ -158,7 +155,7 @@ async function quoteOnce(opts: {
         outAmount,
         notionalUsd: opts.notionalUsd,
         priceImpactPct: impactOf(body),
-        impliedPriceUsd: impliedPrice({
+        impliedPriceUsd: impliedQuotePrice({
           inMint: opts.inputMint,
           outMint: opts.outputMint,
           inAmount,
@@ -243,4 +240,20 @@ export async function quoteSolUsdc(): Promise<QuoteObs> {
     solPriceUsd: 1,
     notionalUsd: 1,
   });
+}
+
+/** Exact-size quote-only adapter for the independent paper sniper. Never builds a swap. */
+export async function quotePaperSwap(opts: {
+  inputMint: string;
+  outputMint: string;
+  amount: string;
+  inDecimals: number;
+  outDecimals: number;
+  notionalUsd: number;
+}): Promise<QuoteObs> {
+  const q = await quoteOnce({ ...opts, solPriceUsd: 0 });
+  // An exit's USDC quote amount is known; the original entry size is not its notional.
+  if (q.available && opts.outputMint === USDC)
+    q.notionalUsd = Number(q.outAmount) / 10 ** opts.outDecimals;
+  return q;
 }

@@ -76,6 +76,7 @@ export function mergeSnap(a: TokenSnapshot, b: TokenSnapshot): TokenSnapshot {
     symbol: a.symbol !== "UNK" ? a.symbol : b.symbol,
     name: a.name !== "unknown" ? a.name : b.name,
     decimals: a.decimals !== 6 ? a.decimals : b.decimals,
+    mintSafety: a.mintSafety ?? b.mintSafety,
     createdAt: a.createdAt ?? b.createdAt,
     priceUsd: prefer(a.priceUsd, b.priceUsd),
     priceCrossUsd: prefer(b.priceUsd.source !== a.priceUsd.source ? b.priceUsd : a.priceCrossUsd, a.priceCrossUsd),
