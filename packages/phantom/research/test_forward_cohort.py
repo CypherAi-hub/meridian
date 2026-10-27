@@ -1,5 +1,6 @@
 """Synthetic contract fixtures only; no market return or profitability evidence."""
 import copy
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
@@ -90,6 +91,29 @@ def with_delivery_audit(data, **overrides):
     return data
 
 
+def with_retirement(data, cutoff=None):
+    """Synthetic marker with the exact ForwardRuntime retirement wire schema."""
+    old = data['protocol']
+    cutoff = max([old['frozenAt']] + [r['at'] for r in data['records']]) if cutoff is None else cutoff
+    target = copy.deepcopy(old)
+    target.update(experimentId='post-probe-60s-v1-'+'c'*64, runtimeSourceVersion='c'*64,
+                  sourceCommit='d'*40, frozenAt=cutoff, enrollmentStart=cutoff+1000,
+                  enrollmentEnd=cutoff+1000+72*3_600_000)
+    target['configurationHash'] = f.configuration_hash(target)
+    data['retirement'] = {
+        'schemaVersion': 1, 'status': 'INCOMPLETE', 'reason': 'SOURCE_CHANGED',
+        'cutoffAt': cutoff, 'oldExperimentId': old['experimentId'],
+        'oldRuntimeSourceVersion': old['runtimeSourceVersion'],
+        'oldConfigurationHash': old['configurationHash'],
+        'originalEnrollmentStart': old['enrollmentStart'], 'originalEnrollmentEnd': old['enrollmentEnd'],
+        'newExperimentId': target['experimentId'], 'newRuntimeSourceVersion': target['runtimeSourceVersion'],
+        'journalRecordCount': len(data['records']),
+        'journalCanonicalSha256': hashlib.sha256(f.canonical(data['records']).encode()).hexdigest(),
+        'targetProtocol': target,
+    }
+    return data
+
+
 class ForwardCohortTests(unittest.TestCase):
     def invalid(self, data, reason=None):
         result = f.evaluate(data)
@@ -124,6 +148,172 @@ class ForwardCohortTests(unittest.TestCase):
         self.assertEqual(report['coverage']['validFreshEntries'], 100)
         self.assertEqual(report['allEnteredConservativeBound']['netLamportsSum'], '200000000')
         self.assertEqual(report['conservativeNetAfterRemovingThreeLargestWinnersLamports'], '194000000')
+
+    def test_retired_positive_fixture_exported_after_old_window_never_becomes_candidate(self):
+        data = with_delivery_audit(fixture(100))
+        nonretired = f.evaluate(data)
+        with_retirement(data)
+        original = copy.deepcopy(data)
+        report = f.evaluate(data)
+        self.assertEqual(report['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', report)
+        self.assertGreater(report['exportedAt'], data['protocol']['enrollmentEnd'])
+        self.assertEqual(report['exportedAt'], data['exportedAt'])
+        self.assertEqual(report['analysisAsOf'], data['retirement']['cutoffAt'])
+        self.assertEqual(report['epochStatus'], 'INCOMPLETE_RETIRED')
+        self.assertEqual(report['classification'], 'INCOMPLETE_RETIRED_FORWARD_QUOTE_EVIDENCE')
+        self.assertFalse(report['candidateGates']['frozenEnrollmentWindowClosed'])
+        self.assertFalse(report['candidateGates']['epochNotRetired'])
+        self.assertEqual(report['retirement'], data['retirement'])
+        self.assertEqual(report['allEnteredConservativeBound'], nonretired['allEnteredConservativeBound'])
+        self.assertEqual(report['outcomes'], nonretired['outcomes'])
+        self.assertEqual(report['probeDeliveryAudit']['exportedAt'], data['exportedAt'])
+        self.assertEqual(report['profitabilityConclusion'], 'UNPROVEN')
+        self.assertFalse(report['liveApproved'])
+        self.assertEqual(data, original)
+
+    def test_retirement_after_old_window_also_blocks_candidate(self):
+        data = with_retirement(with_delivery_audit(fixture(100)), protocol()['enrollmentEnd']+1)
+        report = f.evaluate(data)
+        self.assertEqual(report['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', report)
+        self.assertTrue(report['candidateGates']['frozenEnrollmentWindowClosed'])
+        self.assertTrue(all(v for k, v in report['candidateGates'].items() if k != 'epochNotRetired'))
+        self.assertEqual(report['classification'], 'INCOMPLETE_RETIRED_FORWARD_QUOTE_EVIDENCE')
+
+    def test_retired_pending_exit_uses_cutoff_without_fabricating_missing_or_result(self):
+        data = fixture()
+        data['records'] = [r for r in data['records'] if not r['phase'].startswith('EXIT')]
+        with_retirement(data)
+        original = copy.deepcopy(data)
+        first = f.evaluate(data)
+        self.assertEqual(first['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', first)
+        self.assertEqual(first['coverage']['pendingExits'], 1)
+        self.assertEqual(first['outcomes'][0]['status'], 'PENDING')
+        self.assertEqual(first['allEnteredConservativeBound']['netLamportsSum'], '-10020000')
+        self.assertEqual(data, original)
+        data['exportedAt'] += 90*86_400_000
+        second = f.evaluate(data)
+        self.assertEqual(second['outcomes'], first['outcomes'])
+        self.assertEqual(second['analysisAsOf'], first['analysisAsOf'])
+        self.assertGreater(second['exportedAt'], first['exportedAt'])
+
+    def test_retired_missing_exit_remains_missing_at_cutoff(self):
+        data = fixture()
+        cutoff = phase(data, 'EXIT_RESULT')['at']+10_000
+        data['records'] = [r for r in data['records'] if not r['phase'].startswith('EXIT')]
+        report = f.evaluate(with_retirement(data, cutoff))
+        self.assertEqual(report['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', report)
+        self.assertEqual(report['coverage']['pendingExits'], 0)
+        self.assertEqual(report['outcomes'][0]['status'], 'MISSING_RESULT_AFTER_DEADLINE')
+        self.assertEqual(report['allEnteredConservativeBound']['netLamportsSum'], '-10020000')
+
+    def test_nonretired_export_preserves_wall_clock_analysis_and_legacy_classification(self):
+        data = with_delivery_audit(fixture(100))
+        report = f.evaluate(data)
+        self.assertEqual(report['analysisAsOf'], data['exportedAt'])
+        self.assertEqual(report['epochStatus'], 'NOT_RETIRED')
+        self.assertIsNone(report['retirement'])
+        self.assertTrue(report['candidateGates']['epochNotRetired'])
+        self.assertEqual(report['classification'], 'SYNTHETIC_THRESHOLDS_MET_NOT_MARKET_EVIDENCE')
+
+    def test_supplied_malformed_retirement_is_never_treated_as_absent(self):
+        for marker in (None, False, [], {}, 'INCOMPLETE'):
+            with self.subTest(marker=marker):
+                data = fixture()
+                data['retirement'] = marker
+                self.invalid(data, 'RETIREMENT_SCHEMA_INVALID')
+        for field, value in (('schemaVersion', True), ('schemaVersion', 2),
+                             ('status', 'COMPLETE'), ('reason', 'OTHER')):
+            with self.subTest(field=field, value=value):
+                data = with_retirement(fixture())
+                data['retirement'][field] = value
+                self.invalid(data, 'RETIREMENT_SCHEMA_INVALID')
+        for change in ('extra', 'missing'):
+            data = with_retirement(fixture())
+            if change == 'extra': data['retirement']['unreviewed'] = True
+            else: del data['retirement']['reason']
+            self.invalid(data, 'RETIREMENT_SCHEMA_INVALID')
+
+    def test_retirement_old_source_and_window_must_match_frozen_manifest(self):
+        changes = [('oldExperimentId', 'another'), ('oldRuntimeSourceVersion', 'f'*64),
+                   ('oldConfigurationHash', 'e'*64), ('originalEnrollmentStart', BASE+1001),
+                   ('originalEnrollmentEnd', BASE+99_000)]
+        for field, value in changes:
+            with self.subTest(field=field):
+                data = with_retirement(fixture())
+                data['retirement'][field] = value
+                self.invalid(data, 'RETIREMENT_OLD_MANIFEST_IDENTITY_MISMATCH')
+
+    def test_retirement_requires_distinct_canonical_new_source_identity(self):
+        changes = [('newExperimentId', 'bad id'), ('newExperimentId', protocol()['experimentId']),
+                   ('newRuntimeSourceVersion', 'C'*64), ('newRuntimeSourceVersion', 'a'*64),
+                   ('journalCanonicalSha256', 'bad-hash')]
+        for field, value in changes:
+            with self.subTest(field=field, value=value):
+                data = with_retirement(fixture())
+                data['retirement'][field] = value
+                self.invalid(data, 'RETIREMENT_NEW_SOURCE_OR_JOURNAL_IDENTITY_INVALID')
+
+    def test_retirement_target_manifest_hash_and_identity_are_verified(self):
+        for field, value in (('experimentId', 'another-target'), ('runtimeSourceVersion', 'f'*64)):
+            with self.subTest(field=field):
+                data = with_retirement(fixture())
+                target = data['retirement']['targetProtocol']
+                target[field] = value
+                target['configurationHash'] = f.configuration_hash(target)
+                self.invalid(data, 'RETIREMENT_TARGET_MANIFEST_IDENTITY_MISMATCH')
+        data = with_retirement(fixture())
+        data['retirement']['targetProtocol']['amountLamports'] = '1'
+        self.invalid(data, 'CONFIGURATION_HASH_MISMATCH')
+
+    def test_retirement_cutoff_order_checks_freeze_export_and_target(self):
+        for cutoff in (BASE-1, fixture()['exportedAt']+1):
+            data = with_retirement(fixture(), cutoff)
+            self.invalid(data, 'RETIREMENT_CUTOFF_ORDER_INVALID')
+        data = with_retirement(fixture())
+        target = data['retirement']['targetProtocol']
+        target['frozenAt'] += 1
+        target['configurationHash'] = f.configuration_hash(target)
+        self.invalid(data, 'RETIREMENT_CUTOFF_ORDER_INVALID')
+
+    def test_retirement_integer_fields_reject_boolean_fraction_and_negative(self):
+        for field in ('cutoffAt', 'originalEnrollmentStart', 'originalEnrollmentEnd', 'journalRecordCount'):
+            for value in (True, -1, 1.5, '1', f.SAFE+1):
+                with self.subTest(field=field, value=value):
+                    data = with_retirement(fixture())
+                    data['retirement'][field] = value
+                    self.invalid(data, 'NONCANONICAL_INTEGER_OR_TIMESTAMP')
+
+    def test_retirement_fingerprint_covers_exact_raw_count_content_and_order(self):
+        for change in ('count', 'content', 'order', 'duplicate'):
+            with self.subTest(change=change):
+                data = with_retirement(fixture())
+                if change == 'count': data['retirement']['journalRecordCount'] += 1
+                elif change == 'content': data['records'][0]['data']['signature'] = '2'*64
+                elif change == 'order': data['records'].reverse()
+                else: data['records'].append(copy.deepcopy(data['records'][0]))
+                self.invalid(data, 'RETIREMENT_JOURNAL_FINGERPRINT_MISMATCH')
+
+    def test_retirement_fingerprint_never_authorizes_rows_after_cutoff(self):
+        data = with_retirement(fixture(), phase(fixture(), 'EXIT_RESULT')['at']-1)
+        self.invalid(data, 'RECORD_TIME_OR_DATA_INVALID')
+
+    def test_empty_retirement_at_freeze_and_equal_export_cutoff_is_valid(self):
+        data = fixture(0)
+        data['exportedAt'] = BASE
+        report = f.evaluate(with_retirement(data, BASE))
+        self.assertEqual(report['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', report)
+        self.assertEqual(report['analysisAsOf'], BASE)
+        self.assertEqual(report['coverage']['validFreshEntries'], 0)
+        self.assertEqual(report['classification'], 'INCOMPLETE_RETIRED_FORWARD_QUOTE_EVIDENCE')
+
+    def test_existing_earlier_frozen_target_is_valid_without_rewriting_its_window(self):
+        data = with_retirement(fixture())
+        target = data['retirement']['targetProtocol']
+        target['frozenAt'], target['enrollmentStart'], target['enrollmentEnd'] = BASE, BASE+1, BASE+2
+        target['configurationHash'] = f.configuration_hash(target)
+        report = f.evaluate(data)
+        self.assertEqual(report['datasetStatus'], 'VALIDATED_OFFLINE_RECORD_CONTRACT', report)
+        self.assertEqual(report['retirement']['targetProtocol'], target)
 
     def test_legacy_positive_export_keeps_valid_contract_but_unknown_delivery_blocks_candidate(self):
         report = f.evaluate(fixture(100))

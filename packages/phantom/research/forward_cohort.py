@@ -100,6 +100,45 @@ def protocol_valid(p):
     return p
 
 
+def retirement_valid(export, protocol, exported_at):
+    """Validate the runtime's immutable local retirement evidence, not its authenticity."""
+    if 'retirement' not in export:
+        return None
+    r = export['retirement']
+    fields = {
+        'schemaVersion', 'status', 'reason', 'cutoffAt', 'oldExperimentId',
+        'oldRuntimeSourceVersion', 'oldConfigurationHash', 'originalEnrollmentStart',
+        'originalEnrollmentEnd', 'newExperimentId', 'newRuntimeSourceVersion',
+        'journalRecordCount', 'journalCanonicalSha256', 'targetProtocol',
+    }
+    if type(r) is not dict or set(r) != fields or type(r['schemaVersion']) is not int or r['schemaVersion'] != 1 or r['status'] != 'INCOMPLETE' or r['reason'] != 'SOURCE_CHANGED':
+        raise Invalid('RETIREMENT_SCHEMA_INVALID')
+    for field in ('cutoffAt', 'originalEnrollmentStart', 'originalEnrollmentEnd', 'journalRecordCount'):
+        integer(r[field])
+    if (r['oldExperimentId'] != protocol['experimentId'] or
+            r['oldRuntimeSourceVersion'] != protocol['runtimeSourceVersion'] or
+            r['oldConfigurationHash'] != protocol['configurationHash'] or
+            r['originalEnrollmentStart'] != protocol['enrollmentStart'] or
+            r['originalEnrollmentEnd'] != protocol['enrollmentEnd']):
+        raise Invalid('RETIREMENT_OLD_MANIFEST_IDENTITY_MISMATCH')
+    if (type(r['newExperimentId']) is not str or not re.fullmatch(r'[A-Za-z0-9:_-]{1,128}', r['newExperimentId']) or
+            r['newExperimentId'] == protocol['experimentId'] or
+            type(r['newRuntimeSourceVersion']) is not str or not re.fullmatch(r'[a-f0-9]{64}', r['newRuntimeSourceVersion']) or
+            r['newRuntimeSourceVersion'] == protocol['runtimeSourceVersion'] or
+            type(r['journalCanonicalSha256']) is not str or not re.fullmatch(r'[a-f0-9]{64}', r['journalCanonicalSha256'])):
+        raise Invalid('RETIREMENT_NEW_SOURCE_OR_JOURNAL_IDENTITY_INVALID')
+    target = protocol_valid(r['targetProtocol'])
+    if target['experimentId'] != r['newExperimentId'] or target['runtimeSourceVersion'] != r['newRuntimeSourceVersion']:
+        raise Invalid('RETIREMENT_TARGET_MANIFEST_IDENTITY_MISMATCH')
+    if not protocol['frozenAt'] <= r['cutoffAt'] <= exported_at or target['frozenAt'] > r['cutoffAt']:
+        raise Invalid('RETIREMENT_CUTOFF_ORDER_INVALID')
+    # Hash the exact exported array, including its original ordering and count.
+    # Normal deduplication below is not allowed to conceal a changed fingerprint.
+    if r['journalRecordCount'] != len(export['records']) or hashlib.sha256(canonical(export['records']).encode('utf-8')).hexdigest() != r['journalCanonicalSha256']:
+        raise Invalid('RETIREMENT_JOURNAL_FINGERPRINT_MISMATCH')
+    return json.loads(canonical(r))
+
+
 def quote_valid(q, input_mint, output_mint, amount, at, not_before, max_age, slippage_bps):
     if not isinstance(q, dict) or q.get('inputMint') != input_mint or q.get('outputMint') != output_mint or q.get('inAmount') != amount:
         raise Invalid('QUOTE_MINT_OR_EXACT_SIZE_MISMATCH')
@@ -208,11 +247,15 @@ def _evaluate(export):
     if not isinstance(export, dict):
         raise Invalid('EXPORT_NOT_OBJECT')
     p = protocol_valid(export.get('protocol'))
-    as_of = integer(export['exportedAt'])
-    if as_of < p['frozenAt']:
+    exported_at = integer(export['exportedAt'])
+    if exported_at < p['frozenAt']:
         raise Invalid('EXPORT_PRECEDES_FREEZE')
     if not isinstance(export.get('records'), list):
         raise Invalid('RECORDS_UNAVAILABLE')
+    retirement = retirement_valid(export, p, exported_at)
+    # Export receipt is a wall clock, not permission to age a retired experiment
+    # into completion. Missing/pending observations are evaluated at its cutoff.
+    as_of = retirement['cutoffAt'] if retirement else exported_at
     by_id, duplicates, rows = {}, 0, []
     for index, row in enumerate(export['records']):
         if not isinstance(row, dict) or row.get('phase') not in PHASES or not isinstance(row.get('mint'), str) or not re.fullmatch(B58 + r'{32,44}', row['mint']) or row['mint'] == WSOL:
@@ -383,8 +426,12 @@ def _evaluate(export):
     day_ci, day_lower = bootstrap(days, seed ^ 0xF04A, 3)
     remainder = sum(sorted(bound)[:-3]) if len(bound) > 3 else None
     pending_entries, pending_exits = entry_statuses['PENDING'], exit_statuses['PENDING']
-    delivery_audit = probe_delivery_audit(export, p, as_of, len(groups))
+    # Delivery-audit timestamps describe the actual export, independently of the
+    # frozen record cutoff. Neither audit completeness nor elapsed wall time can
+    # make a retired epoch eligible for candidate classification.
+    delivery_audit = probe_delivery_audit(export, p, exported_at, len(groups))
     gates = {
+        'epochNotRetired': retirement is None,
         'taggedProbeDeliveryComplete': delivery_audit['status'] == 'COMPLETE',
         'frozenEnrollmentWindowClosed': as_of >= p['enrollmentEnd'],
         'minimumDistinctEnteredTokens': len(tokens) >= max(100, p['minimumDistinctEnteredTokens']),
@@ -400,9 +447,10 @@ def _evaluate(export):
     opportunity_bound = bound + [0] * (counts['admitted']-len(outcomes))
     return {
         'inputEvidenceKind': evidence_kind,
-        'datasetStatus': 'VALIDATED_OFFLINE_RECORD_CONTRACT', 'scope': SCOPE, 'experimentId': p['experimentId'], 'configurationHash': p['configurationHash'], 'exportedAt': as_of,
+        'datasetStatus': 'VALIDATED_OFFLINE_RECORD_CONTRACT', 'scope': SCOPE, 'experimentId': p['experimentId'], 'configurationHash': p['configurationHash'], 'exportedAt': exported_at,
+        'analysisAsOf': as_of, 'epochStatus': 'INCOMPLETE_RETIRED' if retirement else 'NOT_RETIRED', 'retirement': retirement,
         'profitabilityConclusion': 'UNPROVEN', 'liveApproved': False,
-        'classification': ('SYNTHETIC_THRESHOLDS_MET_NOT_MARKET_EVIDENCE' if synthetic else 'CANDIDATE_FOR_FURTHER_PAPER_VALIDATION') if all(gates.values()) else 'INSUFFICIENT_OR_NONPOSITIVE_FORWARD_QUOTE_EVIDENCE',
+        'classification': 'INCOMPLETE_RETIRED_FORWARD_QUOTE_EVIDENCE' if retirement else (('SYNTHETIC_THRESHOLDS_MET_NOT_MARKET_EVIDENCE' if synthetic else 'CANDIDATE_FOR_FURTHER_PAPER_VALIDATION') if all(gates.values()) else 'INSUFFICIENT_OR_NONPOSITIVE_FORWARD_QUOTE_EVIDENCE'),
         'candidateGates': gates, 'opportunities': dict(counts),
         'probeDeliveryAudit': delivery_audit,
         'coverage': {'distinctEnrolledTokens': len(groups), 'entryRequests': sum('ENTRY_REQUEST' in group for group in groups.values()),
@@ -427,6 +475,7 @@ def _evaluate(export):
             'Delivery reconciliation covers only explicitly tagged durable baseline rows; it does not attest provider authenticity, untagged probes, all launches, or market-wide coverage. Missing legacy audits leave tagged delivery completeness unknown and block candidate review.',
             'Pending and missing exits have zero proceeds in the all-entered bound; pending counts are also shown separately.',
             'Bootstrap intervals are descriptive; they do not establish independence, regime stability, attainable fills, or counterfactual market impact.',
+            'Retired epochs remain incomplete and cannot qualify as candidates. Their record/pending analysis freezes at the original cutoff; exportedAt remains the later export clock. Retirement hashes check local consistency, not provider or database authenticity.',
         ],
     }
 
