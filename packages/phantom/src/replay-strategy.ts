@@ -50,6 +50,7 @@ export interface ReplayStrategyConfig {
 export const REPLAY_FEATURE_CONTRACT = {
   timestamp: "featuresObservedAt",
   captureTimestamp: "snapshotCapturedAt",
+  optionalSafety: ["securityEvidenceRequestedAt"],
   signals: [
     "observations",
     "verifiedLaunchAgeMs",
@@ -112,6 +113,11 @@ const integer = (ctx: ReplayContext, key: string) => {
   return n != null && Number.isSafeInteger(n) ? BigInt(n) : null;
 };
 function captureClockValid(features: Readonly<Record<string, number | null>>, availableAt: number) {
+  if (Object.hasOwn(features, "securityEvidenceRequestedAt")) {
+    const request = features.securityEvidenceRequestedAt, published = features.securityObservedAt;
+    if (typeof request !== "number" || !Number.isSafeInteger(request) || request < 0 ||
+      typeof published !== "number" || request > published) return false;
+  }
   // Absent legacy capture times remain unknown; a newly recorded time must obey
   // both source chronology and the point when this observation is available.
   if (!Object.hasOwn(features, "snapshotCapturedAt")) return true;
@@ -189,6 +195,9 @@ export function flattenReplayFeatures(
     throw Error("INVALID_REPLAY_SNAPSHOT_TIMESTAMPS");
   if (f.asOf > risk.now || s.observedAt > risk.now)
     throw Error("FUTURE_EVIDENCE_IN_REPLAY_SNAPSHOT");
+  if (s.evidenceRequestedAt !== undefined && (!Number.isSafeInteger(s.evidenceRequestedAt) ||
+    s.evidenceRequestedAt < 0 || s.evidenceRequestedAt > s.observedAt))
+    throw Error("INVALID_REPLAY_SECURITY_REQUEST_ANCHOR");
   if (f.mint !== s.mint) throw Error("REPLAY_SNAPSHOT_MINT_MISMATCH");
   const safe = (n: bigint | null) =>
     n === null || n > BigInt(Number.MAX_SAFE_INTEGER) || n < BigInt(Number.MIN_SAFE_INTEGER)
@@ -201,6 +210,7 @@ export function flattenReplayFeatures(
     featuresObservedAt: f.asOf,
     snapshotCapturedAt: risk.now,
     securityObservedAt: s.observedAt,
+    ...(s.evidenceRequestedAt === undefined ? {} : { securityEvidenceRequestedAt: s.evidenceRequestedAt }),
     observations: f.observations,
     verifiedLaunchAgeMs: f.verifiedLaunchAgeMs,
     imbalance: f.imbalance,
@@ -272,6 +282,8 @@ function safetyAt(ctx: ReplayContext): TokenSafetyEvidence {
   return {
     mint: ctx.current.mint,
     observedAt: value(ctx, "securityObservedAt") ?? NaN,
+    ...(Object.hasOwn(ctx.current.features, "securityEvidenceRequestedAt")
+      ? { evidenceRequestedAt: value(ctx, "securityEvidenceRequestedAt") ?? NaN } : {}),
     mintAuthority: noAuthority("mintAuthorityRevoked"),
     freezeAuthority: noAuthority("freezeAuthorityRevoked"),
     tokenProgram: tokenProgram === 1 ? "spl-token" : tokenProgram === 2 ? "token-2022" : "unknown",

@@ -16,6 +16,7 @@ export class Store {
   private lifecycle: "new" | "opening" | "open" | "closing" | "closed" = "new";
   private closeWork: Promise<void> | null = null;
   /** Worker writes are fenced by their own leased PostgreSQL session, never another pool client. */
+  get workerLeaseEnforced() { return this.workerLeaseRequired; }
   get workerLeaseHealthy() {
     if (!this.workerLeaseRequired) return true;
     return (
@@ -203,6 +204,21 @@ export class Store {
       "INSERT INTO phantom_state(id,payload,updated_at) VALUES($1,$2::jsonb,$3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
       [id, json(value), Date.now()],
     );
+  }
+  /** Atomically fences research book instances in addition to the owning worker session. */
+  async saveResearchPaperBook(id: string, value: unknown, expectedVersion: number | null, manifestHash: string) {
+    if (!this.workerLeaseRequired) throw Error("RESEARCH_WORKER_LEASE_REQUIRED");
+    this.assertWorkerLease();
+    const result = expectedVersion === null
+      ? await this.exec(
+        "INSERT INTO phantom_state(id,payload,updated_at) VALUES($1,$2::jsonb,$3) ON CONFLICT(id) DO NOTHING RETURNING id",
+        [id, json(value), Date.now()],
+      )
+      : await this.exec(
+        "UPDATE phantom_state SET payload=$2::jsonb,updated_at=$3 WHERE id=$1 AND payload->>'ledgerVersion'=$4 AND payload->'manifest'->>'manifestHash'=$5 RETURNING id",
+        [id, json(value), Date.now(), String(expectedVersion), manifestHash],
+      );
+    return result.rows.length === 1;
   }
   async get(id: string) {
     return (

@@ -6,7 +6,11 @@ import {
   type PortfolioRiskState,
   type SafetyVerdict,
   type TradeProposal,
+  type RiskAuthorization,
+  type ResearchRiskAuthorization,
 } from "./risk.ts";
+
+import type { ResearchPaperDecisionEvidence, ResearchPaperPolicy } from "./research-paper-policy.ts";
 
 export type PaperPosition = {
   id: string;
@@ -81,6 +85,16 @@ export type QuoteProvider = {
   }): Promise<Quote>;
 };
 export type PaperPolicy = { minExecutionDelayMs: number; maxQuoteAgeMs: number };
+/** Hash these effective rules into each research run; all paper books use this kernel. */
+export const PAPER_EXIT_RULES = Object.freeze({
+  maximumHoldMs: 300000,
+  stopLossRemainingBps: 8500,
+  trailingRemainingBps: 9000,
+  concentratedSellingBps: 7000,
+  minimumImbalance: -0.4,
+  partialProfitReturnBps: 15000,
+  partialExitBps: 5000,
+});
 function timestamp(at: number) {
   if (!Number.isSafeInteger(at) || at < 0) throw Error("INVALID_LEDGER_TIMESTAMP");
 }
@@ -88,6 +102,28 @@ function basisPoints(value: number, maximum: number) {
   if (!Number.isSafeInteger(value) || value < 0 || value > maximum)
     throw Error("PAPER_SLIPPAGE_LIMIT");
   return value;
+}
+
+/** Shared exact research quote checks for current settlement and durable historical audit. */
+export function validateResearchPaperQuote(
+  q: Quote, inputMint: string, outputMint: string, amount: bigint,
+  policy: ResearchPaperPolicy, now: number, notBefore = 0,
+) {
+  timestamp(now); timestamp(notBefore); timestamp(q.observedAt);
+  const metadata = q as Quote & { quoteId?: unknown; maker?: unknown; expireAt?: unknown; swapType?: unknown };
+  const populated = (v: unknown) => v !== undefined && v !== null && v !== "";
+  if (q.inputMint !== inputMint || q.outputMint !== outputMint || rawAmount(q.inAmount) !== amount ||
+    q.source !== "JUPITER" || !policy.allowedRouters.some((r) => r === q.router) ||
+    !Number.isSafeInteger(q.requestedAt) || (q.requestedAt ?? -1) < notBefore ||
+    q.requestedAt! > q.observedAt || q.observedAt > now || now - q.requestedAt! > policy.maximumQuoteAgeMs ||
+    [metadata.quoteId, metadata.maker, metadata.expireAt].some(populated) ||
+    (populated(metadata.swapType) && (typeof metadata.swapType !== "string" || metadata.swapType.toLowerCase().split("+").some((v) => v.trim() === "rfq"))) ||
+    q.impactBps === null || !Number.isFinite(q.impactBps) || q.impactBps < 0 || q.impactBps > 200)
+    throw Error("RESEARCH_QUOTE_PROVENANCE_CLOCK_SIZE_OR_IMPACT_INVALID");
+  const out = rawAmount(q.outAmount), min = rawAmount(q.minOutAmount, true);
+  if (min > out || min < out * BigInt(10000 - policy.slippageBps) / 10000n)
+    throw Error("RESEARCH_QUOTE_MINIMUM_INVALID");
+  return { out, min };
 }
 
 /** Synchronous economic mutations. Persist the entire state atomically after every mutation. */
@@ -110,6 +146,12 @@ export class PaperLedger {
     });
     for (const n of Object.values(this.policy))
       if (!Number.isSafeInteger(n) || n < 1) throw Error("INVALID_PAPER_EXECUTION_POLICY");
+    const research = governor.researchBook;
+    if (research && (
+      initial.toString() !== research.policy.initialCapitalLamports ||
+      this.policy.minExecutionDelayMs !== research.policy.minimumEntryDelayMs ||
+      this.policy.maxQuoteAgeMs !== research.policy.maximumQuoteAgeMs
+    )) throw Error("RESEARCH_LEDGER_CAPITAL_OR_EXECUTION_PROFILE_MISMATCH");
     const saved = restoreLedger(restored);
     if (saved && saved.initialLamports !== initial)
       throw Error("RESTORED_INITIAL_CAPITAL_MISMATCH");
@@ -189,6 +231,16 @@ export class PaperLedger {
     rawAmount(input.amountLamports);
     if (!input.id || !input.mint || !input.strategy || !input.eventId)
       throw Error("INVALID_PAPER_ENTRY");
+    const research = this.governor.researchBook;
+    if (research && (
+      input.strategy !== research.policy.strategy ||
+      input.amountLamports.toString() !== research.policy.entryLamports ||
+      input.slippageBps !== research.policy.slippageBps
+    )) throw Error("RESEARCH_ENTRY_FROZEN_RULE_MISMATCH");
+    if (research && this.state.pending.length + this.state.positions.length >= research.policy.maximumPositions)
+      return false;
+    if (research && this.state.cashLamports - input.amountLamports - BigInt(research.policy.networkFeePerLegLamports) < this.governor.limits.minReserveLamports)
+      return false;
     const slippageBps = basisPoints(input.slippageBps ?? 100, this.governor.limits.maxSlippageBps);
     if (
       this.state.pending.some((p) => p.id === input.id || p.mint === input.mint) ||
@@ -208,6 +260,39 @@ export class PaperLedger {
     fee: bigint,
     now: number,
   ) {
+    if (this.governor.researchBook) throw Error("STRICT_FILL_REQUIRES_STRICT_BOOK");
+    const prepared = this.prepareEntry(order, quote, liquidity, fee, now);
+    const authorization = this.governor.authorize(prepared.proposal, this.risk(now), safety, now);
+    if (!authorization.allowed) return authorization;
+    return this.settleEntry(prepared, authorization, fee, now);
+  }
+  /** A separate adapter with fresh revalidation, sharing exactly the strict accounting kernel. */
+  fillResearch(order: PendingEntry, quote: Quote, evidence: ResearchPaperDecisionEvidence, now: number) {
+    const book = this.governor.researchBook;
+    if (!book) throw Error("RESEARCH_FILL_REQUIRES_RESEARCH_BOOK");
+    const fee = BigInt(book.policy.networkFeePerLegLamports);
+    const prepared = this.prepareEntry(order, quote, evidence.features.liquidityLamports, fee, now);
+    const e = evidence.quote;
+    if (
+      evidence.policyHash !== book.policy.manifestHash || evidence.sourceHash !== book.policy.sourceHash ||
+      evidence.decisionAt > prepared.pending.createdAt || evidence.captureId !== prepared.pending.eventId ||
+      quote.inputMint !== e.inputMint || quote.outputMint !== e.outputMint || quote.inAmount !== e.inputLamports ||
+      quote.outAmount !== e.outAmount || quote.minOutAmount !== e.minOutAmount ||
+      quote.observedAt !== e.observedAt || quote.requestedAt !== e.requestedAt ||
+      quote.source !== e.source || quote.router !== e.router
+    ) throw Error("RESEARCH_ORDER_OR_EXACT_QUOTE_EVIDENCE_MISMATCH");
+    const currentEvidence = {
+      ...evidence,
+      openPositions: this.state.positions.length,
+      // Its own durable intent already holds a slot; only other pending orders compete.
+      pendingEntries: this.state.pending.filter((p) => p.id !== prepared.pending.id).length,
+      initialCapitalLamports: this.state.initialLamports.toString(),
+    };
+    const authorization = this.governor.authorizeResearch(prepared.proposal, this.risk(now), currentEvidence, now);
+    if (!authorization.allowedForResearch) return authorization;
+    return this.settleEntry(prepared, authorization, fee, now);
+  }
+  private prepareEntry(order: PendingEntry, quote: Quote, liquidity: bigint | null, fee: bigint, now: number) {
     timestamp(now);
     this.validateFee(fee);
     const pending = this.state.pending.find((p) => p.id === order.id);
@@ -220,6 +305,7 @@ export class PaperLedger {
       "createdAt",
       "readyAt",
       "eventId",
+      "slippageBps",
     ] as const)
       if (order[field] !== pending[field]) throw Error("PAPER_ORDER_CONTENT_MISMATCH");
     if (this.state.positions.some((p) => p.mint === pending.mint))
@@ -245,8 +331,12 @@ export class PaperLedger {
       slippageBps: pending.slippageBps ?? 100,
       quoteObservedAt: quote.observedAt,
     };
-    const authorization = this.governor.authorize(proposal, this.risk(now), safety, now);
-    if (!authorization.allowed) return authorization;
+    return { pending, min, proposal };
+  }
+  private settleEntry<T extends RiskAuthorization | ResearchRiskAuthorization>(
+    { pending, min, proposal }: ReturnType<PaperLedger["prepareEntry"]>,
+    authorization: T, fee: bigint, now: number,
+  ): T {
     try {
       if (
         this.state.killSwitch ||
@@ -261,7 +351,7 @@ export class PaperLedger {
       if (this.state.cashLamports < pending.amountLamports + fee)
         throw Error("PAPER_CASH_BALANCE_MISMATCH");
       // No await/provider work occurs between final authorization consumption and settlement.
-      this.governor.complete(pending.id, now);
+      this.governor.consumeAuthorization(authorization, proposal, now);
     } catch (error) {
       this.governor.release(pending.id);
       throw error;
@@ -338,7 +428,7 @@ export class PaperLedger {
     timestamp(now);
     if (this.state.killSwitch || this.governor.isKilled())
       return { reason: "EMERGENCY_SHUTDOWN", bps: 10000 };
-    if (now - p.openedAt >= 300000) return { reason: "MAX_HOLD", bps: 10000 };
+    if (now - p.openedAt >= PAPER_EXIT_RULES.maximumHoldMs) return { reason: "MAX_HOLD", bps: 10000 };
     return null;
   }
   /** A pending profit slice cannot suppress a required full liquidation. A
@@ -379,14 +469,14 @@ export class PaperLedger {
       return null;
     const mark = p.markLamports,
       basis = p.costLamports + p.entryFeeLamports;
-    if (mark * 10000n <= basis * 8500n) return { reason: "STOP_LOSS", bps: 10000 };
-    if (p.peakLamports > basis && mark * 10000n <= p.peakLamports * 9000n)
+    if (mark * 10000n <= basis * BigInt(PAPER_EXIT_RULES.stopLossRemainingBps)) return { reason: "STOP_LOSS", bps: 10000 };
+    if (p.peakLamports > basis && mark * 10000n <= p.peakLamports * BigInt(PAPER_EXIT_RULES.trailingRemainingBps))
       return { reason: "TRAILING_STOP", bps: 10000 };
-    if (signal?.creatorSelling || (signal?.sellerConcentrationBps ?? 0) >= 7000)
+    if (signal?.creatorSelling || (signal?.sellerConcentrationBps ?? 0) >= PAPER_EXIT_RULES.concentratedSellingBps)
       return { reason: "CONCENTRATED_SELLING", bps: 10000 };
-    if (signal?.imbalance != null && Number.isFinite(signal.imbalance) && signal.imbalance < -0.4)
+    if (signal?.imbalance != null && Number.isFinite(signal.imbalance) && signal.imbalance < PAPER_EXIT_RULES.minimumImbalance)
       return { reason: "MOMENTUM_DETERIORATION", bps: 10000 };
-    if (!p.partialTaken && mark * 2n >= basis * 3n) return { reason: "PARTIAL_PROFIT", bps: 5000 };
+    if (!p.partialTaken && mark * 10000n >= basis * BigInt(PAPER_EXIT_RULES.partialProfitReturnBps)) return { reason: "PARTIAL_PROFIT", bps: PAPER_EXIT_RULES.partialExitBps };
     return null;
   }
   queueExit(
@@ -522,6 +612,8 @@ export class PaperLedger {
       throw Error("PAPER_POSITION_BALANCE_MISMATCH");
   }
   private validateFee(fee: bigint) {
+    if (this.governor.researchBook && fee.toString() !== this.governor.researchBook.policy.networkFeePerLegLamports)
+      throw Error("RESEARCH_MODELED_FEE_MISMATCH");
     if (typeof fee !== "bigint" || fee < 0n || fee > this.governor.limits.maxFeeLamports)
       throw Error("PAPER_FEE_BUDGET_EXCEEDED");
   }
@@ -530,7 +622,8 @@ export class PaperLedger {
       throw Error("PAPER_MINIMUM_EXECUTION_DELAY_REQUIRED");
   }
   private validateReady(order: { readyAt: number }, quote: Quote, now: number) {
-    if (now < order.readyAt || quote.observedAt < order.readyAt)
+    if (now < order.readyAt || quote.observedAt < order.readyAt ||
+      (this.governor.researchBook && (quote.requestedAt ?? -1) < order.readyAt))
       throw Error("PAPER_DELAY_NOT_OBSERVED");
   }
   private validateQuote(
@@ -544,6 +637,10 @@ export class PaperLedger {
   ) {
     timestamp(now);
     timestamp(q.observedAt);
+    const research = this.governor.researchBook;
+    if (research) {
+      validateResearchPaperQuote(q, inputMint, outputMint, amount, research.policy, now);
+    }
     basisPoints(slippage, this.governor.limits.maxSlippageBps);
     if (
       !Number.isFinite(maxAgeMs) ||

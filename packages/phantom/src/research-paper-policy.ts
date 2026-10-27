@@ -3,6 +3,7 @@ import { evaluateStrategies, type SignalFeatures } from "./intelligence.ts";
 import { checkTokenSafety, type SafetyVerdict, type TokenSafetyEvidence } from "./risk.ts";
 import { WSOL } from "./types.ts";
 import { conservativeCostBps } from "./costs.ts";
+import { verifyResearchMintCapture, type ResearchMintAccountCapture } from "./research-mint-evidence.ts";
 
 /** Offline engineering policy only: no provider, ledger, credentials or execution. */
 const FIXED = {
@@ -45,12 +46,22 @@ const FIXED = {
   },
 } as const;
 
-export type ResearchPaperPolicy = typeof FIXED &
-  Readonly<{
-    sourceHash: string;
-    frozenAt: number;
-    manifestHash: string;
-  }>;
+// V1's exact body remains unchanged. V2 is a new source universe and therefore
+// requires a new manifest/epoch; no old decision can be relabeled as V2.
+const { tokenProgram: _legacyProgram, requiredExtensions: _legacyExtensions, ...COMMON_V2 } = FIXED;
+const FIXED_V2 = {
+  ...COMMON_V2,
+  kind: "RESEARCH_PAPER_POLICY_V2",
+  version: 2,
+  sourceUniverse: "LEGACY_SPL_AND_METADATA_ONLY_TOKEN_2022_SOL_PAIRS_JUPITER_AGGREGATOR_QUOTES",
+  allowedTokenPrograms: ["spl-token", "token-2022"],
+  allowedMintExtensions: ["MetadataPointer", "TokenMetadata"],
+  requiresOriginalMintAccountCapture: true,
+} as const;
+type FrozenIdentity = Readonly<{ sourceHash: string; frozenAt: number; manifestHash: string }>;
+export type ResearchPaperPolicyV1 = typeof FIXED & FrozenIdentity;
+export type ResearchPaperPolicyV2 = typeof FIXED_V2 & FrozenIdentity;
+export type ResearchPaperPolicy = ResearchPaperPolicyV1 | ResearchPaperPolicyV2;
 
 function canonical(value: unknown): string {
   if (value === null || ["boolean", "string", "number"].includes(typeof value)) {
@@ -84,7 +95,7 @@ function immutable<T>(value: T): T {
 export function freezeResearchPaperPolicy(input: {
   sourceHash: string;
   frozenAt: number;
-}): ResearchPaperPolicy {
+}): ResearchPaperPolicyV1 {
   if (
     !input ||
     Object.keys(input).sort().join(",") !== "frozenAt,sourceHash" ||
@@ -100,14 +111,31 @@ export function freezeResearchPaperPolicy(input: {
   return immutable({ ...body, manifestHash: hash(body) });
 }
 
-/** Saved manifests are accepted only when the entire immutable V1 contract matches. */
+/** A distinct immutable epoch; strategy/economics/timing are identical to V1. */
+export function freezeResearchPaperPolicyV2(input: {
+  sourceHash: string;
+  frozenAt: number;
+}): ResearchPaperPolicyV2 {
+  // Reuse the unchanged V1 constructor's identity/schema validation only.
+  freezeResearchPaperPolicy(input);
+  const body = structuredClone({ ...FIXED_V2, sourceHash: input.sourceHash, frozenAt: input.frozenAt });
+  return immutable({ ...body, manifestHash: hash(body) });
+}
+
+/** Saved manifests must match the complete, exact V1 or V2 contract. */
 export function validateResearchPaperPolicy(value: unknown): ResearchPaperPolicy {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw Error("RESEARCH_POLICY_INVALID");
   const p = value as Record<string, unknown>;
   if (!source(p.sourceHash) || !clock(p.frozenAt))
     throw Error("RESEARCH_POLICY_SOURCE_OR_CLOCK_INVALID");
-  const expected = freezeResearchPaperPolicy({ sourceHash: p.sourceHash, frozenAt: p.frozenAt });
+  const input = { sourceHash: p.sourceHash, frozenAt: p.frozenAt };
+  const expected = p.kind === "RESEARCH_PAPER_POLICY_V1" && p.version === 1
+    ? freezeResearchPaperPolicy(input)
+    : p.kind === "RESEARCH_PAPER_POLICY_V2" && p.version === 2
+      ? freezeResearchPaperPolicyV2(input)
+      : null;
+  if (!expected) throw Error("RESEARCH_POLICY_VERSION_UNSUPPORTED");
   if (canonical(value) !== canonical(expected))
     throw Error("RESEARCH_POLICY_MANIFEST_OR_FIXED_CONFIG_MISMATCH");
   return expected;
@@ -146,7 +174,12 @@ export interface ResearchPaperDecisionEvidence {
   pairedSell: ResearchQuoteOutput & { inAmount: string };
   features: SignalFeatures;
   security: TokenSafetyEvidence;
+  /** Required for V2. V1 remains readable without a raw mint capture. */
+  mintAccountCapture?: ResearchMintAccountCapture;
 }
+export type ResearchPaperDecisionEvidenceV2 = ResearchPaperDecisionEvidence & {
+  mintAccountCapture: ResearchMintAccountCapture;
+};
 
 /** Structurally incompatible with SafetyVerdict: notably there is NO `allowed`. */
 export interface ResearchPaperAdmission {
@@ -176,6 +209,7 @@ export interface ResearchPaperAdmission {
     networkFeeScope: "EXPLICIT_MODEL_NOT_MEASURED";
   }>;
   readonly evidence: Readonly<ResearchPaperDecisionEvidence>;
+  readonly mintCaptureVerification?: ReturnType<typeof verifyResearchMintCapture> | null;
 }
 
 /**
@@ -192,9 +226,9 @@ export interface ResearchPaperAdmission {
  * Capacity describes a new decision before its own entry reservation is made.
  * Invalid manifests throw; validly shaped adverse evidence returns a denial.
  */
-export function evaluateResearchPaperAdmission(
-  policy: ResearchPaperPolicy,
-  evidence: ResearchPaperDecisionEvidence,
+export function evaluateResearchPaperAdmission<P extends ResearchPaperPolicy>(
+  policy: P,
+  evidence: P extends ResearchPaperPolicyV2 ? ResearchPaperDecisionEvidenceV2 : ResearchPaperDecisionEvidence,
   now: number,
 ): ResearchPaperAdmission {
   const p = validateResearchPaperPolicy(policy);
@@ -215,6 +249,8 @@ export function evaluateResearchPaperAdmission(
     sell = e.pairedSell;
   const reasons: string[] = [],
     exempted: string[] = [];
+  let mintCaptureVerification: ReturnType<typeof verifyResearchMintCapture> | null = null;
+  let mintCaptureDeadline = Number.MAX_SAFE_INTEGER;
   if (e.policyHash !== p.manifestHash || e.sourceHash !== p.sourceHash)
     reasons.push("RESEARCH_POLICY_OR_SOURCE_MISMATCH");
   if (typeof e.captureId !== "string" || !/^[A-Za-z0-9:_-]{1,128}$/.test(e.captureId))
@@ -264,7 +300,9 @@ export function evaluateResearchPaperAdmission(
     reasons.push("RESEARCH_QUOTE_MINT_IDENTITY_MISMATCH");
   if (s.sellRouteObservedAt !== sell.observedAt)
     reasons.push("RESEARCH_SELL_ROUTE_NOT_BOUND_TO_PAIRED_QUOTE");
-  if (s.tokenProgram !== p.tokenProgram) reasons.push("RESEARCH_SOURCE_UNIVERSE_UNSUPPORTED");
+  if (p.version === 1 ? s.tokenProgram !== p.tokenProgram :
+      !p.allowedTokenPrograms.some((program) => program === s.tokenProgram))
+    reasons.push("RESEARCH_SOURCE_UNIVERSE_UNSUPPORTED");
   // The strict checker is preserved below, including its original verdict.
   // This V1 universe separately requires genuine legacy SPL schema: a legacy
   // mint cannot carry Token-2022 extensions, regardless of the default allowlist.
@@ -286,8 +324,44 @@ export function evaluateResearchPaperAdmission(
     new Set(s.extensions).size !== s.extensions.length
   )
     reasons.push("RESEARCH_SECURITY_EXTENSIONS_MALFORMED");
-  if (!Array.isArray(s.extensions) || s.extensions.length !== p.requiredExtensions.length)
+  if (p.version === 1 && (!Array.isArray(s.extensions) || s.extensions.length !== p.requiredExtensions.length))
     reasons.push("RESEARCH_LEGACY_SPL_EXTENSIONS_UNSUPPORTED");
+  if (p.version === 2) {
+    if (!Array.isArray(s.extensions) || s.extensions.some((name) =>
+        !p.allowedMintExtensions.some((allowed) => allowed === name)) ||
+        (s.tokenProgram === "spl-token" && s.extensions.length !== 0))
+      reasons.push("RESEARCH_V2_MINT_EXTENSIONS_UNSUPPORTED");
+    const capture = e.mintAccountCapture;
+    if (!capture) reasons.push("RESEARCH_V2_MINT_CAPTURE_REQUIRED");
+    else {
+      if (![capture.requestedAt, capture.observedAt, capture.publishedAt].every(clock) ||
+          capture.requestedAt <= p.frozenAt || capture.observedAt <= p.frozenAt || capture.publishedAt <= p.frozenAt ||
+          capture.requestedAt > capture.observedAt || capture.observedAt > capture.publishedAt ||
+          capture.publishedAt > e.capturedAt || capture.publishedAt > now ||
+          now - capture.requestedAt > p.safetyPolicy.maxAgeMs)
+        reasons.push("RESEARCH_V2_MINT_CAPTURE_CLOCK_INVALID");
+      if (capture.publishedAt !== s.observedAt)
+        reasons.push("RESEARCH_V2_MINT_CAPTURE_CONTROL_MISMATCH");
+      if (clock(capture.requestedAt))
+        mintCaptureDeadline = Math.min(Number.MAX_SAFE_INTEGER, capture.requestedAt + p.safetyPolicy.maxAgeMs);
+      try {
+        // Raw RPC response time is preserved. The later full security snapshot
+        // availability clock is publication, not a retimestamped raw response.
+        mintCaptureVerification = verifyResearchMintCapture(capture, s.mint, capture.observedAt);
+        const d = mintCaptureVerification;
+        if (d.mint !== s.mint || d.tokenProgram !== s.tokenProgram || d.observedAt !== capture.observedAt ||
+            d.requestedAt !== capture.requestedAt || d.publishedAt !== s.observedAt ||
+            d.mintAuthority !== s.mintAuthority || d.freezeAuthority !== s.freezeAuthority ||
+            s.extensionsVerified !== true || !Array.isArray(s.extensions) ||
+            canonical([...d.extensions].sort()) !== canonical([...s.extensions].sort()) ||
+            d.transferFeeBps !== s.transferFeeBps || d.permanentDelegate !== s.permanentDelegate ||
+            d.transferRestricted !== s.transferRestricted)
+          reasons.push("RESEARCH_V2_MINT_CAPTURE_CONTROL_MISMATCH");
+      } catch {
+        reasons.push("RESEARCH_V2_MINT_CAPTURE_INVALID_OR_UNVERIFIED");
+      }
+    }
+  }
   for (const quote of [e.quote, sell]) {
     if (
       quote.source !== p.quoteSource ||
@@ -423,6 +497,7 @@ export function evaluateResearchPaperAdmission(
     expiresAt: Math.min(
       Number.MAX_SAFE_INTEGER,
       strictVerdict.expiresAt,
+      mintCaptureDeadline,
       e.sourceObservedAt + p.maximumDecisionAgeMs,
       e.quote.requestedAt + p.maximumQuoteAgeMs,
       sell.requestedAt + p.maximumQuoteAgeMs,
@@ -445,5 +520,6 @@ export function evaluateResearchPaperAdmission(
       networkFeeScope: p.networkFeeScope,
     },
     evidence: e,
+    ...(p.version === 2 ? { mintCaptureVerification } : {}),
   });
 }

@@ -56,6 +56,19 @@ const proposal: TradeProposal = {
 const safety = checkTokenSafety(evidence, DEFAULT_SAFETY_POLICY, now);
 
 describe("token safety", () => {
+  it("retains the original read deadline when completed evidence is published later", () => {
+    const e = { ...evidence, evidenceRequestedAt: 70001, observedAt: 99000 };
+    const checked = checkTokenSafety(e, DEFAULT_SAFETY_POLICY, now);
+    expect(checked.allowed).toBe(true);
+    expect(checked.expiresAt).toBe(100001);
+    expect(checkTokenSafety(e, DEFAULT_SAFETY_POLICY, 100001).allowed).toBe(true);
+    expect(checkTokenSafety(e, DEFAULT_SAFETY_POLICY, 100002).allowed).toBe(false);
+    expect(checkTokenSafety({ ...e, evidenceRequestedAt: 1000 }, DEFAULT_SAFETY_POLICY, now).allowed).toBe(false);
+  });
+  it.each([null, -1, NaN, Infinity, "70001", 99001, 0.5])("rejects malformed/future evidence request anchor %s", (evidenceRequestedAt) => {
+    const e = { ...evidence, observedAt: 99000, evidenceRequestedAt } as unknown as TokenSafetyEvidence;
+    expect(checkTokenSafety(e, DEFAULT_SAFETY_POLICY, now).reasons).toContain("SECURITY_EVIDENCE_STALE_OR_FUTURE");
+  });
   it("accepts only complete, fresh safety evidence and does not promise future sellability", () => {
     expect(safety.allowed).toBe(true);
     expect(safety.reasons).toContain("CHECKS_PASSED_FUTURE_SELLABILITY_NOT_GUARANTEED");

@@ -1,7 +1,17 @@
+import {
+  evaluateResearchPaperAdmission,
+  validateResearchPaperPolicy,
+  type ResearchPaperPolicy,
+  type ResearchPaperDecisionEvidence,
+  type ResearchPaperAdmission,
+} from "./research-paper-policy.ts";
+
 /** Pure, deterministic final authority. Quotes and safety evidence are never a guarantee. */
 export interface TokenSafetyEvidence {
   mint: string;
   observedAt: number;
+  /** Actual start of the evidence read. Publication cannot renew the age of its original controls. */
+  evidenceRequestedAt?: number;
   mintAuthority: string | null | undefined;
   freezeAuthority: string | null | undefined;
   tokenProgram: "spl-token" | "token-2022" | "unknown";
@@ -50,7 +60,10 @@ export function checkTokenSafety(
   now = Date.now(),
 ): SafetyVerdict {
   const reasons: string[] = [];
-  if (!Number.isFinite(e.observedAt) || e.observedAt > now || now - e.observedAt > policy.maxAgeMs)
+  const evidenceAnchor = e.evidenceRequestedAt === undefined ? e.observedAt : e.evidenceRequestedAt;
+  if (!Number.isSafeInteger(e.observedAt) || e.observedAt < 0 || e.observedAt > now ||
+    !Number.isSafeInteger(evidenceAnchor) || evidenceAnchor < 0 || evidenceAnchor > e.observedAt ||
+    now - evidenceAnchor > policy.maxAgeMs)
     reasons.push("SECURITY_EVIDENCE_STALE_OR_FUTURE");
   if (e.mintAuthority === undefined) reasons.push("MINT_AUTHORITY_UNKNOWN");
   else if (e.mintAuthority !== null) reasons.push("MINT_AUTHORITY_ACTIVE");
@@ -120,7 +133,7 @@ export function checkTokenSafety(
     allowed: reasons.length === 0,
     checkedAt: now,
     expiresAt: Math.min(
-      e.observedAt + policy.maxAgeMs,
+      evidenceAnchor + policy.maxAgeMs,
       (e.sellRouteObservedAt ?? 0) + policy.maxAgeMs,
     ),
     reasons: reasons.length ? reasons : ["CHECKS_PASSED_FUTURE_SELLABILITY_NOT_GUARANTEED"],
@@ -189,6 +202,32 @@ export interface RiskAuthorization {
   reservedLamports: bigint;
 }
 
+/** Research limits are a frozen engineering profile, never live approval. */
+export const RESEARCH_PAPER_RISK_LIMITS: Readonly<RiskLimits> = Object.freeze({
+  ...DEFAULT_RISK_LIMITS,
+  maxPerTradeLamports: 10_000_000n,
+  maxPositions: 1,
+  maxSlippageBps: 25,
+  maxFeeLamports: 10_000n,
+});
+export interface ResearchRiskBook {
+  readonly bookId: string;
+  readonly policy: ResearchPaperPolicy;
+}
+export interface ResearchRiskAuthorization {
+  readonly kind: "RESEARCH_PAPER_CAPITAL_AUTHORIZATION";
+  readonly allowedForResearch: boolean;
+  readonly bookId: string;
+  readonly policyHash: string;
+  readonly orderId: string;
+  readonly mint: string;
+  readonly reasons: readonly string[];
+  readonly expiresAt: number;
+  readonly reservedLamports: bigint;
+  readonly admission: ResearchPaperAdmission;
+}
+type IssuedAuthorization = RiskAuthorization | ResearchRiskAuthorization;
+
 /** One governor per portfolio; durable transactional lock is required across processes. */
 export class RiskGovernor {
   private reservations = new Map<
@@ -198,7 +237,20 @@ export class RiskGovernor {
   private completed = new Set<string>();
   private killed = false;
   readonly limits: Readonly<RiskLimits>;
-  constructor(limits: RiskLimits = DEFAULT_RISK_LIMITS) {
+  #research: Readonly<ResearchRiskBook> | null;
+  #issued = new WeakMap<object, TradeProposal>();
+  get researchBook() { return this.#research; }
+  constructor(limits: RiskLimits = DEFAULT_RISK_LIMITS, research?: ResearchRiskBook) {
+    this.#research = research ? Object.freeze({
+      bookId: research.bookId,
+      policy: validateResearchPaperPolicy(research.policy),
+    }) : null;
+    if (research) {
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(research.bookId)) throw Error("RESEARCH_BOOK_ID_INVALID");
+      const keys = Object.keys(RESEARCH_PAPER_RISK_LIMITS) as (keyof RiskLimits)[];
+      if (Object.keys(limits).length !== keys.length || keys.some((k) => limits[k] !== RESEARCH_PAPER_RISK_LIMITS[k]))
+        throw Error("RESEARCH_RISK_PROFILE_MISMATCH");
+    }
     for (const n of [
       limits.maxCapitalPerTradeBps,
       limits.maxDrawdownBps,
@@ -292,19 +344,82 @@ export class RiskGovernor {
     safety: SafetyVerdict,
     now = Date.now(),
   ): RiskAuthorization {
+    const reasons: string[] = [];
+    if (this.#research) reasons.push("STRICT_AUTHORIZATION_REQUIRES_STRICT_BOOK");
+    if (
+      safety.allowed !== true || safety.mint !== p.mint ||
+      !Number.isSafeInteger(safety.checkedAt) || safety.checkedAt > now ||
+      !Number.isSafeInteger(safety.expiresAt) || safety.expiresAt < now
+    ) reasons.push("TOKEN_SAFETY_VETO");
+    const authorization = this.authorizeEntry(p, state, safety.expiresAt, reasons, now);
+    return this.issue(authorization, p, authorization.allowed);
+  }
+
+  /** Recomputes the original research evidence; a caller Boolean is never capital authority. */
+  authorizeResearch(
+    p: TradeProposal,
+    state: PortfolioRiskState,
+    evidence: ResearchPaperDecisionEvidence,
+    now: number,
+  ): ResearchRiskAuthorization {
+    const book = this.#research;
+    if (!book) throw Error("RESEARCH_AUTHORIZATION_REQUIRES_RESEARCH_BOOK");
+    const admission = evaluateResearchPaperAdmission(book.policy, evidence, now);
+    const reasons = [...admission.reasons];
+    if (
+      p.mint !== evidence.security.mint || p.strategy !== book.policy.strategy ||
+      p.amountLamports.toString() !== evidence.quote.inputLamports ||
+      p.feeLamports.toString() !== book.policy.networkFeePerLegLamports ||
+      p.liquidityLamports !== evidence.features.liquidityLamports ||
+      p.slippageBps !== book.policy.slippageBps ||
+      p.quoteObservedAt !== evidence.quote.observedAt ||
+      evidence.openPositions !== state.openPositions
+    ) reasons.push("RESEARCH_PROPOSAL_EVIDENCE_OR_PORTFOLIO_MISMATCH");
+    const capital = this.authorizeEntry(p, state, admission.expiresAt, reasons, now);
+    const authorization: ResearchRiskAuthorization = {
+      kind: "RESEARCH_PAPER_CAPITAL_AUTHORIZATION",
+      allowedForResearch: capital.allowed,
+      bookId: book.bookId,
+      policyHash: book.policy.manifestHash,
+      orderId: p.orderId,
+      mint: p.mint,
+      reasons: capital.reasons,
+      expiresAt: capital.expiresAt,
+      reservedLamports: capital.reservedLamports,
+      admission,
+    };
+    return this.issue(authorization, p, authorization.allowedForResearch);
+  }
+  private issue<T extends IssuedAuthorization>(authorization: T, proposal: TradeProposal, allowed: boolean): T {
+    Object.freeze(authorization);
+    if (allowed) this.#issued.set(authorization, Object.freeze({ ...proposal }));
+    return authorization;
+  }
+  /** Only an actual issuance from this governor can be consumed, once, with its exact proposal. */
+  consumeAuthorization(authorization: IssuedAuthorization, proposal: TradeProposal, now: number) {
+    const issued = this.#issued.get(authorization);
+    if (!issued || Object.keys(issued).some((key) => issued[key as keyof TradeProposal] !== proposal[key as keyof TradeProposal]))
+      throw Error("CAPITAL_AUTHORIZATION_NOT_ISSUED_OR_PROPOSAL_MISMATCH");
+    if (!Number.isSafeInteger(authorization.expiresAt) || authorization.expiresAt < now)
+      throw Error("CAPITAL_AUTHORIZATION_EXPIRED");
+    this.complete(proposal.orderId, now);
+    this.#issued.delete(authorization);
+  }
+  private authorizeEntry(
+    p: TradeProposal,
+    state: PortfolioRiskState,
+    evidenceExpiresAt: number,
+    reasons: string[],
+    now: number,
+  ): RiskAuthorization {
+    if (!Number.isSafeInteger(now) || now < 0) throw Error("INVALID_RISK_TIMESTAMP");
     this.prune(now);
-    const reasons: string[] = [],
-      l = this.limits;
+    const l = this.limits;
+    if (!Number.isSafeInteger(evidenceExpiresAt) || evidenceExpiresAt < now)
+      reasons.push("ADMISSION_DEADLINE_INVALID_OR_EXPIRED");
     if (this.killed || state.killSwitch) reasons.push("GLOBAL_KILL_SWITCH");
     if (!p.orderId || this.reservations.has(p.orderId) || this.completed.has(p.orderId))
       reasons.push("DUPLICATE_OR_INVALID_ORDER");
-    if (
-      !safety.allowed ||
-      safety.mint !== p.mint ||
-      safety.checkedAt > now ||
-      safety.expiresAt < now
-    )
-      reasons.push("TOKEN_SAFETY_VETO");
     if (
       state.equityLamports <= 0n ||
       state.peakEquityLamports < state.equityLamports ||
@@ -363,7 +478,7 @@ export class RiskGovernor {
       reasons.push("QUOTE_STALE_OR_FUTURE");
     const expiresAt = Math.min(
       now + l.authorizationTtlMs,
-      safety.expiresAt,
+      evidenceExpiresAt,
       p.quoteObservedAt + l.maxQuoteAgeMs,
     );
     const amount = p.amountLamports + p.feeLamports;

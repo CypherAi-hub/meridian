@@ -93,6 +93,27 @@ describe.skipIf(!connection)("real PostgreSQL persistence and worker fencing", (
       await second?.close();
     }
   });
+  it("atomically creates and version-fences research books on the actual leased PostgreSQL session", async () => {
+    const store = await new Store().open(databaseUrl, undefined, true);
+    const id = "research-paper:postgres-cas", manifestHash = "a".repeat(64);
+    try {
+      const first = { ledgerVersion: 1, manifest: { manifestHash }, cashLamports: "1000000000" };
+      expect(await store.saveResearchPaperBook(id, first, null, manifestHash)).toBe(true);
+      expect(await store.saveResearchPaperBook(id, first, null, manifestHash)).toBe(false);
+      const updates = await Promise.all(["989990000", "989980000"].map((cashLamports) =>
+        store.saveResearchPaperBook(id, { ...first, ledgerVersion: 2, cashLamports }, 1, manifestHash)));
+      expect(updates.filter(Boolean)).toHaveLength(1);
+      expect((await store.get(id)).ledgerVersion).toBe(2);
+      expect(await store.saveResearchPaperBook(id, { ...first, ledgerVersion: 3 }, 1, manifestHash)).toBe(false);
+      expect(await store.saveResearchPaperBook(id, { ...first, ledgerVersion: 3 }, 2, "b".repeat(64))).toBe(false);
+    } finally { await store.close(); }
+    const restored = await new Store().open(databaseUrl, undefined, true);
+    try {
+      const current = await restored.get(id);
+      expect(current.ledgerVersion).toBe(2);
+      expect(await restored.saveResearchPaperBook(id, { ...current, ledgerVersion: 3 }, 2, manifestHash)).toBe(true);
+    } finally { await restored.close(); }
+  });
   it("does not move an in-flight write to another pooled session after lease loss", async () => {
     const first = await new Store().open(databaseUrl, undefined, true);
     let second: Store | undefined;

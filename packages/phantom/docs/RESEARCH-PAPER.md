@@ -1,10 +1,12 @@
 # Research paper admission and the next runner
 
-The implemented module is an **offline admission boundary**. A runner, cash
-reservation, persistent research account, automatic orders, exits and dashboard
-integration are still required. Passing these functions is not a completed trade
-or evidence of profitability. The current strict account and frozen quote cohort
-do not import this module.
+This document describes the **offline admission boundary**. A separate local
+runner now shares the paper accounting and persists prospective entries, cash
+reservations, positions and exits; see [RESEARCH-PAPER-RUNNER.md](RESEARCH-PAPER-RUNNER.md).
+Actual Engine scheduling, discovery enrollment, dashboard integration and a
+prospective market-quote lifecycle remain required. Passing these functions or
+synthetic runner tests is not evidence of profitability. The current strict
+account and frozen quote cohort do not import this module.
 
 ## A deliberate research exception
 
@@ -27,16 +29,25 @@ veto. Unknown association coverage alone is not converted into verified coverage
 
 `ResearchPaperAdmission` has `allowedForResearch` and deliberately has no outer
 `allowed` property. It is structurally incompatible with `SafetyVerdict`; even a
-runtime cast is rejected by the existing strict governor. Future integration
-must add a distinct paper-only authorization path sharing the economic risk and
-accounting primitives. It must never synthesize `SafetyVerdict.allowed=true`.
+runtime cast is rejected by the existing strict governor. The local research
+runner uses a distinct paper-only authorization path sharing the economic risk
+and accounting primitives. It never synthesizes `SafetyVerdict.allowed=true`.
 
 ## What the module actually verifies
 
-`freezeResearchPaperPolicy({sourceHash, frozenAt})` creates a deeply immutable,
-hashed V1 manifest. `validateResearchPaperPolicy` reconstructs its entire fixed
-body and rejects edited parameters, extra fields, source mismatch or hash changes.
-There is no parameter search. The fixed engineering policy has:
+`freezeResearchPaperPolicy({sourceHash, frozenAt})` continues to create the exact
+deeply immutable, hashed **V1** manifest. Its body and validation remain readable
+without adding a mint capture to old evidence. V1 remains legacy SPL only.
+`freezeResearchPaperPolicyV2({sourceHash, frozenAt})` creates a **separate V2**
+manifest with a different kind, source universe and hash. It admits legacy SPL
+and a restricted metadata-only Token-2022 universe, requiring original mint
+account bytes for every V2 decision. This is a protocol-coverage revision, not
+selection using observed returns or evidence of an eligible/profitable population.
+
+`ResearchPaperPolicy` is the V1/V2 union. `validateResearchPaperPolicy` recognizes
+only the exact kind/version pairs and reconstructs the entire corresponding fixed
+body. Edited parameters, extra fields, source mismatch or hash changes reject.
+There is no parameter search. Both versions retain these engineering settings:
 
 | Setting                                   | Value                                                            |
 | ----------------------------------------- | ---------------------------------------------------------------- |
@@ -46,7 +57,7 @@ There is no parameter search. The fixed engineering policy has:
 | Net liquidity floor / paired cost ceiling | 20 SOL / 150 bps                                                 |
 | Requested slippage per leg                | 25 bps, below the existing 100 bps maximum                       |
 | Minimum entry delay / quote freshness     | Two seconds / five seconds                                       |
-| Initial source universe                   | Legacy SPL SOL pairs, supported non-RFQ Jupiter routing          |
+| Quote routing                             | SOL pairs, supported non-RFQ Jupiter aggregators                 |
 | Network cost model                        | 10,000 lamports per leg, explicitly modeled rather than measured |
 
 Tighter slippage does not make the market cheaper. It increases the chance that
@@ -63,7 +74,8 @@ correct mints, valid minimum outputs under the 25-bps limit, supported source an
 router identity, and no contradictory RFQ metadata. Security's sell-route time
 must match the supplied sell quote. Legacy SPL requires an empty extension list
 and actual Boolean evidence, so truthy strings or impossible extension claims
-cannot pass.
+cannot pass in V1. V2 retains exact Boolean and extension-schema validation and
+adds the independently decoded raw mint controls described below.
 
 The delayed paired cost is recomputed from the raw proceeds and frozen fee model.
 It is a separate final pricing check, not a replacement for the earlier signal:
@@ -79,7 +91,68 @@ capture identifiers are preserved, not cryptographically authenticated. A valid
 decision must still undergo final cash, inventory, fee, drawdown, reservation and
 idempotency checks in the future paper runner.
 
+## V2 original mint-account evidence
+
+Every V2 decision requires:
+
+```ts
+mintAccountCapture: {
+  address: string;
+  owner: string;
+  dataBase64: string;
+  slot: number;
+  requestedAt: number;
+  observedAt: number;
+  publishedAt: number;
+}
+```
+
+The policy calls `verifyResearchMintCapture` on these original bytes, with the
+security mint and the original raw response time as exact expected identities.
+The three clocks are distinct: `requestedAt` is the actual mint RPC start,
+`observedAt` is its original response completion, and `publishedAt` is the later
+completed full security snapshot's availability time. `publishedAt` must equal
+`security.observedAt`; the raw response is never retimestamped after holder or
+other security inspection. The policy requires exact agreement with the decoded token program, mint
+and freeze authorities, extension set, transfer fee, permanent delegate and
+transfer restrictions. `extensionsVerified:true` alone cannot substitute for a
+capture, contradict it, or make an unsupported layout acceptable. Active
+authorities remain actual active authorities and retain their strict vetoes.
+
+Legacy SPL requires its exact mint layout and no extensions. For Token-2022,
+only mint `MetadataPointer` and `TokenMetadata` extensions are in scope; a mint
+with no extensions is also supported. Token metadata requires its metadata
+pointer and matching embedded mint identity. Account-only `ImmutableOwner`,
+unknown types, transfer hooks, permanent delegates, transfer-fee configurations
+**even with zero rates**, and every other extension reject. These restrictions
+are narrower than the shared strict checker's general extension allowlist.
+
+All three raw anchors must be after the new policy freeze, with
+`requestedAt <= observedAt <= publishedAt <= capturedAt <= now`. The maximum age
+is 30 seconds from the **earliest raw request**, matching the existing security
+evidence limit without hiding time spent in RPC or later inspection. That request
+time plus the limit participates in admission expiration, alongside all original
+source, decision, quote-request, quote-observation and security deadlines.
+
+The derived controls and raw/capture hashes remain attached to a V2 admission
+with `CALLER_SUPPLIED_RAW_ACCOUNT_NOT_ATTESTED` provenance. Decoding supplied
+bytes does not authenticate a provider, prove a same-bank relationship to holder
+or liquidity evidence, certify deployed program behavior, or establish future
+sellability. The unknown-association PAPER exception and all strict/funded
+exclusions remain unchanged.
+
+V2 requires a newly frozen epoch and policy identity before its first prospective
+decision. Restore V1 as V1; do not edit its manifest, relabel its historical data,
+carry earlier quotes into V2 entries, or turn a conditional capture into a strict
+certificate. No strategy, cost, liquidity, capacity, delay or capital threshold
+was changed to fit observed winners.
+
 ## Required next integration
+
+The local accounting/runner implementation is now described in
+[RESEARCH-PAPER-RUNNER.md](RESEARCH-PAPER-RUNNER.md). Its synthetic durable
+lifecycles do not complete the actual Engine, provider, UI or performance
+integration described below.
 
 Use the repaired native paper accounting, not a second incompatible fill model.
 Implement an explicitly separate research account/namespace and persisted

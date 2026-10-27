@@ -108,6 +108,13 @@ const opts: ReplayOptions = {
   fixtureKind: "synthetic-fixture",
 };
 describe("frozen point-in-time strategy adapter", () => {
+  it("does not renew recorded security freshness through later publication during replay", () => {
+    const r = row("long-security-inspection", 40000);
+    r.features = { ...r.features, securityEvidenceRequestedAt: 1000 };
+    const result = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0))(ctx(r));
+    expect(result.action).toBe("reject");
+    expect(result.reasons).toContain("SECURITY_EVIDENCE_STALE_OR_FUTURE");
+  });
   for (const strategy of [
     "launch_sniper",
     "momentum_breakout",
@@ -536,6 +543,15 @@ describe("durable replay feature capture", () => {
     abnormalCreatorActivity: null,
   };
   const risk = { now: 1200, killSwitch: false, consecutiveFailures: 0, slippageBps: 100 };
+  it("preserves the original security request anchor without retimestamping publication", () => {
+    const f = flattenReplayFeatures(signal, { ...safety, evidenceRequestedAt: 900 }, risk);
+    expect(f.securityEvidenceRequestedAt).toBe(900);
+    expect(f.securityObservedAt).toBe(1100);
+    expect(flattenReplayFeatures(signal, safety, risk)).not.toHaveProperty("securityEvidenceRequestedAt");
+  });
+  it.each([null, -1, 1101, NaN, Infinity, 1.5])("rejects malformed replay security request anchor %s", (anchor) => {
+    expect(() => flattenReplayFeatures(signal, { ...safety, evidenceRequestedAt: anchor } as unknown as TokenSafetyEvidence, risk)).toThrow("REQUEST_ANCHOR");
+  });
   it("preserves the source feature time separately from capture and unknown safety flags", () => {
     const f = flattenReplayFeatures(signal, safety, risk);
     expect(f.featuresObservedAt).toBe(1000);
