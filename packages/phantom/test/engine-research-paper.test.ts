@@ -35,7 +35,7 @@ afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
-async function setup() {
+async function setup(options: { defaultResearch?: boolean } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "phantom-engine-experimental-"));
   directories.push(dir);
   process.env.PHANTOM_DATA_DIR = join(dir, "db");
@@ -44,6 +44,10 @@ async function setup() {
   process.env.PHANTOM_KILL_SWITCH = "false";
   process.env.PHANTOM_QUOTE_RESEARCH = "false";
   process.env.PHANTOM_FORWARD_RESEARCH = "false";
+  if (options.defaultResearch) {
+    delete process.env.PHANTOM_QUOTE_RESEARCH;
+    delete process.env.PHANTOM_FORWARD_RESEARCH;
+  }
   process.env.PHANTOM_WALLET_HISTORY = "false";
   process.env.PHANTOM_RESEARCH_PAPER_ENABLED = "true";
   process.env.PHANTOM_TRADE_SOL = "0.02"; // Strict configuration must never change the frozen research notional.
@@ -231,8 +235,8 @@ async function setup() {
     tx,
     calls,
     provider,
-    setStopDuringBuy() {
-      stopDuringBuy = true;
+    setStopDuringBuy(value = true) {
+      stopDuringBuy = value;
     },
     advance(ms: number) {
       offset += ms;
@@ -241,6 +245,199 @@ async function setup() {
 }
 
 describe("experimental book Engine integration", () => {
+  it("arbitrates fast and full callbacks ahead of baseline sampling with both research defaults enabled", async () => {
+    const f = await setup({ defaultResearch: true });
+    // Drive timer work explicitly so injected clock jumps do not race periodic callbacks.
+    clearInterval((f.engine as any).timer);
+    (f.engine as any).timer = null;
+    clearInterval((f.engine as any).researchTimer);
+    (f.engine as any).researchTimer = null;
+    const collector = (f.engine as any).quoteResearch;
+    const samples = vi.spyOn(collector, "sample");
+    expect(process.env.PHANTOM_QUOTE_RESEARCH).toBeUndefined();
+    expect(process.env.PHANTOM_FORWARD_RESEARCH).toBeUndefined();
+    expect(f.engine.state().forwardResearch).not.toBeNull();
+    await f.engine.recordLogs({
+      signature: f.tx.transaction.signatures[0],
+      slot: f.tx.slot,
+      receivedAt: Date.now(),
+      logs: f.tx.meta!.logMessages!,
+      commitment: "finalized",
+    });
+    expect(samples).not.toHaveBeenCalled();
+    expect(f.calls).toHaveLength(0);
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(4);
+    expect(f.calls.every((c) => c.input.slippageBps === 25)).toBe(true);
+    expect(f.engine.state().researchPaper!.positions).toHaveLength(1);
+    // Baseline remains enabled and gets a later full-event turn when the book is occupied.
+    f.advance(31_000);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(43));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(samples).toHaveBeenCalledTimes(2);
+    expect(f.calls).toHaveLength(6);
+    const baselines = await f.engine.store.query(
+      "SELECT payload FROM phantom_quote_research WHERE payload->>'phase'='BASELINE'",
+    );
+    expect(baselines).toHaveLength(1);
+    expect(baselines[0].payload.forwardExperimentId).toBe(
+      f.engine.state().forwardResearch!.experimentId,
+    );
+    const window = await (f.engine as any).forwardRuntime.collector.nextQuoteWindow();
+    f.advance(Math.max(0, window.dueAt - Date.now()));
+    await collector.tick(f.provider);
+    expect(f.calls).toHaveLength(7); // Four modeled-entry quotes, two baseline quotes, one fresh forward entry.
+    const records = await f.engine.store.query(
+      "SELECT payload FROM phantom_forward_records WHERE phase='ENTRY_RESULT'",
+    );
+    expect(records).toHaveLength(1);
+    await collector.tick(f.provider);
+    expect(f.calls).toHaveLength(7); // A due legacy horizon cannot bypass the spent shared budget.
+    expect(f.engine.state().researchPaper!.positions).toHaveLength(1);
+  }, 30000);
+
+  it("keeps a genuine due forward turn ahead of an otherwise valid experimental candidate", async () => {
+    const f = await setup({ defaultResearch: true });
+    clearInterval((f.engine as any).timer);
+    (f.engine as any).timer = null;
+    clearInterval((f.engine as any).researchTimer);
+    (f.engine as any).researchTimer = null;
+    const signal = vi.mocked((f.engine as any).feature).getMockImplementation()!;
+    vi.mocked((f.engine as any).feature).mockImplementation((...args: unknown[]) => ({
+      ...signal(...args),
+      observations: 1,
+    }));
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(2); // With no valid signal, the enabled baseline owns this turn.
+    vi.mocked((f.engine as any).feature).mockImplementation(signal);
+    const collector = (f.engine as any).quoteResearch;
+    const window = await (f.engine as any).forwardRuntime.collector.nextQuoteWindow();
+    f.advance(Math.max(0, window.dueAt - Date.now()));
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(47));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(2);
+    expect(f.engine.state().researchPaper!.positions).toEqual([]);
+    await collector.tick(f.provider);
+    expect(f.calls).toHaveLength(3);
+    expect(
+      await f.engine.store.query(
+        "SELECT payload FROM phantom_forward_records WHERE phase='ENTRY_RESULT'",
+      ),
+    ).toHaveLength(1);
+  }, 30000);
+
+  it("keeps an observed initial-quote kill latched after the file is cleared", async () => {
+    const f = await setup();
+    f.setStopDuringBuy();
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(true);
+    await rm(join(f.dir, "KILL"));
+    f.setStopDuringBuy(false);
+    f.advance(31_000);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(44));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(1);
+    expect(f.engine.state().researchPaper!.positions).toEqual([]);
+  }, 15000);
+
+  it("latches a stop observed before analysis even when the file clears before a tick", async () => {
+    const f = await setup();
+    clearInterval((f.engine as any).timer);
+    (f.engine as any).timer = null;
+    clearInterval((f.engine as any).researchTimer);
+    (f.engine as any).researchTimer = null;
+    await writeFile(join(f.dir, "KILL"), "synthetic stop before analysis");
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(true);
+    await rm(join(f.dir, "KILL"));
+    f.advance(31_000);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(48));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(0);
+    expect(f.engine.state().researchPaper!.positions).toEqual([]);
+  }, 15000);
+
+  it("latches a stop observed during the real entry delay without a periodic tick", async () => {
+    const f = await setup();
+    clearInterval((f.engine as any).timer);
+    (f.engine as any).timer = null;
+    clearInterval((f.engine as any).researchTimer);
+    (f.engine as any).researchTimer = null;
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await vi.waitFor(() => expect(f.engine.state().researchPaper!.pending).toHaveLength(1), {
+      timeout: 4000,
+      interval: 20,
+    });
+    await writeFile(join(f.dir, "KILL"), "synthetic stop during delay");
+    await f.engine.idle();
+    expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(true);
+    expect(f.engine.state().researchPaper!.pending).toEqual([]);
+    await rm(join(f.dir, "KILL"));
+    f.advance(31_000);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(49));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(2);
+    expect(f.engine.state().researchPaper!.positions).toEqual([]);
+  }, 15000);
+
+  it("does not reserve an experimental turn after restoring a durably stopped book", async () => {
+    const f = await setup();
+    await f.engine.stop();
+    const restored = new Engine();
+    restored.setQuoteProvider(f.provider);
+    await restored.start({ stream: false, port: 0 });
+    engines.push(restored);
+    vi.spyOn(restored as any, "feature").mockImplementation(
+      vi.mocked((f.engine as any).feature).getMockImplementation()!,
+    );
+    const inspect = vi
+      .spyOn(restored.security, "inspect")
+      .mockRejectedValue(Error("UNEXPECTED_SECURITY_AFTER_STOP"));
+    const reserve = vi.spyOn((restored as any).quoteResearch, "externalTurn");
+    f.advance(31_000);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(45));
+    await restored.receive(later, Date.now(), "finalized");
+    await restored.idle();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(inspect).not.toHaveBeenCalled();
+    expect(f.calls).toHaveLength(0);
+  }, 15000);
+
+  it("expires an ordinary turn without latching a stop and allows a later fresh candidate", async () => {
+    const f = await setup(),
+      inspect = vi.mocked(f.engine.security.inspect).getMockImplementation()!;
+    vi.mocked(f.engine.security.inspect).mockImplementation(async (...args) => {
+      const snapshot = await inspect(...args);
+      f.advance(31_000);
+      return snapshot;
+    });
+    await f.engine.receive(f.tx, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(0);
+    expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(false);
+    vi.mocked(f.engine.security.inspect).mockImplementation(inspect);
+    const later = structuredClone(f.tx);
+    later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(46));
+    await f.engine.receive(later, Date.now(), "finalized");
+    await f.engine.idle();
+    expect(f.calls).toHaveLength(4);
+    expect(f.engine.state().researchPaper!.positions).toHaveLength(1);
+  }, 30000);
   it("observes a 25bps original pair, waits real delay, settles separately and exposes the book through the Omni contract", async () => {
     const f = await setup();
     await f.engine.receive(f.tx, Date.now(), "finalized");

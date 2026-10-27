@@ -133,6 +133,8 @@ export class Engine {
   private researchPaperRunner: ResearchPaperRunner | null = null;
   private eventAvailability = new Map<string, { decodedAt: number; publishedAt: number }>();
   private researchBookWork: Promise<unknown> = Promise.resolve();
+  private deferredBaselineEvent: ChainEvent | null = null;
+  private baselineWork: Promise<void> | null = null;
   private fastEvents: ChainEvent[] = [];
   private fastIds = new Set<string>();
   private materializedTrades = new Map<string, number>();
@@ -189,6 +191,7 @@ export class Engine {
       if (this.researchTimer) clearInterval(this.researchTimer);
       await this.source?.stop();
       await this.work;
+      await this.baselineWork;
       await this.tickWork;
       await this.researchWork;
       if (this.stateServer?.listening)
@@ -542,6 +545,7 @@ export class Engine {
   }
   async idle() {
     await this.work;
+    await this.baselineWork;
     await this.tickWork;
     await this.ledgerSaves;
   }
@@ -570,11 +574,13 @@ export class Engine {
         this.eventAvailability.delete(this.eventAvailability.keys().next().value!);
       this.latencies.push(e.processedAt - at);
       if (this.latencies.length > 2000) this.latencies.shift();
-      if (process.env.PHANTOM_QUOTE_RESEARCH !== "false")
+      if (process.env.PHANTOM_QUOTE_RESEARCH !== "false" && !this.researchPaperRunner)
         void this.quoteResearch
           .sample(e, this.quote)
           ?.catch(() => this.fail("QUOTE_RESEARCH_PERSISTENCE_FAILED"));
       this.schedule(e);
+      if (process.env.PHANTOM_QUOTE_RESEARCH !== "false" && this.researchPaperRunner)
+        this.deferBaselineUntilAnalysis(e);
     }
   }
   async recordLogs(
@@ -621,12 +627,42 @@ export class Engine {
       this.fastEvents.unshift(event);
       if (this.fastEvents.length > 2000) this.fastEvents.pop();
       this.observe(event);
-      if (process.env.PHANTOM_QUOTE_RESEARCH !== "false")
+      // In experimental mode a fast notification cannot claim the matching full event's turn.
+      // Its observations remain immediately available; baseline admission follows full enrichment.
+      if (process.env.PHANTOM_QUOTE_RESEARCH !== "false" && !this.researchPaperRunner)
         void this.quoteResearch
           .sample(event, this.quote)
           ?.catch(() => this.fail("QUOTE_RESEARCH_PERSISTENCE_FAILED"));
     }
     return decoded;
+  }
+  private deferBaselineUntilAnalysis(event: ChainEvent) {
+    if (this.stopped || !this.store.workerLeaseHealthy) return;
+    // Keep the first pending full event, never an unbounded callback queue or winner replacement.
+    this.deferredBaselineEvent ??= event;
+    if (this.baselineWork) return;
+    const drain = async () => {
+      while (this.deferredBaselineEvent && !this.stopped) {
+        const barrier = this.work;
+        await barrier;
+        if (barrier !== this.work) continue;
+        if (this.stopped || !this.store.workerLeaseHealthy) {
+          this.deferredBaselineEvent = null;
+          return;
+        }
+        const pending = this.deferredBaselineEvent;
+        this.deferredBaselineEvent = null;
+        await this.quoteResearch.sample(pending, this.quote);
+      }
+    };
+    this.baselineWork = drain()
+      .catch(() => this.fail("QUOTE_RESEARCH_PERSISTENCE_FAILED"))
+      .finally(() => {
+        this.baselineWork = null;
+        if (this.deferredBaselineEvent && !this.stopped && this.store.workerLeaseHealthy)
+          this.deferBaselineUntilAnalysis(this.deferredBaselineEvent);
+        else if (this.stopped || !this.store.workerLeaseHealthy) this.deferredBaselineEvent = null;
+      });
   }
   private observe(e: ChainEvent) {
     if (e.kind === "launch") {
@@ -738,8 +774,16 @@ export class Engine {
     if (!value.accepted) this.health.rejected++;
     await this.store.decision(value, value.at);
   }
+  private async researchEntryBarred(reason: string) {
+    const runner = this.researchPaperRunner;
+    if (!runner) return this.stopped || this.killed();
+    if (runner.suspended) return true;
+    if (this.stopped || this.killed()) await runner.latchEmergencyStop(reason);
+    return runner.accountState().emergencyStopLatched;
+  }
   private async analyze(event: ChainEvent) {
     if (!this.researchPaperRunner) return this.analyzeWithQuotes(event);
+    if (await this.researchEntryBarred("ENGINE_INITIAL_ANALYSIS_STOP")) return;
     const availability = this.eventAvailability.get(event.id);
     const state = this.researchPaperRunner.accountState(),
       now = Date.now();
@@ -752,24 +796,48 @@ export class Engine {
       this.stopped ||
       this.killed() ||
       state.suspended ||
+      state.emergencyStopLatched ||
       state.openPositions ||
       state.pendingEntries
     )
       return;
+    // Reject provider-free ineligibility before spending the shared durable turn.
+    // The enabled baseline collector can then use this event without starving either book.
+    if (
+      event.quoteMint !== WSOL ||
+      event.details.executionSupported === false ||
+      this.feature(event).observations < 3
+    ) {
+      await this.decision({
+        at: now,
+        mint: event.mint,
+        strategy: "research_paper",
+        accepted: false,
+        reasons: [
+          event.quoteMint !== WSOL
+            ? "NON_SOL_QUOTE_UNSUPPORTED_BY_PAPER_LEDGER"
+            : event.details.executionSupported === false
+              ? "EVENT_SCHEMA_PARTIALLY_VERIFIED_EXECUTION_UNSUPPORTED"
+              : "INSUFFICIENT_VERIFIED_TRADE_OBSERVATIONS",
+        ],
+      });
+      return;
+    }
     const turn = await this.quoteResearch.externalTurn(
       EXPERIMENTAL_TURN_BUDGET_MS,
       async (deadlineAt) => {
         await this.analyzeWithQuotes(event, 25, deadlineAt);
         const pending = this.researchPaperRunner!.snapshot().ledger.pending[0];
-        if (pending && !this.stopped && !this.killed()) {
+        if (pending && !(await this.researchEntryBarred("ENGINE_DELAYED_ENTRY_STOP"))) {
           const waitMs = Math.max(0, pending.readyAt - Date.now());
           // Leave room for the existing client's two six-second provider deadlines.
           if (Date.now() + waitMs + 12_000 < deadlineAt) {
             if (waitMs) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-            if (!this.stopped && !this.killed())
+            if (!(await this.researchEntryBarred("ENGINE_DELAYED_ENTRY_STOP")))
               await this.withResearchBook(async () => {
                 if (!(await this.researchCapturesReady())) return;
-                if (this.stopped || this.killed() || Date.now() + 12_000 >= deadlineAt) return;
+                if (await this.researchEntryBarred("ENGINE_QUEUED_ENTRY_STOP")) return;
+                if (Date.now() + 12_000 >= deadlineAt) return;
                 this.store.assertWorkerLease();
                 await this.researchPaperRunner!.step({
                   allowEntryQuotes: true,
@@ -834,19 +902,22 @@ export class Engine {
       deadlineAt === undefined
         ? solAmount(process.env.PHANTOM_TRADE_SOL ?? "0.01")
         : BigInt(this.researchPaperRunner!.manifest.policy.entryLamports);
-    const researchBarrier = () => {
-      if (deadlineAt !== undefined) this.store.assertWorkerLease();
-      if (deadlineAt !== undefined && (this.stopped || this.killed() || Date.now() >= deadlineAt))
-        throw Error("RESEARCH_ENTRY_STOPPED_OR_TURN_EXPIRED");
+    const researchBarrier = async () => {
+      if (deadlineAt === undefined) return;
+      this.store.assertWorkerLease();
+      if (await this.researchEntryBarred("ENGINE_INITIAL_ANALYSIS_STOP")) {
+        throw Error("RESEARCH_ENTRY_STOPPED_BY_CONTROL");
+      }
+      if (Date.now() >= deadlineAt) throw Error("RESEARCH_TURN_EXPIRED");
     };
     try {
-      researchBarrier();
+      await researchBarrier();
       if (deadlineAt !== undefined)
         snapshot = await this.security.inspect(
           { ...event, creator: this.launches.get(event.mint)?.creator ?? event.creator },
           null,
         );
-      researchBarrier();
+      await researchBarrier();
       buy = structuredClone(
         await this.quote.quote({
           ...(deadlineAt === undefined ? {} : { priority: "research" as const }),
@@ -856,7 +927,7 @@ export class Engine {
           slippageBps,
         }),
       );
-      researchBarrier();
+      await researchBarrier();
       sell = structuredClone(
         await this.quote.quote({
           ...(deadlineAt === undefined ? {} : { priority: "research" as const }),
@@ -866,7 +937,7 @@ export class Engine {
           slippageBps,
         }),
       );
-      researchBarrier();
+      await researchBarrier();
       if (deadlineAt === undefined)
         snapshot = await this.security.inspect(
           { ...event, creator: this.launches.get(event.mint)?.creator ?? event.creator },
@@ -965,6 +1036,7 @@ export class Engine {
   ) {
     const runner = this.researchPaperRunner!,
       availability = this.eventAvailability.get(event.id);
+    if (await this.researchEntryBarred("ENGINE_CAPTURE_STOP")) return;
     if (
       !availability ||
       !snapshot.mintAccountCapture ||
@@ -1013,7 +1085,8 @@ export class Engine {
       await this.latchSuspension("RESEARCH_ORIGINAL_DECISION_DURABILITY_UNCERTAIN");
       return;
     }
-    if (this.stopped || this.killed() || Date.now() >= deadlineAt) return;
+    if (await this.researchEntryBarred("ENGINE_CAPTURE_ACK_STOP")) return;
+    if (Date.now() >= deadlineAt) return;
     try {
       await this.withResearchBook(() =>
         runner.enroll({
@@ -1107,7 +1180,7 @@ export class Engine {
       this.managingPositions = false;
     }
     if (this.stopped || !(await this.workerLeaseAvailable())) return;
-    if (this.researchPaperRunner && !this.researchPaperRunner.suspended && !this.killed()) {
+    if (this.researchPaperRunner && !(await this.researchEntryBarred("ENGINE_TICK_ENTRY_STOP"))) {
       const account = this.researchPaperRunner.accountState();
       if (
         !this.researchPaperRunner.snapshot().ledger.killSwitch &&
@@ -1116,7 +1189,8 @@ export class Engine {
         await this.quoteResearch.externalTurn(15_000, async (deadlineAt) => {
           await this.withResearchBook(async () => {
             if (!(await this.researchCapturesReady())) return;
-            if (this.stopped || this.killed() || Date.now() + 12_000 >= deadlineAt) return;
+            if (await this.researchEntryBarred("ENGINE_QUEUED_ENTRY_STOP")) return;
+            if (Date.now() + 12_000 >= deadlineAt) return;
             this.store.assertWorkerLease();
             await this.researchPaperRunner!.step({
               allowEntryQuotes: true,
@@ -1512,7 +1586,15 @@ export class Engine {
       equity: l.equity,
       cashLamports: l.cashLamports,
       pending: l.pending,
-      research: this.quoteResearch?.status() ?? null,
+      research: this.quoteResearch
+        ? {
+            ...this.quoteResearch.status(),
+            baselineRouting: this.researchPaperRunner
+              ? "FULL_EVENT_AFTER_EXPERIMENTAL_ANALYSIS"
+              : "FAST_AND_FULL",
+            deferredBaselinePending: this.deferredBaselineEvent !== null,
+          }
+        : null,
       researchPaper: this.researchPaperState(),
       forwardResearch: this.forwardRuntime
         ? {
@@ -1538,6 +1620,7 @@ export class Engine {
     try {
       await this.source?.stop();
       await this.work;
+      await this.baselineWork;
       await this.tickWork;
       await this.researchWork;
       await this.researchBookWork;
