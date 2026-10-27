@@ -645,7 +645,8 @@ export class Engine {
       while (this.deferredBaselineEvent && !this.stopped) {
         const barrier = this.work;
         await barrier;
-        if (barrier !== this.work) continue;
+        // New arrivals cannot move this captured watermark indefinitely.
+        // Collector exclusion, due windows and durable spacing still decide admission.
         if (this.stopped || !this.store.workerLeaseHealthy) {
           this.deferredBaselineEvent = null;
           return;
@@ -793,8 +794,6 @@ export class Engine {
       availability.publishedAt <= this.researchPaperRunner.manifest.enrollmentStart ||
       now < this.researchPaperRunner.manifest.enrollmentStart ||
       now >= this.researchPaperRunner.manifest.enrollmentEnd ||
-      this.stopped ||
-      this.killed() ||
       state.suspended ||
       state.emergencyStopLatched ||
       state.openPositions ||
@@ -823,6 +822,7 @@ export class Engine {
       });
       return;
     }
+    if (await this.researchEntryBarred("ENGINE_INITIAL_ANALYSIS_STOP")) return;
     const turn = await this.quoteResearch.externalTurn(
       EXPERIMENTAL_TURN_BUDGET_MS,
       async (deadlineAt) => {
@@ -964,6 +964,11 @@ export class Engine {
         await this.workerLeaseAvailable();
         return;
       }
+      if (
+        deadlineAt !== undefined &&
+        (await this.researchEntryBarred("ENGINE_REJECTED_INITIAL_IO_STOP"))
+      )
+        err = Error("RESEARCH_ENTRY_STOPPED_BY_CONTROL");
       await this.decision({
         at: Date.now(),
         mint: event.mint,
@@ -1037,14 +1042,8 @@ export class Engine {
     const runner = this.researchPaperRunner!,
       availability = this.eventAvailability.get(event.id);
     if (await this.researchEntryBarred("ENGINE_CAPTURE_STOP")) return;
-    if (
-      !availability ||
-      !snapshot.mintAccountCapture ||
-      this.stopped ||
-      this.killed() ||
-      Date.now() >= deadlineAt
-    )
-      return;
+    if (!availability || !snapshot.mintAccountCapture || Date.now() >= deadlineAt) return;
+    if (await this.researchEntryBarred("ENGINE_CAPTURE_STOP")) return;
     // Normalize BigInts to their exact JSON strings before durable canonical comparison.
     const original = JSON.parse(
       json({

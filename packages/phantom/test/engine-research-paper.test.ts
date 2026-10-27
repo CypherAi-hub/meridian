@@ -245,6 +245,121 @@ async function setup(options: { defaultResearch?: boolean } = {}) {
 }
 
 describe("experimental book Engine integration", () => {
+  it.each(["security", "buy", "sell"] as const)(
+    "latches an observed stop when initial %s rejects",
+    async (stage) => {
+      const f = await setup();
+      clearInterval((f.engine as any).timer);
+      (f.engine as any).timer = null;
+      clearInterval((f.engine as any).researchTimer);
+      (f.engine as any).researchTimer = null;
+      const inspect = vi.mocked(f.engine.security.inspect).getMockImplementation()!;
+      const originalQuote = f.provider.quote.bind(f.provider);
+      vi.mocked(f.engine.security.inspect).mockImplementation(async (...args) => {
+        if (stage === "security") {
+          await writeFile(join(f.dir, "KILL"), "synthetic rejected inspection stop");
+          throw Error("SYNTHETIC_INSPECTION_REJECTED");
+        }
+        return inspect(...args);
+      });
+      const quote = vi.spyOn(f.provider, "quote").mockImplementation(async (input) => {
+        if (
+          (stage === "buy" && input.inputMint === WSOL) ||
+          (stage === "sell" && input.outputMint === WSOL)
+        ) {
+          await writeFile(join(f.dir, "KILL"), "synthetic rejected quote stop");
+          throw Error("SYNTHETIC_QUOTE_REJECTED");
+        }
+        return originalQuote(input);
+      });
+      await f.engine.receive(f.tx, Date.now(), "finalized");
+      await f.engine.idle();
+      expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(true);
+      expect(f.engine.state().researchPaper!.pending).toEqual([]);
+      const count = f.calls.length;
+      await rm(join(f.dir, "KILL"));
+      quote.mockRestore();
+      vi.mocked(f.engine.security.inspect).mockImplementation(inspect);
+      f.advance(31_000);
+      const later = structuredClone(f.tx);
+      later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(50));
+      await f.engine.receive(later, Date.now(), "finalized");
+      await f.engine.idle();
+      expect(f.calls).toHaveLength(count);
+      expect(f.engine.state().researchPaper!.positions).toEqual([]);
+    },
+    15000,
+  );
+
+  it.each(["ENGINE_INITIAL_ANALYSIS_STOP", "ENGINE_CAPTURE_STOP"])(
+    "latches an adjacent control transition after %s",
+    async (stage) => {
+      const f = await setup();
+      clearInterval((f.engine as any).timer);
+      (f.engine as any).timer = null;
+      clearInterval((f.engine as any).researchTimer);
+      (f.engine as any).researchTimer = null;
+      let armed = false,
+        flipped = false;
+      const killed = vi.spyOn(f.engine as any, "killed").mockImplementation(() => armed);
+      const original = (f.engine as any).researchEntryBarred.bind(f.engine);
+      const check = vi
+        .spyOn(f.engine as any, "researchEntryBarred")
+        .mockImplementation(async (...args: unknown[]) => {
+          const result = await original(...args);
+          if (args[0] === stage && !flipped) {
+            flipped = true;
+            armed = true;
+          }
+          return result;
+        });
+      await f.engine.receive(f.tx, Date.now(), "finalized");
+      await f.engine.idle();
+      expect(flipped).toBe(true);
+      expect(f.engine.state().researchPaper!.account.emergencyStopLatched).toBe(true);
+      const count = f.calls.length;
+      armed = false;
+      killed.mockRestore();
+      check.mockRestore();
+      f.advance(31_000);
+      const later = structuredClone(f.tx);
+      later.transaction.signatures[0] = bs58.encode(new Uint8Array(64).fill(51));
+      await f.engine.receive(later, Date.now(), "finalized");
+      await f.engine.idle();
+      expect(f.calls).toHaveLength(count);
+      expect(f.engine.state().researchPaper!.positions).toEqual([]);
+    },
+    15000,
+  );
+
+  it("offers a bounded baseline turn after its captured analysis even while newer work remains queued", async () => {
+    const f = await setup();
+    clearInterval((f.engine as any).timer);
+    (f.engine as any).timer = null;
+    clearInterval((f.engine as any).researchTimer);
+    (f.engine as any).researchTimer = null;
+    let releaseFirst!: () => void, releaseLater!: () => void;
+    const first = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const later = new Promise<void>((resolve) => {
+      releaseLater = resolve;
+    });
+    const sample = vi.spyOn((f.engine as any).quoteResearch, "sample").mockResolvedValue(undefined);
+    (f.engine as any).work = first;
+    (f.engine as any).deferBaselineUntilAnalysis(decodeTransaction(f.tx, Date.now())[0]);
+    (f.engine as any).work = later;
+    try {
+      releaseFirst();
+      await vi.waitFor(() => expect(sample).toHaveBeenCalledOnce(), { timeout: 300 });
+    } finally {
+      releaseLater();
+      await (f.engine as any).baselineWork;
+      (f.engine as any).work = Promise.resolve();
+    }
+    expect(f.calls).toHaveLength(0);
+  }, 15000);
+
   it("arbitrates fast and full callbacks ahead of baseline sampling with both research defaults enabled", async () => {
     const f = await setup({ defaultResearch: true });
     // Drive timer work explicitly so injected clock jumps do not race periodic callbacks.
