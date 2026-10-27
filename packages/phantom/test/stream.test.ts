@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import bs58 from 'bs58';
 import type { SubscribeRequest, SubscribeUpdateTransaction } from '@triton-one/yellowstone-grpc';
-import { PROGRAMS, decodeLogNotification, type RpcTransaction } from '../src/decoder.ts';
+import { PROGRAMS, decodeLogNotification, type LogEnrichmentHint, type RpcTransaction } from '../src/decoder.ts';
 import { Rpc, SolanaStream, normalizeYellowstoneTransaction, startYellowstone, enrichmentPriority, ENRICHMENT_PRIORITY } from '../src/stream.ts';
 import { WSOL, type Health, type ChainEvent } from '../src/types.ts';
 
@@ -161,6 +161,80 @@ function wsFixture() {
   return { socket, notify: (s: string, slot = 123, logs: string[] = []) => socket.onmessage?.({ data: JSON.stringify({ method: 'logsNotification', params: { result: { context: { slot }, value: { signature: s, logs, err: null } } } }) }) };
 }
 describe('independent bounded finalized typed-log path', () => {
+  it('uses actorless SOL hints to order full enrichment while retaining zero invented trade events', async () => {
+    const ws = wsFixture(), fetched: string[] = [];
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    const mint = bs58.encode(Buffer.alloc(32, 8));
+    const rpc = rpcMock(async (method, params) => {
+      if (method === 'getSignaturesForAddress') return [];
+      fetched.push(String(params[0]));
+      if (fetched.length === 1) await gate;
+      const value = tx(1); value.transaction.signatures = [String(params[0])]; return value;
+    });
+    const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, {
+      websocket: () => ws.socket, maxQueue: 2, backfillIntervalMs: 1_000_000,
+      isWatchedMint: value => value === mint,
+      onLogs: envelope => ({ events: [], enrichmentHints: envelope.signature === signature(3) || envelope.signature === signature(4) ? [{
+        scope: 'ENRICHMENT_PRIORITY_ONLY', source: 'TYPED_PROGRAM_EVENT', protocol: 'raydium-cpmm',
+        kind: 'buy', signature: envelope.signature, slot: envelope.slot, receivedAt: envelope.receivedAt,
+        pool: bs58.encode(Buffer.alloc(32, 9)), mint: envelope.signature === signature(4) ? mint : bs58.encode(Buffer.alloc(32, 7)),
+        quoteMint: WSOL, eventName: 'SwapEvent', eventSchema: 'raydium_cp_swap', logIndex: 1, executionSupported: false,
+      }] : [] }),
+    });
+    stream.start(); ws.notify(signature(1)); await vi.waitFor(() => expect(fetched).toHaveLength(1));
+    for (const n of [2, 3, 4]) ws.notify(signature(n), 123, ['SYNTHETIC LOG', 'SYNTHETIC EVENT POSITION']);
+    await vi.waitFor(() => expect(stream.logMetrics().processed).toBe(4));
+    expect(stream.logMetrics().priorityHints).toBe(2);
+    release(); await vi.waitFor(() => expect(fetched).toHaveLength(3));
+    expect(fetched).toEqual([signature(1), signature(4), signature(3)]);
+    await stream.stop();
+  });
+  it.each(['wrong-signature', 'wrong-slot', 'wrong-receipt', 'not-priority-only', 'unsupported-schema', 'launch-kind', 'claims-execution',
+    'empty-pool', 'empty-mint', 'invalid-quote-key', 'same-mint', 'negative-log-index', 'fractional-log-index', 'out-of-range-log-index', 'sol-swap', 'non-sol-buy'])(
+    'keeps %s hints on the background fallback instead of evicting a queued transaction', async mutation => {
+      const ws = wsFixture(), fetched: string[] = [];
+      let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+      const rpc = rpcMock(async (method, params) => {
+        if (method === 'getSignaturesForAddress') return [];
+        fetched.push(String(params[0])); if (fetched.length === 1) await gate;
+        const value = tx(1); value.transaction.signatures = [String(params[0])]; return value;
+      });
+      const stream = new SolanaStream(rpc, 'wss://synthetic.invalid', cursorStore(), health(), async () => undefined, {
+        websocket: () => ws.socket, maxQueue: 1, backfillIntervalMs: 1_000_000,
+        onLogs: envelope => {
+          const h: any = { scope: 'ENRICHMENT_PRIORITY_ONLY', source: 'TYPED_PROGRAM_EVENT', protocol: 'raydium-cpmm',
+            kind: 'buy', signature: envelope.signature, slot: envelope.slot, receivedAt: envelope.receivedAt,
+            pool: bs58.encode(Buffer.alloc(32, 9)), mint: bs58.encode(Buffer.alloc(32, 8)), quoteMint: WSOL,
+            eventName: 'SwapEvent', eventSchema: 'raydium_cp_swap', logIndex: 1, executionSupported: false };
+          if (mutation === 'wrong-signature') h.signature = signature(99);
+          if (mutation === 'wrong-slot') h.slot++;
+          if (mutation === 'wrong-receipt') h.receivedAt++;
+          if (mutation === 'not-priority-only') h.scope = 'TRADE';
+          if (mutation === 'unsupported-schema') h.eventSchema = 'unknown-v2';
+          if (mutation === 'launch-kind') h.kind = 'launch';
+          if (mutation === 'claims-execution') h.executionSupported = true;
+          if (mutation === 'empty-pool') h.pool = '';
+          if (mutation === 'empty-mint') h.mint = '';
+          if (mutation === 'invalid-quote-key') h.quoteMint = 'invalid-address';
+          if (mutation === 'same-mint') h.mint = h.quoteMint;
+          if (mutation === 'negative-log-index') h.logIndex = -1;
+          if (mutation === 'fractional-log-index') h.logIndex = 0.5;
+          if (mutation === 'out-of-range-log-index') h.logIndex = 2;
+          if (mutation === 'sol-swap') h.kind = 'swap';
+          if (mutation === 'non-sol-buy') h.quoteMint = bs58.encode(Buffer.alloc(32, 7));
+          return { events: [], enrichmentHints: envelope.signature === signature(3) ? [h as LogEnrichmentHint] : [] };
+        },
+      });
+      stream.start(); ws.notify(signature(1)); await vi.waitFor(() => expect(fetched).toHaveLength(1));
+      ws.notify(signature(2), 123, ['SYNTHETIC LOG', 'SYNTHETIC EVENT POSITION']);
+      ws.notify(signature(3), 123, ['SYNTHETIC LOG', 'SYNTHETIC EVENT POSITION']);
+      await vi.waitFor(() => expect(stream.logMetrics().processed).toBe(3));
+      expect(stream.logMetrics().priorityHints).toBe(0);
+      release(); await vi.waitFor(() => expect(fetched).toHaveLength(2));
+      expect(fetched).toEqual([signature(1), signature(2)]);
+      await stream.stop();
+    },
+  );
   it('publishes actual typed events while full transaction enrichment is still waiting', async () => {
     const capture: RpcTransaction = JSON.parse(fs.readFileSync(new URL('./fixtures/real-pump-buy.json', import.meta.url), 'utf8'));
     const ws = wsFixture(), h = health(), observed: ChainEvent[] = [];

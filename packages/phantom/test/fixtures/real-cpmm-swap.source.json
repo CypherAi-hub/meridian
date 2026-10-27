@@ -1,0 +1,21 @@
+{
+  "scope": "SAVED_PUBLIC_RPC_DECODER_FIXTURE_NOT_MARKET_RETURN_EVIDENCE",
+  "provider": "https://api.mainnet-beta.solana.com",
+  "method": "getTransaction",
+  "configuration": {
+    "commitment": "finalized",
+    "encoding": "json",
+    "maxSupportedTransactionVersion": 1
+  },
+  "signature": "d8jLn2Ut5JAouqHigcTLfYiyDEH8Jp5MrprX42yQKGv8NjX5daj1wquRDEQn9PFjAtTryNsaEYe2dHPafKXpsVi",
+  "slot": 461849599,
+  "receivedAtUtc": "2026-10-26T23:25:35.368555+00:00",
+  "selectionPlanSha256": "3d5a8e437ec9c1ff06aba5a02bc69d6aa60f03d5d9a9be3aa5ac6966bc6d57f7",
+  "selectionIndex": 1,
+  "fixtureSha256": "42a465113f1e5ded0c77ac6c304cd9cc74ae4533d3761af8276bd2250819b1dd",
+  "expectedPool": "FwKhszK9qZFGe3A4nKfynt4GJvu2xGsa4tTqQ8zNYBX2",
+  "limits": [
+    "Saved provider response, not cryptographic provider or deployment attestation.",
+    "Non-WSOL pair, never a paper trade or strategy validation."
+  ]
+}

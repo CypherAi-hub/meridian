@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { Connection } from "@solana/web3.js";
 import { Store } from "./store.ts";
-import { decodeTransaction, decodeLogNotification, type RpcTransaction } from "./decoder.ts";
+import { decodeTransaction, decodeLogNotification, type LogEnrichmentHint, type RpcTransaction } from "./decoder.ts";
 import { Rpc, SolanaStream, startYellowstone, type FinalizedLogEnvelope } from "./stream.ts";
 import { JupiterQuoteClient, PumpQuoteClient } from "./execution.ts";
 import {
@@ -318,7 +318,11 @@ export class Engine {
             "ws",
           );
         const source = new SolanaStream(this.rpc, url, this.store, this.health, receive, {
-          onLogs: (envelope) => this.recordLogs(envelope),
+          onLogs: async (envelope) => {
+            const enrichmentHints: LogEnrichmentHint[] = [];
+            const events = await this.recordLogs(envelope, (hint) => enrichmentHints.push(hint));
+            return { events, enrichmentHints };
+          },
           isWatchedMint: (mint) =>
             this.launches.has(mint) || this.ledger.state.positions.some((p) => p.mint === mint),
           maxQueue: 200,
@@ -381,7 +385,7 @@ export class Engine {
       this.schedule(e);
     }
   }
-  async recordLogs(envelope: FinalizedLogEnvelope) {
+  async recordLogs(envelope: FinalizedLogEnvelope, onEnrichmentHint?: (hint: LogEnrichmentHint) => void) {
     const decoded = decodeLogNotification(
       envelope.logs,
       envelope.signature,
@@ -389,6 +393,7 @@ export class Engine {
       envelope.receivedAt,
       Date.now(),
       {
+        onEnrichmentHint,
         resolvePool: (pool, protocol) => {
           const e = this.events.find((x) => x.pool === pool && x.protocol === protocol);
           return e ? { mint: e.mint, quoteMint: e.quoteMint } : undefined;

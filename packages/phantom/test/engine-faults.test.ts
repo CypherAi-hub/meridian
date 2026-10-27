@@ -14,6 +14,7 @@ import {
 import { WSOL, json, type ChainEvent } from "../src/types.ts";
 import type { Quote } from "../src/execution.ts";
 import type { RpcTransaction } from "../src/decoder.ts";
+import type { LogEnrichmentHint } from "../src/decoder.ts";
 
 const oldEnvironment = { ...process.env };
 const directories: string[] = [];
@@ -181,6 +182,20 @@ function enter(ledger: PaperLedger, mint: string, id: string) {
 }
 
 describe("engine economic and audit fault boundaries", () => {
+  it("forwards actorless priority hints without persisting fake events or adding wallet demand", async () => {
+    const f = fixture();
+    const tx: RpcTransaction = JSON.parse(readFileSync(new URL('./fixtures/real-cpmm-swap.json', import.meta.url), 'utf8'));
+    const writes = vi.spyOn(f.engine.store, 'exec').mockResolvedValue({ rows: [], rowCount: 0 } as any);
+    const hints: LogEnrichmentHint[] = [];
+    const before = json(f.ledger.state);
+    const observed = await f.engine.recordLogs({ logs: tx.meta!.logMessages!, signature: tx.transaction.signatures[0],
+      slot: tx.slot, receivedAt: Date.now(), commitment: 'finalized' }, hint => hints.push(hint));
+    expect(observed).toEqual([]);
+    expect(hints).toHaveLength(1);
+    expect(writes).not.toHaveBeenCalled();
+    expect(f.internal.trades).toEqual([]);
+    expect(json(f.ledger.state)).toBe(before);
+  });
   it("escalates a pending profit slice before requesting an emergency full-size quote", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(400000);

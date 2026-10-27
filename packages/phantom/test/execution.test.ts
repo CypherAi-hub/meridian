@@ -84,12 +84,56 @@ describe('quote-only Jupiter V2 with synthetic provider fixtures', () => {
     expect(url.searchParams.get('amount')).toBe('9007199254740993');
     expect(url.searchParams.has('taker')).toBe(false);
     expect(url.searchParams.get('maxSupportedTransactionVersion')).toBe('0');
+    expect(url.searchParams.get('excludeRouters')).toBe('jupiterz');
     expect(result.outAmount).toBe('20000000000000001');
     expect(result.minOutAmount).toBe('19800000000000000');
     expect(result.impactBps).toBe(10);
     expect(result.observedAt).toBe(1234);
     expect(result.contextSlot).toBeNull();
     expect(result.feeBps).toBe(2);
+    expect(result.router).toBe('metis');
+  });
+  it.each([
+    { router: "jupiterz" },
+    { router: " JUPITERZ " },
+    { expireAt: "1970-01-01T00:00:00.000Z" },
+    { expireAt: "2100-01-01T00:00:00.000Z" },
+    { expireAt: "1793050000" },
+    { expireAt: 1234 },
+    { quoteId: "SYNTHETIC-RFQ-ID" },
+    { maker: SOL },
+    { swapType: "rfq" },
+    { swapType: "aggregator+rfq" },
+  ])(
+    "rejects unsupported RFQ pricing even if the provider ignores the requested exclusion %#",
+    async (override) => {
+      const client = new JupiterQuoteClient({
+        apiKey: "fixture",
+        fetch: async () => Response.json(quoteFixture(override)),
+        now: () => 1234,
+      });
+      await expect(
+        client.quote({ inputMint: SOL, outputMint: USDC, amount: 9007199254740993n }),
+      ).rejects.toThrow("JUPITER_RFQ_EXECUTION_UNSUPPORTED");
+    },
+  );
+  it("accepts ordinary AMM routing with absent or empty RFQ placeholders", async () => {
+    const client = new JupiterQuoteClient({
+      apiKey: "fixture",
+      fetch: async () => Response.json(quoteFixture({ quoteId: null, maker: "", expireAt: null })),
+      now: () => 1234,
+    });
+    expect(
+      (await client.quote({ inputMint: SOL, outputMint: USDC, amount: 9007199254740993n })).router,
+    ).toBe("metis");
+  });
+  it.each([undefined, 'unknown-router'])('rejects unknown routing provenance even when a route label is present: %s',async router=>{
+    const client=new JupiterQuoteClient({apiKey:'fixture',fetch:async()=>Response.json(quoteFixture({router})),now:()=>1234});
+    await expect(client.quote({inputMint:SOL,outputMint:USDC,amount:9007199254740993n})).rejects.toThrow('JUPITER_ROUTER_UNSUPPORTED');
+  });
+  it.each(['metis','dflow','okx'])('preserves the supported provider router family %s',async router=>{
+    const client=new JupiterQuoteClient({apiKey:'fixture',fetch:async()=>Response.json(quoteFixture({router})),now:()=>1234});
+    expect((await client.quote({inputMint:SOL,outputMint:USDC,amount:9007199254740993n})).router).toBe(router);
   });
   it('does not interpret deprecated priceImpactPct as a current measured price impact', async () => {
     const client = new JupiterQuoteClient({ apiKey: 'fixture', fetch: async () => Response.json(quoteFixture({ priceImpact: undefined, priceImpactPct: '0.01' })) });

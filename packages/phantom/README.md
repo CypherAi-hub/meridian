@@ -6,7 +6,10 @@ An additive Solana transaction observer, deterministic research engine, and pape
 
 ## Install and run
 
-Use Node.js **22.12+ or 24+**, with npm. From this directory:
+Use Node.js **24+**, with npm. The validated runtime is Node 24.22.1 and CI runs
+Node 24. Node 22 fails an import in the pinned Pump SDK dependencies and is not
+supported for PHANTOM. The separate Meridian terminal has its own requirements.
+From this directory:
 
 ```sh
 npm ci --ignore-scripts

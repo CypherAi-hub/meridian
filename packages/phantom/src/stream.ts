@@ -1,6 +1,6 @@
 import bs58 from 'bs58';
 import type { SubscribeRequest, SubscribeUpdate, SubscribeUpdateTransaction } from '@triton-one/yellowstone-grpc';
-import { PROGRAMS, validateTransactionConfig, validateTransactionLayout, type RpcTransaction } from './decoder.ts';
+import { PROGRAMS, validateTransactionConfig, validateTransactionLayout, type LogEnrichmentHint, type RpcTransaction } from './decoder.ts';
 import { WSOL, type Health, type ChainEvent } from './types.ts';
 import type { Store } from './store.ts';
 
@@ -43,14 +43,19 @@ export class Rpc {
 export type Receive = (tx: RpcTransaction, receivedAt: number, commitment: 'confirmed' | 'finalized') => Promise<void>;
 interface WebSocketLike { onopen: (() => void) | null; onmessage: ((event: { data: unknown }) => void) | null; onerror: (() => void) | null; onclose: (() => void) | null; send(data: string): void; close(): void; }
 export interface FinalizedLogEnvelope { signature: string; slot: number; logs: string[]; receivedAt: number; commitment: 'finalized'; }
-export interface TypedLogMetrics { received: number; processed: number; dropped: number; errors: number; queueDepth: number; latencyMs: { p50: number | null; p95: number | null }; }
-export interface SolanaStreamOptions { websocket?: (url: string) => WebSocketLike; reconnectMs?: number; retryMs?: number; attempts?: number; maxQueue?: number; pageSize?: number; maxPages?: number; backfillIntervalMs?: number; onLogs?: (envelope: FinalizedLogEnvelope) => Promise<ChainEvent[] | void> | ChainEvent[] | void; isWatchedMint?: (mint: string) => boolean; maxLogQueue?: number; }
+export interface TypedLogMetrics { received: number; processed: number; priorityHints: number; dropped: number; errors: number; queueDepth: number; latencyMs: { p50: number | null; p95: number | null }; }
+export type LogObservations = { events: ChainEvent[]; enrichmentHints: LogEnrichmentHint[] };
+export interface SolanaStreamOptions { websocket?: (url: string) => WebSocketLike; reconnectMs?: number; retryMs?: number; attempts?: number; maxQueue?: number; pageSize?: number; maxPages?: number; backfillIntervalMs?: number; onLogs?: (envelope: FinalizedLogEnvelope) => Promise<ChainEvent[] | LogObservations | void> | ChainEvent[] | LogObservations | void; isWatchedMint?: (mint: string) => boolean; maxLogQueue?: number; }
 /** Admission priority affects enrichment only, never evidence validity or order authorization.
  * Empty/unknown layouts and non-SOL pairs retain the background full-fetch fallback.
  * Equal priorities remain FIFO; a new item may evict only a strictly lower priority.
  */
 export const ENRICHMENT_PRIORITY = Object.freeze({ BACKGROUND: 0, SOL_ACTIVITY: 1, WATCHED_SOL_TRADE: 2, SOL_POOL: 3, SOL_LAUNCH: 4 });
-export function enrichmentPriority(events: readonly ChainEvent[], isWatchedMint?: (mint: string) => boolean): number {
+function base58Length(value: unknown, length: number) {
+  try { return typeof value === 'string' && bs58.decode(value).length === length; }
+  catch { return false; }
+}
+export function enrichmentPriority(events: readonly Pick<ChainEvent, 'protocol' | 'kind' | 'mint' | 'quoteMint'>[], isWatchedMint?: (mint: string) => boolean): number {
   let priority: number = ENRICHMENT_PRIORITY.BACKGROUND;
   for (const event of events) {
     // Pump represents native SOL using Pubkey::default(); normal decoders normalize it to WSOL.
@@ -70,7 +75,7 @@ export class SolanaStream {
   private queue: Pending[] = []; private queued = new Map<string, Promise<boolean>>(); private seen = new Map<string, number>(); private gaps = new Set<string>();
   private untrackedGaps = false; private gapRevision = 0;
   private logQueue: FinalizedLogEnvelope[] = []; private logQueued = new Set<string>(); private logSeen = new Map<string, number>(); private logBusy = false;
-  private typedMetrics: Omit<TypedLogMetrics, 'latencyMs'> = { received: 0, processed: 0, dropped: 0, errors: 0, queueDepth: 0 }; private typedLatencies: number[] = [];
+  private typedMetrics: Omit<TypedLogMetrics, 'latencyMs'> = { received: 0, processed: 0, priorityHints: 0, dropped: 0, errors: 0, queueDepth: 0 }; private typedLatencies: number[] = [];
   private busy = false; private timer: ReturnType<typeof setInterval> | null = null; private reconnect: ReturnType<typeof setTimeout> | null = null; private backfilling: Promise<void> | null = null;
   constructor(private rpc: Pick<Rpc, 'call'>, private wsUrl: string, private store: Pick<Store, 'cursor'>, readonly health: Health, private receive: Receive, private options: SolanaStreamOptions = {}) {}
   private error(error: unknown) { this.health.errors++; this.health.status = 'DEGRADED'; this.health.lastError = error instanceof Error ? error.message : 'STREAM_ERROR'; }
@@ -97,8 +102,26 @@ export class SolanaStream {
         const envelope = this.logQueue.shift()!; this.typedMetrics.queueDepth = this.logQueue.length;
         let priority = 0;
         try {
-          const observations = await this.options.onLogs?.(envelope);
+          const result = await this.options.onLogs?.(envelope);
+          const observations = Array.isArray(result) ? result : result?.events;
           if (Array.isArray(observations)) priority = enrichmentPriority(observations, this.options.isWatchedMint);
+          if (result && !Array.isArray(result) && Array.isArray(result.enrichmentHints)) {
+            for (const hint of result.enrichmentHints) {
+              if (!hint || hint.scope !== 'ENRICHMENT_PRIORITY_ONLY' || hint.source !== 'TYPED_PROGRAM_EVENT' ||
+                  hint.protocol !== 'raydium-cpmm' || hint.eventName !== 'SwapEvent' ||
+                  hint.eventSchema !== 'raydium_cp_swap' || hint.executionSupported !== false ||
+                  !['buy', 'sell', 'swap'].includes(hint.kind) || hint.signature !== envelope.signature ||
+                  hint.slot !== envelope.slot || hint.receivedAt !== envelope.receivedAt ||
+                  !base58Length(hint.signature, 64) || !Number.isSafeInteger(hint.slot) || hint.slot < 0 ||
+                  !Number.isSafeInteger(hint.receivedAt) || hint.receivedAt < 0 ||
+                  ![hint.pool, hint.mint, hint.quoteMint].every(value => base58Length(value, 32)) ||
+                  hint.mint === hint.quoteMint || !Number.isSafeInteger(hint.logIndex) ||
+                  hint.logIndex < 0 || hint.logIndex >= envelope.logs.length ||
+                  (hint.kind === 'swap' ? hint.mint === WSOL || hint.quoteMint === WSOL : hint.quoteMint !== WSOL || hint.mint === WSOL)) continue;
+              this.typedMetrics.priorityHints++;
+              priority = Math.max(priority, enrichmentPriority([hint], this.options.isWatchedMint));
+            }
+          }
           this.typedMetrics.processed++;
           this.typedLatencies.push(Math.max(0, Date.now() - envelope.receivedAt)); if (this.typedLatencies.length > 2048) this.typedLatencies.shift();
           this.logSeen.set(envelope.signature, Date.now()); if (this.logSeen.size > 10_000) this.logSeen.delete(this.logSeen.keys().next().value!);

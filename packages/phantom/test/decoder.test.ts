@@ -1,15 +1,66 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { BN, type Idl } from '@coral-xyz/anchor';
 import { PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { ADAPTERS, VERSIONED_ADAPTERS, decodeTransaction, decodeLogNotification, validateTransactionConfig, validateTransactionLayout, type RpcTransaction } from '../src/decoder.ts';
+import { ADAPTERS, VERSIONED_ADAPTERS, decodeTransaction, decodeLogNotification, validateTransactionConfig, validateTransactionLayout, type LogEnrichmentHint, type RpcTransaction } from '../src/decoder.ts';
 import { WSOL } from '../src/types.ts';
 
 // Generated cases are SYNTHETIC. The separately attributed real-pump-buy fixture is mainnet capture.
 const key = (n: number) => new PublicKey(new Uint8Array(32).fill(n));
 const actor = key(2), mint = key(3), pool = key(4);
 const sig = bs58.encode(new Uint8Array(64).fill(7));
+
+describe('actorless CPMM priority evidence', () => {
+  const cpmm = ADAPTERS.find(a => a.protocol === 'raydium-cpmm')!;
+  const logs = (input = new PublicKey(WSOL), output = mint, extra: Record<string, unknown> = {}) => [
+    `Program ${cpmm.address} invoke [1]`,
+    eventLog(cpmm, 'SwapEvent', { pool_id: pool, input_mint: input, output_mint: output,
+      input_amount: new BN(100), output_amount: new BN(200), ...extra }),
+    `Program ${cpmm.address} success`,
+  ];
+  it('preserves an attributed real non-SOL swap as a hint without inventing its absent trader', () => {
+    const bytes = fs.readFileSync(new URL('./fixtures/real-cpmm-swap.json', import.meta.url));
+    const source = JSON.parse(fs.readFileSync(new URL('./fixtures/real-cpmm-swap.source.json', import.meta.url), 'utf8'));
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(source.fixtureSha256);
+    const tx: RpcTransaction = JSON.parse(bytes.toString());
+    const hints: LogEnrichmentHint[] = [];
+    const events = decodeLogNotification(tx.meta!.logMessages, tx.transaction.signatures[0], tx.slot,
+      1000, 1001, { onEnrichmentHint: h => hints.push(h) });
+    expect(events).toEqual([]);
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatchObject({ scope: 'ENRICHMENT_PRIORITY_ONLY', protocol: 'raydium-cpmm',
+      kind: 'swap', pool: source.expectedPool, slot: source.slot, executionSupported: false });
+    expect(hints[0]).not.toHaveProperty('actor');
+    expect(hints[0]).not.toHaveProperty('amountRaw');
+  });
+  it.each(['buy', 'sell'] as const)('identifies the SOL direction for a synthetic %s without emitting a trade', kind => {
+    const hints: LogEnrichmentHint[] = [];
+    const lines = kind === 'buy' ? logs() : logs(mint, new PublicKey(WSOL));
+    expect(decodeLogNotification(lines, sig, 123, 1000, 1001, { onEnrichmentHint: h => hints.push(h) })).toEqual([]);
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatchObject({ kind, mint: mint.toBase58(), quoteMint: WSOL,
+      eventSchema: 'raydium_cp_swap', signature: sig, slot: 123, receivedAt: 1000, executionSupported: false });
+  });
+  it.each(['spoofed-program', 'failed-call', 'ancestor-rollback', 'unknown-trailing-bytes', 'same-mint', 'zero-input'])(
+    'refuses %s as priority evidence', mutation => {
+      let lines = logs();
+      if (mutation === 'spoofed-program') lines = [`Program ${actor} invoke [1]`, lines[1], `Program ${actor} success`];
+      if (mutation === 'failed-call') lines[2] = `Program ${cpmm.address} failed: synthetic failure`;
+      if (mutation === 'ancestor-rollback') lines = [`Program ${actor} invoke [1]`,
+        `Program ${cpmm.address} invoke [2]`, lines[1], lines[2], `Program ${actor} failed: synthetic failure`];
+      if (mutation === 'unknown-trailing-bytes') lines[1] = 'Program data: ' + Buffer.concat([
+        Buffer.from(lines[1].slice(14), 'base64'), Buffer.from([1]),
+      ]).toString('base64');
+      if (mutation === 'same-mint') lines = logs(mint, mint);
+      if (mutation === 'zero-input') lines = logs(undefined, undefined, { input_amount: new BN(0) });
+      const hints: LogEnrichmentHint[] = [];
+      expect(decodeLogNotification(lines, sig, 123, 1000, 1001, { onEnrichmentHint: h => hints.push(h) })).toEqual([]);
+      expect(hints).toEqual([]);
+    },
+  );
+});
 function defaults(type: any, idl: Idl): any {
   if (typeof type === 'string') {
     if (type === 'pubkey') return key(12);

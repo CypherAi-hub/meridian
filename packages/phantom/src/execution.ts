@@ -56,6 +56,8 @@ export type Quote = {
   requestedAt?: number;
   contextSlot: number | null;
   route: string[];
+  /** Provider routing family; this is pricing provenance, not transaction success. */
+  router?: string;
   requestId?: string;
   /** Jupiter's platform fee is already embedded in the quote; do not subtract it twice. */
   feeBps?: number;
@@ -70,6 +72,7 @@ export const EXTERNAL_INTEGRATIONS = {
     version: "Swap V2",
     endpoint: "https://api.jup.ag/swap/v2/order",
     mode: "QUOTE_ONLY",
+    limitation: "RFQ prices are excluded until their provider deadline is supported at every modeled settlement.",
     docs: "https://developers.jup.ag/docs/api-reference/swap/order",
   },
   pump: {
@@ -173,6 +176,9 @@ export class JupiterQuoteClient {
       slippageBps: String(slippage),
       swapMode: "ExactIn",
       maxSupportedTransactionVersion: "0",
+      // RFQ expiry has not been modeled end to end. Request supported AMM routes
+      // rather than treating a maker's expiring offer as an ordinary spot quote.
+      excludeRouters: "jupiterz",
     });
     return this.lane.schedule(input.priority ?? "analysis", this.timeoutMs, async (signal) => {
       try {
@@ -202,6 +208,20 @@ export class JupiterQuoteClient {
         if (!Number.isSafeInteger(observedAt) || observedAt < requestedAt)
           throw Error("JUPITER_QUOTE_CLOCK_INVALID");
         if (data.error || data.errorCode) throw new Error("JUPITER_QUOTE_UNAVAILABLE");
+        const rfqMetadata = ["quoteId", "maker", "expireAt"].some(
+          (field) => data[field] !== undefined && data[field] !== null && data[field] !== "",
+        );
+        const rfqRouter =
+          typeof data.router === "string" && data.router.trim().toLowerCase() === "jupiterz";
+        const rfqType =
+          typeof data.swapType === "string" &&
+          data.swapType
+            .toLowerCase()
+            .split("+")
+            .some((part) => part.trim() === "rfq");
+        // Check the response too: an ignored exclusion or mixed/unknown RFQ
+        // metadata must not reach a consumer that only checks observedAt.
+        if (rfqRouter || rfqMetadata || rfqType) throw Error("JUPITER_RFQ_EXECUTION_UNSUPPORTED");
         if (
           data.inputMint !== inputMint ||
           data.outputMint !== outputMint ||
@@ -230,6 +250,8 @@ export class JupiterQuoteClient {
           : [];
         if (!route.length && typeof data.router === "string") route.push(data.router);
         if (!route.length) throw new Error("JUPITER_ROUTE_MISSING");
+        if (typeof data.router !== "string" || !["metis", "dflow", "okx"].includes(data.router))
+          throw Error("JUPITER_ROUTER_UNSUPPORTED");
         return {
           inputMint,
           outputMint,
@@ -242,6 +264,7 @@ export class JupiterQuoteClient {
           observedAt,
           contextSlot: null,
           route,
+          ...(typeof data.router === "string" ? { router: data.router } : {}),
           ...(typeof data.requestId === "string" ? { requestId: data.requestId } : {}),
           ...(typeof data.feeBps === "number" && Number.isFinite(data.feeBps)
             ? { feeBps: data.feeBps }
@@ -263,6 +286,8 @@ export class JupiterQuoteClient {
           "JUPITER_ROUTE_MISSING",
           "JUPITER_QUOTE_TIMEOUT",
           "JUPITER_QUOTE_CLOCK_INVALID",
+          "JUPITER_RFQ_EXECUTION_UNSUPPORTED",
+          "JUPITER_ROUTER_UNSUPPORTED",
         ]);
         if (
           error instanceof Error &&

@@ -3,8 +3,13 @@ $ErrorActionPreference='Stop'
 $packageRoot=$PSScriptRoot
 Set-Location -LiteralPath $packageRoot
 $nodeCommand=Get-Command node.exe -ErrorAction SilentlyContinue
-if(-not $nodeCommand){throw 'Install Node.js 22.12+ or 24+ from nodejs.org, then run this script again.'}
+if(-not $nodeCommand){throw 'Install Node.js 24+ from nodejs.org, then run this script again.'}
 $nodePath=$nodeCommand.Source
+$nodeMajorText=& $nodePath -p "process.versions.node.split('.')[0]"
+$nodeMajor=0
+if($LASTEXITCODE -ne 0 -or -not [int]::TryParse($nodeMajorText,[ref]$nodeMajor) -or $nodeMajor -lt 24){
+  throw 'PHANTOM requires Node.js 24 or newer. Node 22 cannot load the pinned Pump SDK dependencies.'
+}
 if($Mode -eq 'install'){
   $npmCommand=Get-Command npm.cmd -ErrorAction SilentlyContinue
   if($npmCommand){& $npmCommand.Source ci --ignore-scripts;exit $LASTEXITCODE}

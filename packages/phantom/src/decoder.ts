@@ -329,7 +329,25 @@ const amountValid = (v: unknown): v is string => typeof v === 'string' && /^\d+$
 export interface LogDecodeOptions {
   /** Caller must supply mappings learned from fully verified transaction/account state only. */
   resolvePool?: (pool: string, protocol: Protocol) => { mint: string; quoteMint: string } | undefined;
+  /** Actorless events may prioritize a full fetch, never become trade evidence. */
+  onEnrichmentHint?: (hint: LogEnrichmentHint) => void;
 }
+export type LogEnrichmentHint = Readonly<{
+  scope: 'ENRICHMENT_PRIORITY_ONLY';
+  source: 'TYPED_PROGRAM_EVENT';
+  protocol: 'raydium-cpmm';
+  kind: 'buy' | 'sell' | 'swap';
+  signature: string;
+  slot: number;
+  receivedAt: number;
+  pool: string;
+  mint: string;
+  quoteMint: string;
+  eventName: 'SwapEvent';
+  eventSchema: string;
+  logIndex: number;
+  executionSupported: false;
+}>;
 /** Low-latency observations from finalized RPC notifications. These are real typed
  * program events, not guesses based on human-readable log labels. They are never
  * full-transaction evidence or order authorization. PumpSwap trade events omit
@@ -340,6 +358,20 @@ export function decodeLogNotification(logs: unknown, signature: string, slot: nu
   const observations: ChainEvent[] = [];
   for (const event of typedEvents(logs)) {
     const d = event.data;
+    // Official CPMM SwapEvent omits the trader. Its exact typed mint pair can
+    // prioritize enrichment without inventing an actor, launch or position.
+    if (event.protocol === 'raydium-cpmm' && event.name === 'SwapEvent' && !event.unsupportedTrailingBytes &&
+        keyValid(d.pool_id) && keyValid(d.input_mint) && keyValid(d.output_mint) && d.input_mint !== d.output_mint &&
+        amountValid(d.input_amount) && amountValid(d.output_amount)) {
+      const buying = d.input_mint === WSOL, selling = d.output_mint === WSOL;
+      options.onEnrichmentHint?.({
+        scope: 'ENRICHMENT_PRIORITY_ONLY', source: 'TYPED_PROGRAM_EVENT', protocol: 'raydium-cpmm',
+        kind: buying ? 'buy' : selling ? 'sell' : 'swap', signature, slot, receivedAt,
+        pool: d.pool_id, mint: buying ? d.output_mint : d.input_mint,
+        quoteMint: buying ? WSOL : d.output_mint, eventName: 'SwapEvent', eventSchema: event.schemaVersion,
+        logIndex: event.logIndex, executionSupported: false,
+      });
+    }
     let kind: ChainEvent['kind'] | null = null;
     if (event.protocol === 'pump') {
       if (event.name === 'TradeEvent' && typeof d.is_buy === 'boolean') kind = d.is_buy ? 'buy' : 'sell';

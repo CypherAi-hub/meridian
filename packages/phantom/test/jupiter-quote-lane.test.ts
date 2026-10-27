@@ -27,7 +27,7 @@ function data(url: string | URL | Request, output = 1000) {
     outAmount: String(output),
     otherAmountThreshold: String(Math.floor(output * 0.99)),
     priceImpact: -0.1,
-    router: "SYNTHETIC_ROUTE",
+    router: "metis",
   };
 }
 const response = (url: string | URL | Request, headers?: HeadersInit, output?: number) =>

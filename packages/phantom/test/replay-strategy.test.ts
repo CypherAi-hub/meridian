@@ -429,6 +429,59 @@ describe("frozen point-in-time strategy adapter", () => {
       }),
     ).toThrow("FUTURE_QUOTE");
   });
+  it.each([
+    { snapshotCapturedAt: 2000 },
+    { snapshotCapturedAt: null },
+    { snapshotCapturedAt: 999 },
+    { snapshotCapturedAt: 1000.5 },
+    { snapshotCapturedAt: 1000, securityObservedAt: 1001 },
+  ])(
+    "rejects unavailable or inconsistent capture timing at export and direct strategy boundaries %#",
+    (patch) => {
+      const r = row("capture"),
+        event = {
+          id: "capture",
+          mint: r.mint,
+          signature: "1".repeat(64),
+          slot: 1,
+          receivedAt: 1000,
+        };
+    r.features = { ...r.features, ...(patch as Record<string, number | null>) };
+      expect(() =>
+        replayObservationFromSnapshot({
+          event,
+          snapshotAt: 1000,
+          regime: "trend",
+          features: { ...r.features },
+        }),
+      ).toThrow("CAPTURE_TIMING");
+      const result = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0))(ctx(r));
+      expect(result.action).toBe("reject");
+      expect(result.reasons).toContain("FEATURE_CAPTURE_TIMING_INVALID");
+    },
+  );
+  it("accepts capture exactly at availability and does not invent missing legacy capture time", () => {
+    const r = row("capture-boundary"),
+      evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+    expect(evaluate(ctx(r)).action).toBe("enter");
+    r.features = { ...r.features, snapshotCapturedAt: 1000 };
+    expect(evaluate(ctx(r)).action).toBe("enter");
+    const event = {
+      id: "capture",
+      mint: r.mint,
+      signature: "1".repeat(64),
+      slot: 1,
+      receivedAt: 1000,
+    };
+    expect(
+      replayObservationFromSnapshot({
+        event,
+        snapshotAt: 1000,
+        regime: "trend",
+        features: { ...r.features },
+      }).features.snapshotCapturedAt,
+    ).toBe(1000);
+  });
 });
 describe("durable replay feature capture", () => {
   const signal: SignalFeatures = {
@@ -483,9 +536,10 @@ describe("durable replay feature capture", () => {
     abnormalCreatorActivity: null,
   };
   const risk = { now: 1200, killSwitch: false, consecutiveFailures: 0, slippageBps: 100 };
-  it("captures the actual snapshot time and preserves unknown safety flags", () => {
+  it("preserves the source feature time separately from capture and unknown safety flags", () => {
     const f = flattenReplayFeatures(signal, safety, risk);
-    expect(f.featuresObservedAt).toBe(1200);
+    expect(f.featuresObservedAt).toBe(1000);
+    expect(f.snapshotCapturedAt).toBe(1200);
     expect(f.securityObservedAt).toBe(1100);
     expect(f.mintAuthorityRevoked).toBe(1);
     expect(f.freezeAuthorityRevoked).toBeNull();
@@ -563,5 +617,41 @@ describe("durable replay feature capture", () => {
     expect(() => flattenReplayFeatures(signal, { ...safety, mint: "different" }, risk)).toThrow(
       "MINT_MISMATCH",
     );
+  });
+  it.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid source/capture timestamps %s",
+    (at) => {
+      expect(() => flattenReplayFeatures({ ...signal, asOf: at }, safety, risk)).toThrow(
+        "TIMESTAMPS",
+      );
+      expect(() => flattenReplayFeatures(signal, { ...safety, observedAt: at }, risk)).toThrow(
+        "TIMESTAMPS",
+      );
+      expect(() => flattenReplayFeatures(signal, safety, { ...risk, now: at })).toThrow(
+        "TIMESTAMPS",
+      );
+    },
+  );
+  it("does not admit an old signal merely because quotes and security were captured recently", () => {
+    const now = 1_000_000,
+      r = row("stale-signal", now),
+      complete = features(now);
+    const f = flattenReplayFeatures(
+      { ...signal, asOf: 1000 },
+      { ...safety, observedAt: now },
+      { ...risk, now },
+    );
+    // All other evidence is deliberately fresh and otherwise passes the policy.
+    // Changing only the feature-source time must switch admission to rejection.
+    const evaluate = createReplayStrategy(researchReplayConfiguration("launch_sniper", 0));
+    expect(evaluate(ctx(r)).action).toBe("enter");
+    r.features = {
+      ...complete,
+      featuresObservedAt: f.featuresObservedAt,
+      snapshotCapturedAt: f.snapshotCapturedAt,
+    };
+    const result = evaluate(ctx(r));
+    expect(result.action).toBe("reject");
+    expect(result.reasons).toContain("FEATURES_UNRECORDED_STALE_OR_FUTURE");
   });
 });

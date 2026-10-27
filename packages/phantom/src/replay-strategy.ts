@@ -49,6 +49,7 @@ export interface ReplayStrategyConfig {
 }
 export const REPLAY_FEATURE_CONTRACT = {
   timestamp: "featuresObservedAt",
+  captureTimestamp: "snapshotCapturedAt",
   signals: [
     "observations",
     "verifiedLaunchAgeMs",
@@ -110,6 +111,22 @@ const integer = (ctx: ReplayContext, key: string) => {
   const n = value(ctx, key);
   return n != null && Number.isSafeInteger(n) ? BigInt(n) : null;
 };
+function captureClockValid(features: Readonly<Record<string, number | null>>, availableAt: number) {
+  // Absent legacy capture times remain unknown; a newly recorded time must obey
+  // both source chronology and the point when this observation is available.
+  if (!Object.hasOwn(features, "snapshotCapturedAt")) return true;
+  const captured = features.snapshotCapturedAt,
+    source = features.featuresObservedAt,
+    security = features.securityObservedAt;
+  return (
+    [captured, source, security, availableAt].every(
+      (at) => typeof at === "number" && Number.isSafeInteger(at) && at >= 0,
+    ) &&
+    source! <= captured! &&
+    security! <= captured! &&
+    captured! <= availableAt
+  );
+}
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object") {
     Object.freeze(value);
@@ -168,7 +185,9 @@ export function flattenReplayFeatures(
   s: TokenSafetyEvidence,
   risk: { now: number; slippageBps: number; killSwitch: boolean; consecutiveFailures: number },
 ): Record<string, number | null> {
-  if (!Number.isFinite(risk.now) || f.asOf > risk.now || s.observedAt > risk.now)
+  if (![risk.now, f.asOf, s.observedAt].every((at) => Number.isSafeInteger(at) && at >= 0))
+    throw Error("INVALID_REPLAY_SNAPSHOT_TIMESTAMPS");
+  if (f.asOf > risk.now || s.observedAt > risk.now)
     throw Error("FUTURE_EVIDENCE_IN_REPLAY_SNAPSHOT");
   if (f.mint !== s.mint) throw Error("REPLAY_SNAPSHOT_MINT_MISMATCH");
   const safe = (n: bigint | null) =>
@@ -179,7 +198,8 @@ export function flattenReplayFeatures(
   const revoked = (authority: string | null | undefined) =>
     authority === undefined ? null : authority === null ? 1 : 0;
   return {
-    featuresObservedAt: risk.now,
+    featuresObservedAt: f.asOf,
+    snapshotCapturedAt: risk.now,
     securityObservedAt: s.observedAt,
     observations: f.observations,
     verifiedLaunchAgeMs: f.verifiedLaunchAgeMs,
@@ -385,6 +405,8 @@ export function createReplayStrategy(input: ReplayStrategyConfig) {
     const at = value(ctx, "featuresObservedAt");
     if (at == null || at > ctx.now || ctx.now - at > config.maxFeatureAgeMs)
       reasons.push("FEATURES_UNRECORDED_STALE_OR_FUTURE");
+    if (!captureClockValid(ctx.current.features, Math.min(ctx.now, ctx.current.at)))
+      reasons.push("FEATURE_CAPTURE_TIMING_INVALID");
     if (!ctx.portfolio) reasons.push("PORTFOLIO_RISK_STATE_UNAVAILABLE");
     return reasons;
   };
@@ -599,17 +621,19 @@ export function replayObservationFromSnapshot(input: {
     !/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(input.event.signature) ||
     !Number.isSafeInteger(input.event.slot) ||
     input.event.slot < 0 ||
-    !Number.isFinite(input.event.receivedAt)
+    !Number.isSafeInteger(input.event.receivedAt) ||
+    input.event.receivedAt < 0
   )
     throw Error("INVALID_RECORDED_SNAPSHOT_PROVENANCE");
   const snapshotAt = input.snapshotAt ?? input.event.receivedAt;
-  if (!Number.isFinite(snapshotAt) || snapshotAt < input.event.receivedAt)
+  if (!Number.isSafeInteger(snapshotAt) || snapshotAt < input.event.receivedAt)
     throw Error("SNAPSHOT_PRECEDES_SOURCE_RECEIPT");
   for (const q of [input.buy, input.sell])
     if (q && (q.observedAt > snapshotAt || q.observedAt < 0))
       throw Error("FUTURE_QUOTE_IN_RECORDED_SNAPSHOT");
   for (const [name, value] of Object.entries(input.features))
     if (value !== null && !Number.isFinite(value)) throw Error(`INVALID_RECORDED_FEATURE:${name}`);
+  if (!captureClockValid(input.features, snapshotAt)) throw Error("FEATURE_CAPTURE_TIMING_INVALID");
   return structuredClone({
     id: input.event.id,
     mint: input.event.mint,

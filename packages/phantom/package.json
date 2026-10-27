@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "paper": "node --env-file-if-exists=.env --import tsx src/cli.ts paper",
     "replay": "node --env-file-if-exists=.env --import tsx src/cli.ts replay",
