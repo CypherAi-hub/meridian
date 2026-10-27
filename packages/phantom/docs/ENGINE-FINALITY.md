@@ -1,0 +1,5 @@
+# Engine finalized admission
+
+`Engine.receive` rejects callbacks whose commitment label is not `finalized` before decoding or writing transaction/event rows. Otherwise a confirmed callback could occupy an immutable event ID and prevent the later finalized callback from reaching observation or scheduling. `Engine.recordLogs` independently checks the runtime envelope label before the log decoder can generate finalized observations. Rejections update health and throw a fixed error; they cannot publish hints, change trade history or sample quotes.
+
+Current RPC and Yellowstone producers already request finalized data. This is a boundary defense against unsupported callback labels, not evidence of an observed failure in the running feed. A caller's label is not independent proof of chain finality, and the guard does not repair older persisted rows. Two offline tests use a recorded public fixture, an in-memory Store and disabled network access to cover rejected confirmed input, later finalized admission and duplicate callback idempotence. No live provider or trading calls are required.

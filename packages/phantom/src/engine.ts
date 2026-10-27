@@ -367,6 +367,10 @@ export class Engine {
     this.health.status = "DEGRADED";
   }
   async receive(tx: RpcTransaction, at: number, commitment: "confirmed" | "finalized") {
+    if (commitment !== "finalized") {
+      this.fail("NON_FINALIZED_TRANSACTION_REJECTED");
+      throw Error("NON_FINALIZED_TRANSACTION_REJECTED");
+    }
     const events = decodeTransaction(tx, at, commitment);
     await this.store.transaction(tx.transaction.signatures[0], tx.slot, tx);
     for (const e of events) {
@@ -386,6 +390,10 @@ export class Engine {
     }
   }
   async recordLogs(envelope: FinalizedLogEnvelope, onEnrichmentHint?: (hint: LogEnrichmentHint) => void) {
+    if (envelope.commitment !== "finalized") {
+      this.fail("NON_FINALIZED_LOGS_REJECTED");
+      throw Error("NON_FINALIZED_LOGS_REJECTED");
+    }
     const decoded = decodeLogNotification(
       envelope.logs,
       envelope.signature,
