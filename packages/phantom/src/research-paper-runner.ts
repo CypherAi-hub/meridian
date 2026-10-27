@@ -170,6 +170,8 @@ export interface ResearchRunnerControls {
 export interface ResearchStepControls {
   allowEntryQuotes?: boolean;
   allowPassiveMarks?: boolean;
+  /** Provider-free prepass: retain every intent and its delay; execute in a later enabled pass. */
+  allowExitQuotes?: boolean;
 }
 
 type RunnerStore = Pick<
@@ -921,7 +923,12 @@ export class ResearchPaperRunner {
       options.allowEntryQuotes === undefined ? true : options.allowEntryQuotes;
     const allowPassiveMarks =
       options.allowPassiveMarks === undefined ? true : options.allowPassiveMarks;
-    if (typeof allowEntryQuotes !== "boolean" || typeof allowPassiveMarks !== "boolean")
+    const allowExitQuotes = options.allowExitQuotes === undefined ? true : options.allowExitQuotes;
+    if (
+      typeof allowEntryQuotes !== "boolean" ||
+      typeof allowPassiveMarks !== "boolean" ||
+      typeof allowExitQuotes !== "boolean"
+    )
       throw Error("RESEARCH_STEP_CONTROLS_INVALID");
     if (this.#busy) throw Error("RESEARCH_RUN_ALREADY_BUSY");
     this.#busy = true;
@@ -946,6 +953,7 @@ export class ResearchPaperRunner {
         }
         const pending = this.#ledger.state.pendingExits.find((e) => e.positionId === position.id);
         if (!pending && !allowPassiveMarks) continue;
+        if (pending && !allowExitQuotes) continue;
         if (pending && this.time() < pending.readyAt) continue;
         let q: Quote;
         try {

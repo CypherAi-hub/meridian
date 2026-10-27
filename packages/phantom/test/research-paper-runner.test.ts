@@ -187,6 +187,31 @@ async function enter(f: Awaited<ReturnType<typeof fixture>>) {
 const saved = (value: unknown) => JSON.parse(json(value));
 
 describe("separate durable prospective research PAPER runner", () => {
+  it("persists time-based exit intent in a provider-free pass and later executes the same ready order without renewing its delay", async () => {
+    const f = await fixture();
+    await enter(f);
+    const before = f.calls.length;
+    const offline = { allowEntryQuotes: false, allowPassiveMarks: false, allowExitQuotes: false };
+    f.time(399000);
+    await f.runner.step(offline);
+    const original = f.runner.snapshot().ledger.pendingExits[0];
+    expect(original.reason).toBe("MAX_HOLD");
+    expect(original.createdAt).toBe(399000);
+    expect(original.readyAt).toBe(401000);
+    expect((await f.store.get(f.runner.key)).ledger.pendingExits[0].id).toBe(original.id);
+    f.time(401000);
+    await f.runner.step(offline);
+    expect(f.calls).toHaveLength(before);
+    expect(f.runner.snapshot().ledger.pendingExits[0]).toEqual(original);
+    f.time(402000);
+    f.script.push((input) => f.quote(input, 12000000n));
+    await f.runner.step();
+    const s = f.runner.snapshot();
+    expect(s.ledger.trades).toHaveLength(1);
+    expect(s.ledger.trades[0].exitOrderId).toBe(original.id);
+    expect(s.ledger.positions).toEqual([]);
+    expect(reconcileResearchPaper(s).cashLamports).toBe(1001980000n);
+  });
   it.each(["passive", "partial"])(
     "observes callback-only stop during %s quote and replaces the old quote with full emergency intent",
     async (kind) => {
