@@ -47,6 +47,86 @@ beforeEach(() => {
 });
 afterEach(() => vi.useRealTimers());
 describe("bounded quote-only research and horizon observations", () => {
+  it("serializes external paper work with the same durable turn budget and waits on shutdown", async () => {
+    const store = memoryStore(),
+      collector = new QuoteResearchCollector(store as any),
+      p = provider();
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const turn = collector.externalTurn(20_000, async (deadline) => {
+      expect(deadline).toBe(1_020_000);
+      entered();
+      await gate;
+      return "original-work";
+    });
+    await started;
+    expect(collector.status().externalTurnReserved).toBe(true);
+    expect(await collector.externalTurn(20_000, async () => "must-not-run")).toEqual({
+      reserved: false,
+    });
+    expect(collector.sample(event(), p)).toBeUndefined();
+    await collector.tick(p);
+    expect(p.quote).not.toHaveBeenCalled();
+    let idle = false;
+    const stopped = collector.idle().then(() => {
+      idle = true;
+    });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    release();
+    expect(await turn).toEqual({ reserved: true, value: "original-work" });
+    await stopped;
+    expect(idle).toBe(true);
+    const restarted = new QuoteResearchCollector(store as any);
+    expect(await restarted.externalTurn(20_000, async () => "early")).toEqual({ reserved: false });
+    vi.setSystemTime(1_030_000);
+    expect(await restarted.externalTurn(20_000, async () => "next")).toEqual({
+      reserved: true,
+      value: "next",
+    });
+  });
+  it("checks the current clock after awaiting an upcoming forward reservation", async () => {
+    const collector = new QuoteResearchCollector(memoryStore() as any),
+      work = vi.fn(async () => "late");
+    vi.spyOn(collector as any, "forwardWindow").mockImplementation(async () => {
+      vi.setSystemTime(1_025_000);
+      return { dueAt: 1_040_000 };
+    });
+    expect(await collector.externalTurn(20_000, work)).toEqual({ reserved: false });
+    expect(work).not.toHaveBeenCalled();
+    expect(collector.status().externalTurnReserved).toBe(false);
+  });
+  it("preserves forward capacity for the full spacing budget even when external work is shorter", async () => {
+    const collector = new QuoteResearchCollector(memoryStore() as any),
+      work = vi.fn(async () => "instant");
+    vi.spyOn(collector as any, "forwardWindow").mockResolvedValue({
+      dueAt: 1_020_000,
+      deadlineAt: 1_025_000,
+    });
+    expect(await collector.externalTurn(15_000, work)).toEqual({ reserved: false });
+    expect(work).not.toHaveBeenCalled();
+    expect(collector.status().lastProviderSampleAt).toBe(0);
+  });
+  it("releases an external reservation on failure while retaining its spent budget", async () => {
+    const collector = new QuoteResearchCollector(memoryStore() as any);
+    await expect(
+      collector.externalTurn(20_000, async () => {
+        throw Error("SYNTHETIC_PAPER_FAILURE");
+      }),
+    ).rejects.toThrow("SYNTHETIC_PAPER_FAILURE");
+    expect(collector.status().externalTurnReserved).toBe(false);
+    expect(await collector.externalTurn(20_000, async () => "early")).toEqual({ reserved: false });
+    vi.setSystemTime(1_030_000);
+    expect(await collector.externalTurn(20_000, async () => "next")).toEqual({
+      reserved: true,
+      value: "next",
+    });
+  });
   it("keeps exact baseline sizes and models network costs once without creating fills", async () => {
     const store = memoryStore(),
       p = provider(),
@@ -260,7 +340,9 @@ describe("bounded quote-only research and horizon observations", () => {
       expect(baselines[i].startedAt - baselines[i - 1].startedAt).toBeGreaterThanOrEqual(90_000);
   });
   it("keeps an upcoming reservation across restart before any horizon is due", async () => {
-    const store = memoryStore(), p = provider(), collector = new QuoteResearchCollector(store as any);
+    const store = memoryStore(),
+      p = provider(),
+      collector = new QuoteResearchCollector(store as any);
     await collector.sample(event(), p);
     for (const offset of [30_000, 60_000]) {
       vi.setSystemTime(1_000_000 + offset);
@@ -275,10 +357,13 @@ describe("bounded quote-only research and horizon observations", () => {
     vi.setSystemTime(1_210_000);
     await restarted.sample({ ...event(), mint: "SYNTHETIC_FREE_CAPACITY_MINT" }, p);
     expect(p.quote).toHaveBeenCalledTimes(7);
-    expect([...store.rows.values()].every((r) => r.schedulingPolicy === "HORIZON_CAPACITY_RESERVED_V2")).toBe(true);
+    expect(
+      [...store.rows.values()].every((r) => r.schedulingPolicy === "HORIZON_CAPACITY_RESERVED_V2"),
+    ).toBe(true);
   });
   it("retains legacy episode provenance and permits a slower configured quote budget", async () => {
-    const store = memoryStore(), p = provider();
+    const store = memoryStore(),
+      p = provider();
     await new QuoteResearchCollector(store as any, 60_000).sample(event(), p);
     const saved = store.state.get(RESEARCH_WATCH_STATE_KEY);
     delete saved.episodes[0].schedulingPolicy;
@@ -286,7 +371,10 @@ describe("bounded quote-only research and horizon observations", () => {
     vi.setSystemTime(1_060_000);
     await new QuoteResearchCollector(store as any, 60_000).tick(p);
     const row = [...store.rows.values()].find((r) => r.phase === "HORIZON");
-    expect(row).toMatchObject({schedulingPolicy: "LEGACY_DUE_ONLY_V1", delayPastTargetMs: 30_000});
+    expect(row).toMatchObject({
+      schedulingPolicy: "LEGACY_DUE_ONLY_V1",
+      delayPastTargetMs: 30_000,
+    });
     expect(p.quote).toHaveBeenCalledTimes(3);
   });
   it("caps persisted watches and refuses over-budget configuration", async () => {

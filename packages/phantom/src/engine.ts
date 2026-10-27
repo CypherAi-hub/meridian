@@ -3,9 +3,15 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { Connection } from "@solana/web3.js";
 import { Store } from "./store.ts";
-import { decodeTransaction, decodeLogNotification, type LogEnrichmentHint, type RpcTransaction } from "./decoder.ts";
+import {
+  decodeTransaction,
+  decodeLogNotification,
+  type LogEnrichmentHint,
+  type RpcTransaction,
+} from "./decoder.ts";
 import { Rpc, SolanaStream, startYellowstone, type FinalizedLogEnvelope } from "./stream.ts";
 import { JupiterQuoteClient, PumpQuoteClient } from "./execution.ts";
 import {
@@ -20,6 +26,7 @@ import {
   PaperLedger,
   restoreLedger,
   aggregateCompletedPositions,
+  validateResearchPaperQuote,
   type QuoteProvider,
 } from "./paper.ts";
 import { SecurityReader, type SecuritySnapshot } from "./security.ts";
@@ -35,6 +42,33 @@ import { QuoteResearchCollector } from "./quote-research.ts";
 import { runtimeSourceVersion } from "./runtime-version.ts";
 import { conservativeCostBps } from "./costs.ts";
 import { ForwardRuntime } from "./forward-runtime.ts";
+import { freezeResearchPaperPolicyV2 } from "./research-paper-policy.ts";
+import {
+  freezeResearchPaperRun,
+  ResearchPaperRunner,
+  reconcileResearchPaper,
+  type ResearchRunManifest,
+  type ResearchBookEnvelope,
+} from "./research-paper-runner.ts";
+const EXPERIMENTAL_RUN_KEY = "research-paper-engine-active-v1";
+const EXPERIMENTAL_ENROLLMENT_MS = 72 * 60 * 60 * 1000;
+const EXPERIMENTAL_TURN_BUDGET_MS = 30_000;
+function captureCanonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(captureCanonical).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${captureCanonical((value as Record<string, unknown>)[key])}`,
+      )
+      .join(",")}}`;
+  if (typeof value === "number" && !Number.isFinite(value))
+    throw Error("RESEARCH_CAPTURE_NONFINITE_NUMBER");
+  const result = JSON.stringify(value);
+  if (result === undefined) throw Error("RESEARCH_CAPTURE_NONCANONICAL_VALUE");
+  return result;
+}
 function sourceCommit(configured?: string) {
   const explicit = configured ?? process.env.PHANTOM_SOURCE_COMMIT;
   if (explicit?.trim()) {
@@ -96,6 +130,9 @@ export class Engine {
   private managingPositions = false;
   private researchTimer: ReturnType<typeof setInterval> | null = null;
   private researchWork: Promise<void> | null = null;
+  private researchPaperRunner: ResearchPaperRunner | null = null;
+  private eventAvailability = new Map<string, { decodedAt: number; publishedAt: number }>();
+  private researchBookWork: Promise<unknown> = Promise.resolve();
   private fastEvents: ChainEvent[] = [];
   private fastIds = new Set<string>();
   private materializedTrades = new Map<string, number>();
@@ -179,6 +216,7 @@ export class Engine {
       this.forwardRuntime = await new ForwardRuntime(this.store, {
         runtimeSourceVersion: this.sourceVersion,
         sourceCommit: sourceCommit(options.sourceCommit),
+        retireInterruptedEpoch: process.env.PHANTOM_FORWARD_RETIRE_INCOMPLETE === "true",
       }).initialize();
     }
     this.quoteResearch = new QuoteResearchCollector(
@@ -203,6 +241,7 @@ export class Engine {
       restored,
     );
     this.ledger.state.killSwitch = this.killed();
+    if (process.env.PHANTOM_RESEARCH_PAPER_ENABLED === "true") await this.initializeResearchPaper();
     if (!this.ledger.state.equity.length) this.ledger.recordEquity(Date.now());
     if (!(await this.store.get("research-config")))
       await this.store.save(
@@ -356,6 +395,151 @@ export class Engine {
   setQuoteProvider(provider: QuoteProvider) {
     this.quote = provider;
   }
+  private async initializeResearchPaper() {
+    const existing = (await this.store.get(EXPERIMENTAL_RUN_KEY)) as ResearchRunManifest | null;
+    const provider: QuoteProvider = { quote: (input) => this.quote.quote(input) };
+    const controls = {
+      stopRequested: () => this.stopped || this.killed() || !this.store.workerLeaseHealthy,
+    };
+    if (existing) {
+      if (existing.policy?.sourceHash !== this.sourceVersion)
+        throw Error("RESEARCH_ACTIVE_RUN_SOURCE_CHANGED_REVIEW_ARCHIVE_BEFORE_NEW_RUN");
+      const saved = (await this.store.get(
+        `research-paper:${existing.bookId}`,
+      )) as ResearchBookEnvelope | null;
+      if (!saved) throw Error("RESEARCH_BOOK_MISSING_NO_CAPITAL_RESET");
+      reconcileResearchPaper(saved);
+      await this.validateOriginalResearchCaptures(saved);
+      // A missing book is an error, never a new capital balance.
+      this.researchPaperRunner = await ResearchPaperRunner.restore(
+        this.store,
+        provider,
+        existing,
+        Date.now,
+        controls,
+      );
+    } else {
+      if (
+        (
+          await this.store.query(
+            "SELECT id FROM phantom_state WHERE id LIKE 'research-paper:%' LIMIT 1",
+          )
+        ).length
+      )
+        throw Error("RESEARCH_ORPHAN_BOOK_REQUIRES_REVIEW_NO_CAPITAL_RESET");
+      const frozenAt = Date.now();
+      const policy = freezeResearchPaperPolicyV2({ sourceHash: this.sourceVersion, frozenAt });
+      const manifest = freezeResearchPaperRun({
+        bookId: `engine-${this.sourceVersion.slice(0, 16)}-${frozenAt}`,
+        policy,
+        enrollmentStart: frozenAt + 5_000,
+        enrollmentEnd: frozenAt + 5_000 + EXPERIMENTAL_ENROLLMENT_MS,
+      });
+      // Intent precedes capital creation. An interrupted setup cannot silently create another book.
+      await this.store.exec(
+        "INSERT INTO phantom_state(id,payload,updated_at) VALUES($1,$2::jsonb,$3) ON CONFLICT DO NOTHING",
+        [EXPERIMENTAL_RUN_KEY, json(manifest), frozenAt],
+      );
+      const recorded = await this.store.get(EXPERIMENTAL_RUN_KEY);
+      if (captureCanonical(recorded) !== captureCanonical(manifest))
+        throw Error("RESEARCH_RUN_CREATION_IDENTITY_CONFLICT");
+      this.researchPaperRunner = await ResearchPaperRunner.create(
+        this.store,
+        provider,
+        manifest,
+        Date.now,
+        controls,
+      );
+    }
+    if (this.killed()) await this.researchPaperRunner.latchEmergencyStop("ENGINE_KILL_SWITCH");
+  }
+  private withResearchBook<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.researchBookWork.then(work);
+    this.researchBookWork = next.catch(() => undefined);
+    return next;
+  }
+  private async validateOriginalResearchCaptures(book: ResearchBookEnvelope, pendingOnly = false) {
+    const pending = new Set(book.ledger.pending.map((order) => order.eventId));
+    for (const entry of book.entries) {
+      const decision = entry.decision;
+      if (pendingOnly && !pending.has(decision.captureId)) continue;
+      try {
+        this.store.assertWorkerLease();
+        if (!/^engine:[a-f0-9]{64}$/.test(decision.captureId)) throw Error();
+        const original = await this.store.get(`research-decision:${decision.captureId}`);
+        this.store.assertWorkerLease();
+        const digest = createHash("sha256").update(captureCanonical(original)).digest("hex");
+        if (
+          decision.captureId !== `engine:${digest}` ||
+          original.schemaVersion !== 1 ||
+          original.scope !== "ENGINE_RESEARCH_ORIGINAL_DECISION_NOT_FILL" ||
+          original.sourceHash !== this.sourceVersion ||
+          original.bookId !== book.manifest.bookId ||
+          original.policyHash !== book.manifest.policy.manifestHash ||
+          original.runHash !== book.manifest.manifestHash ||
+          original.decisionAt !== decision.decisionAt ||
+          original.publishedAt !== decision.sourceObservedAt ||
+          original.costObservedAt !== original.initialQuoteEvidence.sell.observedAt ||
+          original.creatorBehaviorObservedAt !== decision.features.asOf ||
+          ![original.receivedAt, original.decodedAt, original.publishedAt].every(
+            (n: number) => Number.isSafeInteger(n) && n > book.manifest.enrollmentStart,
+          ) ||
+          original.receivedAt > original.decodedAt ||
+          original.decodedAt > original.publishedAt ||
+          original.publishedAt > decision.decisionAt ||
+          captureCanonical(original.features) !==
+            captureCanonical(JSON.parse(json(decision.features))) ||
+          captureCanonical(original.security) !==
+            captureCanonical(JSON.parse(json(decision.security))) ||
+          captureCanonical(original.mintAccountCapture) !==
+            captureCanonical(JSON.parse(json(decision.mintAccountCapture)))
+        )
+          throw Error();
+        const initial = original.initialQuoteEvidence,
+          p = book.manifest.policy;
+        if (initial.slippageBps !== p.slippageBps || initial.amountLamports !== p.entryLamports)
+          throw Error();
+        validateResearchPaperQuote(
+          initial.buy,
+          WSOL,
+          decision.features.mint,
+          BigInt(p.entryLamports),
+          p,
+          decision.decisionAt,
+          original.mintAccountCapture.publishedAt,
+        );
+        validateResearchPaperQuote(
+          initial.sell,
+          decision.features.mint,
+          WSOL,
+          BigInt(initial.buy.minOutAmount),
+          p,
+          decision.decisionAt,
+          initial.buy.observedAt,
+        );
+        if (
+          original.features.executionCostBps !==
+          conservativeCostBps(
+            BigInt(p.entryLamports),
+            BigInt(initial.sell.minOutAmount),
+            2n * BigInt(p.networkFeePerLegLamports),
+          )
+        )
+          throw Error();
+      } catch {
+        throw Error("RESEARCH_ORIGINAL_CAPTURE_MISSING_OR_CONTRADICTORY");
+      }
+    }
+  }
+  private async researchCapturesReady() {
+    try {
+      await this.validateOriginalResearchCaptures(this.researchPaperRunner!.snapshot(), true);
+      return true;
+    } catch {
+      await this.latchSuspension("RESEARCH_ORIGINAL_CAPTURE_MISSING_OR_CONTRADICTORY");
+      return false;
+    }
+  }
   async idle() {
     await this.work;
     await this.tickWork;
@@ -372,6 +556,7 @@ export class Engine {
       throw Error("NON_FINALIZED_TRANSACTION_REJECTED");
     }
     const events = decodeTransaction(tx, at, commitment);
+    const decodedAt = Date.now();
     await this.store.transaction(tx.transaction.signatures[0], tx.slot, tx);
     for (const e of events) {
       if (!(await this.store.event(e))) continue;
@@ -380,6 +565,9 @@ export class Engine {
       this.events.unshift(e);
       if (this.events.length > 2000) this.events.pop();
       this.observe(e);
+      this.eventAvailability.set(e.id, { decodedAt, publishedAt: Date.now() });
+      if (this.eventAvailability.size > 20_000)
+        this.eventAvailability.delete(this.eventAvailability.keys().next().value!);
       this.latencies.push(e.processedAt - at);
       if (this.latencies.length > 2000) this.latencies.shift();
       if (process.env.PHANTOM_QUOTE_RESEARCH !== "false")
@@ -389,7 +577,10 @@ export class Engine {
       this.schedule(e);
     }
   }
-  async recordLogs(envelope: FinalizedLogEnvelope, onEnrichmentHint?: (hint: LogEnrichmentHint) => void) {
+  async recordLogs(
+    envelope: FinalizedLogEnvelope,
+    onEnrichmentHint?: (hint: LogEnrichmentHint) => void,
+  ) {
     if (envelope.commitment !== "finalized") {
       this.fail("NON_FINALIZED_LOGS_REJECTED");
       throw Error("NON_FINALIZED_LOGS_REJECTED");
@@ -548,6 +739,58 @@ export class Engine {
     await this.store.decision(value, value.at);
   }
   private async analyze(event: ChainEvent) {
+    if (!this.researchPaperRunner) return this.analyzeWithQuotes(event);
+    const availability = this.eventAvailability.get(event.id);
+    const state = this.researchPaperRunner.accountState(),
+      now = Date.now();
+    if (
+      !availability ||
+      event.receivedAt <= this.researchPaperRunner.manifest.enrollmentStart ||
+      availability.publishedAt <= this.researchPaperRunner.manifest.enrollmentStart ||
+      now < this.researchPaperRunner.manifest.enrollmentStart ||
+      now >= this.researchPaperRunner.manifest.enrollmentEnd ||
+      this.stopped ||
+      this.killed() ||
+      state.suspended ||
+      state.openPositions ||
+      state.pendingEntries
+    )
+      return;
+    const turn = await this.quoteResearch.externalTurn(
+      EXPERIMENTAL_TURN_BUDGET_MS,
+      async (deadlineAt) => {
+        await this.analyzeWithQuotes(event, 25, deadlineAt);
+        const pending = this.researchPaperRunner!.snapshot().ledger.pending[0];
+        if (pending && !this.stopped && !this.killed()) {
+          const waitMs = Math.max(0, pending.readyAt - Date.now());
+          // Leave room for the existing client's two six-second provider deadlines.
+          if (Date.now() + waitMs + 12_000 < deadlineAt) {
+            if (waitMs) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+            if (!this.stopped && !this.killed())
+              await this.withResearchBook(async () => {
+                if (!(await this.researchCapturesReady())) return;
+                if (this.stopped || this.killed() || Date.now() + 12_000 >= deadlineAt) return;
+                this.store.assertWorkerLease();
+                await this.researchPaperRunner!.step({
+                  allowEntryQuotes: true,
+                  allowPassiveMarks: false,
+                });
+              });
+          }
+        }
+        this.collectWalletEvidence(event);
+      },
+    );
+    if (!turn.reserved)
+      await this.decision({
+        at: Date.now(),
+        mint: event.mint,
+        strategy: "research_paper",
+        accepted: false,
+        reasons: ["SHARED_PROVIDER_TURN_RESERVED_OR_UNAVAILABLE"],
+      });
+  }
+  private async analyzeWithQuotes(event: ChainEvent, slippageBps = 100, deadlineAt?: number) {
     if (event.quoteMint !== WSOL) {
       await this.decision({
         at: Date.now(),
@@ -585,27 +828,71 @@ export class Engine {
       });
       return;
     }
-    this.collectWalletEvidence(event);
+    if (deadlineAt === undefined) this.collectWalletEvidence(event);
     let buy, sell, snapshot: SecuritySnapshot;
-    const amount = solAmount(process.env.PHANTOM_TRADE_SOL ?? "0.01");
+    const amount =
+      deadlineAt === undefined
+        ? solAmount(process.env.PHANTOM_TRADE_SOL ?? "0.01")
+        : BigInt(this.researchPaperRunner!.manifest.policy.entryLamports);
+    const researchBarrier = () => {
+      if (deadlineAt !== undefined) this.store.assertWorkerLease();
+      if (deadlineAt !== undefined && (this.stopped || this.killed() || Date.now() >= deadlineAt))
+        throw Error("RESEARCH_ENTRY_STOPPED_OR_TURN_EXPIRED");
+    };
     try {
-      buy = await this.quote.quote({
-        inputMint: WSOL,
-        outputMint: event.mint,
-        amount,
-        slippageBps: 100,
-      });
-      sell = await this.quote.quote({
-        inputMint: event.mint,
-        outputMint: WSOL,
-        amount: BigInt(buy.minOutAmount),
-        slippageBps: 100,
-      });
-      snapshot = await this.security.inspect(
-        { ...event, creator: this.launches.get(event.mint)?.creator ?? event.creator },
-        { available: true, at: sell.observedAt },
+      researchBarrier();
+      if (deadlineAt !== undefined)
+        snapshot = await this.security.inspect(
+          { ...event, creator: this.launches.get(event.mint)?.creator ?? event.creator },
+          null,
+        );
+      researchBarrier();
+      buy = structuredClone(
+        await this.quote.quote({
+          ...(deadlineAt === undefined ? {} : { priority: "research" as const }),
+          inputMint: WSOL,
+          outputMint: event.mint,
+          amount,
+          slippageBps,
+        }),
       );
+      researchBarrier();
+      sell = structuredClone(
+        await this.quote.quote({
+          ...(deadlineAt === undefined ? {} : { priority: "research" as const }),
+          inputMint: event.mint,
+          outputMint: WSOL,
+          amount: BigInt(buy.minOutAmount),
+          slippageBps,
+        }),
+      );
+      researchBarrier();
+      if (deadlineAt === undefined)
+        snapshot = await this.security.inspect(
+          { ...event, creator: this.launches.get(event.mint)?.creator ?? event.creator },
+          { available: true, at: sell.observedAt },
+        );
+      else {
+        const at = Date.now(),
+          policy = this.researchPaperRunner!.manifest.policy;
+        validateResearchPaperQuote(buy, WSOL, event.mint, amount, policy, at, snapshot!.observedAt);
+        validateResearchPaperQuote(
+          sell,
+          event.mint,
+          WSOL,
+          BigInt(buy.minOutAmount),
+          policy,
+          at,
+          buy.observedAt,
+        );
+        snapshot!.evidence.sellRouteAvailable = true;
+        snapshot!.evidence.sellRouteObservedAt = sell.observedAt;
+      }
     } catch (err) {
+      if (deadlineAt !== undefined && !this.store.workerLeaseHealthy) {
+        await this.workerLeaseAvailable();
+        return;
+      }
       await this.decision({
         at: Date.now(),
         mint: event.mint,
@@ -619,6 +906,7 @@ export class Engine {
       });
       return;
     }
+    snapshot = snapshot!;
     const cost = conservativeCostBps(amount, BigInt(sell.minOutAmount), 20_000n);
     const feature = this.feature(event, snapshot, cost);
     if (feature.observations >= 3 && this.launches.has(event.mint))
@@ -626,7 +914,11 @@ export class Engine {
     const safety = checkTokenSafety(snapshot.evidence);
     this.snapshots.set(event.mint, snapshot);
     if (this.snapshots.size > 500) this.snapshots.delete(this.snapshots.keys().next().value!);
-    await this.capture(event, feature, snapshot, buy, sell);
+    await this.capture(event, feature, snapshot, buy, sell, slippageBps);
+    if (this.researchPaperRunner && deadlineAt !== undefined && !executionReasons.length)
+      await this.enrollResearchPaper(event, feature, snapshot, buy, sell, deadlineAt);
+    // Research quotes cannot enqueue strict-book orders. Its existing positions/exits retain their original kernel.
+    if (deadlineAt !== undefined) return;
     for (const d of evaluateStrategies(feature)) {
       const reasons = [
         ...d.reasons,
@@ -663,12 +955,99 @@ export class Engine {
       }
     }
   }
+  private async enrollResearchPaper(
+    event: ChainEvent,
+    feature: ReturnType<typeof featuresAt>,
+    snapshot: SecuritySnapshot,
+    buy: Quote,
+    sell: Quote,
+    deadlineAt: number,
+  ) {
+    const runner = this.researchPaperRunner!,
+      availability = this.eventAvailability.get(event.id);
+    if (
+      !availability ||
+      !snapshot.mintAccountCapture ||
+      this.stopped ||
+      this.killed() ||
+      Date.now() >= deadlineAt
+    )
+      return;
+    // Normalize BigInts to their exact JSON strings before durable canonical comparison.
+    const original = JSON.parse(
+      json({
+        schemaVersion: 1,
+        scope: "ENGINE_RESEARCH_ORIGINAL_DECISION_NOT_FILL",
+        sourceHash: this.sourceVersion,
+        bookId: runner.manifest.bookId,
+        policyHash: runner.manifest.policy.manifestHash,
+        runHash: runner.manifest.manifestHash,
+        eventId: event.id,
+        receivedAt: event.receivedAt,
+        ...availability,
+        decisionAt: feature.asOf,
+        features: structuredClone(feature),
+        costObservedAt: sell.observedAt,
+        creatorBehaviorObservedAt: feature.asOf,
+        security: structuredClone(snapshot.evidence),
+        mintAccountCapture: snapshot.mintAccountCapture,
+        initialQuoteEvidence: {
+          slippageBps: 25,
+          amountLamports: runner.manifest.policy.entryLamports,
+          buy: structuredClone(buy),
+          sell: structuredClone(sell),
+        },
+      }),
+    );
+    const hash = createHash("sha256").update(captureCanonical(original)).digest("hex");
+    const captureId = `engine:${hash}`,
+      key = `research-decision:${captureId}`;
+    try {
+      await this.store.exec(
+        "INSERT INTO phantom_state(id,payload,updated_at) VALUES($1,$2::jsonb,$3) ON CONFLICT DO NOTHING",
+        [key, json(original), feature.asOf],
+      );
+      if (captureCanonical(await this.store.get(key)) !== captureCanonical(original))
+        throw Error("RESEARCH_CAPTURE_IDENTITY_CONFLICT");
+    } catch {
+      await this.latchSuspension("RESEARCH_ORIGINAL_DECISION_DURABILITY_UNCERTAIN");
+      return;
+    }
+    if (this.stopped || this.killed() || Date.now() >= deadlineAt) return;
+    try {
+      await this.withResearchBook(() =>
+        runner.enroll({
+          captureId,
+          sourceObservedAt: availability.publishedAt,
+          decisionAt: feature.asOf,
+          features: structuredClone(feature),
+          security: structuredClone(snapshot.evidence),
+          mintAccountCapture: snapshot.mintAccountCapture,
+        }),
+      );
+    } catch (error) {
+      if (runner.suspended) await this.latchSuspension("RESEARCH_BOOK_RESTORE_REQUIRED");
+      else
+        await this.decision({
+          at: Date.now(),
+          mint: event.mint,
+          strategy: "research_paper",
+          accepted: false,
+          reasons: [
+            error instanceof Error && /^[A-Z_0-9]+$/.test(error.message)
+              ? error.message
+              : "RESEARCH_ORIGINAL_DECISION_REJECTED",
+          ],
+        });
+    }
+  }
   private async capture(
     event: ChainEvent,
     feature: ReturnType<typeof featuresAt>,
     snapshot: SecuritySnapshot,
     buy: Quote,
     sell: Quote,
+    slippageBps = 100,
   ) {
     const toReplay = (q: Quote) =>
       q.impactBps == null
@@ -688,7 +1067,7 @@ export class Engine {
       regime: "unclassified",
       features: flattenReplayFeatures(feature, snapshot.evidence, {
         now: at,
-        slippageBps: 100,
+        slippageBps,
         killSwitch: this.ledger.state.killSwitch,
         consecutiveFailures: this.ledger.state.failures,
       }),
@@ -706,11 +1085,46 @@ export class Engine {
     this.ledger.state.killSwitch = this.killed();
     this.managingPositions = true;
     try {
+      if (this.researchPaperRunner && !this.researchPaperRunner.suspended) {
+        if (this.killed()) await this.researchPaperRunner.latchEmergencyStop("ENGINE_KILL_SWITCH");
+        await this.withResearchBook(() =>
+          this.researchPaperRunner!.step({
+            allowEntryQuotes: false,
+            allowPassiveMarks: false,
+            allowExitQuotes: false,
+          }),
+        );
+      }
+      if (!(await this.workerLeaseAvailable())) return;
       await this.managePositions();
+      if (this.researchPaperRunner && !this.researchPaperRunner.suspended) {
+        if (this.killed()) await this.researchPaperRunner.latchEmergencyStop("ENGINE_KILL_SWITCH");
+        await this.withResearchBook(() =>
+          this.researchPaperRunner!.step({ allowEntryQuotes: false, allowPassiveMarks: false }),
+        );
+      }
     } finally {
       this.managingPositions = false;
     }
     if (this.stopped || !(await this.workerLeaseAvailable())) return;
+    if (this.researchPaperRunner && !this.researchPaperRunner.suspended && !this.killed()) {
+      const account = this.researchPaperRunner.accountState();
+      if (
+        !this.researchPaperRunner.snapshot().ledger.killSwitch &&
+        (account.openPositions || account.pendingEntries)
+      )
+        await this.quoteResearch.externalTurn(15_000, async (deadlineAt) => {
+          await this.withResearchBook(async () => {
+            if (!(await this.researchCapturesReady())) return;
+            if (this.stopped || this.killed() || Date.now() + 12_000 >= deadlineAt) return;
+            this.store.assertWorkerLease();
+            await this.researchPaperRunner!.step({
+              allowEntryQuotes: true,
+              allowPassiveMarks: true,
+            });
+          });
+        });
+    }
     for (const order of [...this.ledger.state.pending]) {
       if (Date.now() < order.readyAt) continue;
       let settled = false;
@@ -814,7 +1228,9 @@ export class Engine {
     // Persist every price-independent intent before the first provider await.
     // One slow position must not postpone another position's delay clock.
     for (const position of this.ledger.state.positions) {
-      const previous = this.ledger.state.pendingExits.find((exit) => exit.positionId === position.id);
+      const previous = this.ledger.state.pendingExits.find(
+        (exit) => exit.positionId === position.id,
+      );
       const required = this.ledger.queueRequiredExit(
         position,
         Date.now(),
@@ -911,6 +1327,9 @@ export class Engine {
     this.suspensionReason = reason;
     this.ledger.state.killSwitch = true;
     this.ledger.governor.kill();
+    const researchStop = this.researchPaperRunner?.latchEmergencyStop(reason).catch(() => {
+      this.fail("RESEARCH_STOP_DURABILITY_UNCERTAIN");
+    });
     this.fail(reason);
     try {
       mkdirSync(dirname(this.killFile), { recursive: true });
@@ -923,6 +1342,7 @@ export class Engine {
     try {
       await this.store.save("suspension", { reason, at: Date.now() });
     } catch {}
+    await researchStop;
   }
   private async persistLedger() {
     const save = this.ledgerSaves
@@ -1000,6 +1420,39 @@ export class Engine {
       },
     };
   }
+  private researchPaperState() {
+    const runner = this.researchPaperRunner;
+    if (!runner) return null;
+    const snapshot = runner.snapshot(),
+      account = runner.accountState(),
+      now = Date.now();
+    const status = runner.suspended
+      ? "SUSPENDED"
+      : snapshot.ledger.killSwitch
+        ? "ENTRY_STOPPED"
+        : now < runner.manifest.enrollmentStart
+          ? "WAITING_ENROLLMENT"
+          : now >= runner.manifest.enrollmentEnd
+            ? "ENROLLMENT_CLOSED"
+            : "ACTIVE";
+    return {
+      status,
+      account,
+      manifest: runner.manifest,
+      positions: snapshot.ledger.positions,
+      pending: snapshot.ledger.pending,
+      pendingExits: snapshot.ledger.pendingExits,
+      journal: snapshot.journal.slice(-200),
+      trades: snapshot.ledger.trades.slice(-1000),
+      completedPositions: aggregateCompletedPositions(snapshot.ledger.trades),
+      limitations: [
+        "Experimental PAPER only; strict policy eligibility and live approval are false.",
+        "Creator associations remain unverified; a position may lose 100%.",
+        "Quotes are minimum-output accounting models; fees are modeled and rent/failed-chain costs are excluded.",
+        "Journal and trade views are bounded tails; durable source history is retained separately.",
+      ],
+    };
+  }
   state() {
     const latency = [...this.latencies].sort((a, b) => a - b);
     this.health.latencyMs = {
@@ -1060,6 +1513,7 @@ export class Engine {
       cashLamports: l.cashLamports,
       pending: l.pending,
       research: this.quoteResearch?.status() ?? null,
+      researchPaper: this.researchPaperState(),
       forwardResearch: this.forwardRuntime
         ? {
             experimentId: this.forwardRuntime.protocol.experimentId,
@@ -1075,6 +1529,9 @@ export class Engine {
   }
   async stop() {
     this.stopped = true;
+    const paperStop = this.researchPaperRunner?.latchEmergencyStop("ENGINE_STOP").catch(() => {
+      this.fail("RESEARCH_STOP_DURABILITY_UNCERTAIN");
+    });
     this.ledger.governor.kill();
     if (this.timer) clearInterval(this.timer);
     if (this.researchTimer) clearInterval(this.researchTimer);
@@ -1083,6 +1540,8 @@ export class Engine {
       await this.work;
       await this.tickWork;
       await this.researchWork;
+      await this.researchBookWork;
+      await paperStop;
       while (this.walletJobs.size) await new Promise((r) => setTimeout(r, 100));
       await this.quoteResearch.idle();
       await this.forwardRuntime?.idle();

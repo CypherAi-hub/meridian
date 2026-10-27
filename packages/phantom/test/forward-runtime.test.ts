@@ -8,12 +8,14 @@ import {
   FORWARD_SCOPE,
   FORWARD_WSOL,
   freezeForwardProtocol,
+  forwardHash,
   type ForwardProbe,
   type ForwardRecord,
 } from "../src/forward-cohort.ts";
 import {
   FORWARD_ACTIVE_STATE_KEY,
   ForwardRuntime,
+  forwardRetirementStateKey,
   type ForwardRuntimeStore,
 } from "../src/forward-runtime.ts";
 
@@ -61,6 +63,9 @@ class MemoryStore implements ForwardRuntimeStore {
   healthy = true;
   loseProtocolAck = false;
   losePointerWrite = false;
+  loseRetirementAck = false;
+  loseRetirementRecoveryRead = false;
+  failProtocolBeforeWrite = false;
   writes = 0;
   assertWorkerLease() {
     if (!this.healthy) throw Error("PHANTOM_WORKER_LEASE_LOST");
@@ -69,6 +74,10 @@ class MemoryStore implements ForwardRuntimeStore {
     this.assertWorkerLease();
     if (sql.includes("CREATE TABLE IF NOT EXISTS phantom_forward_protocols")) return;
     if (sql.startsWith("INSERT INTO phantom_forward_protocols")) {
+      if (this.failProtocolBeforeWrite) {
+        this.failProtocolBeforeWrite = false;
+        throw Error("SYNTHETIC_PROTOCOL_NOT_WRITTEN");
+      }
       this.writes++;
       if (!this.protocols.has(String(args[0])))
         this.protocols.set(String(args[0]), JSON.parse(String(args[1])));
@@ -86,6 +95,19 @@ class MemoryStore implements ForwardRuntimeStore {
       );
       if (!this.protocols.has(row.experimentId)) throw Error("SYNTHETIC_FOREIGN_KEY");
       if (!this.records.has(row.id) && !duplicatePhase) this.records.set(row.id, row);
+      return;
+    }
+    if (
+      sql ===
+      "INSERT INTO phantom_state(id,payload,updated_at) VALUES($1,$2::jsonb,$3) ON CONFLICT(id) DO NOTHING"
+    ) {
+      this.writes++;
+      if (!this.state.has(String(args[0])))
+        this.state.set(String(args[0]), JSON.parse(String(args[1])));
+      if (this.loseRetirementAck) {
+        this.loseRetirementAck = false;
+        throw Error("SYNTHETIC_RETIREMENT_ACK_LOST");
+      }
       return;
     }
     throw Error(`Unexpected fixture SQL: ${sql}`);
@@ -110,6 +132,14 @@ class MemoryStore implements ForwardRuntimeStore {
   }
   async get(id: string) {
     this.assertWorkerLease();
+    if (
+      this.loseRetirementRecoveryRead &&
+      id.startsWith("forward-runtime-retirement-v1:") &&
+      this.state.has(id)
+    ) {
+      this.loseRetirementRecoveryRead = false;
+      throw Error("SYNTHETIC_RETIREMENT_READ_ACK_LOST");
+    }
     return structuredClone(this.state.get(id) ?? null);
   }
   async save(id: string, value: unknown) {
@@ -127,11 +157,13 @@ const create = (
   clock: { now: number },
   source = SOURCE_A,
   commit = COMMIT,
+  retireInterruptedEpoch = false,
 ) =>
   new ForwardRuntime(store, {
     runtimeSourceVersion: source,
     sourceCommit: commit,
     now: () => clock.now,
+    retireInterruptedEpoch,
   });
 
 async function enrollmentAndIntent(
@@ -165,6 +197,202 @@ async function enrollmentAndIntent(
 }
 
 describe("durable forward runtime (synthetic contract fixtures)", () => {
+  it("refuses changed sources by default before target manifests, retirement or provider recovery", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    await enrollmentAndIntent(store, first, clock);
+    const original = await first.export(),
+      pointer = await store.get(FORWARD_ACTIVE_STATE_KEY);
+    clock.now = 38000;
+    await expect(create(store, clock, SOURCE_B).initialize()).rejects.toThrow(
+      "SOURCE_CHANGE_REQUIRES_RETIREMENT",
+    );
+    expect(store.protocols.size).toBe(1);
+    expect(await store.get(FORWARD_ACTIVE_STATE_KEY)).toEqual(pointer);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toBeNull();
+    expect((await first.export()).records).toEqual(original.records);
+    expect(store.records.size).toBe(2); // No interrupted-request result is invented for the old epoch.
+  });
+
+  it("durably labels the old epoch incomplete, binds its original journal/bounds, and refuses rollback", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    await enrollmentAndIntent(store, first, clock);
+    const before = await first.export();
+    clock.now = 38000;
+    const next = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
+    const old = await next.export(first.protocol.experimentId),
+      retirement = old.retirement!;
+    expect(retirement).toMatchObject({
+      schemaVersion: 1,
+      status: "INCOMPLETE",
+      reason: "SOURCE_CHANGED",
+      cutoffAt: 38000,
+      oldExperimentId: first.protocol.experimentId,
+      oldRuntimeSourceVersion: SOURCE_A,
+      oldConfigurationHash: first.protocol.configurationHash,
+      originalEnrollmentStart: first.protocol.enrollmentStart,
+      originalEnrollmentEnd: first.protocol.enrollmentEnd,
+      newExperimentId: next.protocol.experimentId,
+      newRuntimeSourceVersion: SOURCE_B,
+      journalRecordCount: 2,
+      journalCanonicalSha256: forwardHash(before.records),
+      targetProtocol: next.protocol,
+    });
+    expect(Object.isFrozen(retirement)).toBe(true);
+    expect(old.protocol).toEqual(before.protocol);
+    expect(old.records).toEqual(before.records);
+    const history = await next.history();
+    expect(history[0]).toMatchObject({ active: false, retirement });
+    expect(history[1]).toMatchObject({ active: true });
+    const writes = store.writes;
+    await expect(create(store, clock, SOURCE_A, COMMIT, true).initialize()).rejects.toThrow(
+      "EPOCH_RETIRED",
+    );
+    expect(store.writes).toBe(writes);
+    expect(store.records.size).toBe(2);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toEqual(
+      retirement,
+    );
+  });
+
+  it("reuses original retirement and target protocol after a crash before pointer replacement", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    await enrollmentAndIntent(store, first, clock);
+    clock.now = 38000;
+    store.losePointerWrite = true;
+    await expect(create(store, clock, SOURCE_B, COMMIT, true).initialize()).rejects.toThrow(
+      "CRASH_BEFORE_POINTER",
+    );
+    const retirement = (await store.get(
+      forwardRetirementStateKey(first.protocol.experimentId),
+    )) as any;
+    expect(retirement.cutoffAt).toBe(38000);
+    expect(((await store.get(FORWARD_ACTIVE_STATE_KEY)) as any).runtimeSourceVersion).toBe(
+      SOURCE_A,
+    );
+    // Retirement alone forbids old-source recovery, even while its pointer remains.
+    await expect(create(store, clock).initialize()).rejects.toThrow("EPOCH_RETIRED");
+    await expect(create(store, clock, "d".repeat(64), COMMIT, true).initialize()).rejects.toThrow(
+      "RETIREMENT_TARGET_MISMATCH",
+    );
+    clock.now += 80 * 3_600_000;
+    await expect(create(store, clock, SOURCE_B).initialize()).rejects.toThrow(
+      "SOURCE_CHANGE_REQUIRES_RETIREMENT",
+    );
+    const recovered = await create(store, clock, SOURCE_B, "e".repeat(40), true).initialize();
+    expect(recovered.protocol).toEqual(retirement.targetProtocol);
+    expect(recovered.protocol.frozenAt).toBe(38000);
+    expect(recovered.protocol.sourceCommit).toBe(COMMIT);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toEqual(
+      retirement,
+    );
+    expect(
+      (await recovered.export(first.protocol.experimentId)).records.map((r) => r.phase),
+    ).toEqual(["ENROLLMENT", "ENTRY_REQUEST"]);
+  });
+
+  it("does not open a new enrollment window when retirement committed before a failed target manifest write", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    clock.now = 6000;
+    store.failProtocolBeforeWrite = true;
+    await expect(create(store, clock, SOURCE_B, COMMIT, true).initialize()).rejects.toThrow(
+      "PROTOCOL_NOT_WRITTEN",
+    );
+    const retirement = (await store.get(
+      forwardRetirementStateKey(first.protocol.experimentId),
+    )) as any;
+    expect(store.protocols.size).toBe(1);
+    expect(retirement.targetProtocol.frozenAt).toBe(6000);
+    clock.now = 9000;
+    const next = await create(store, clock, SOURCE_B, "d".repeat(40), true).initialize();
+    expect(next.protocol).toEqual(retirement.targetProtocol);
+    expect(next.protocol.enrollmentStart).toBe(7000);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toEqual(
+      retirement,
+    );
+  });
+
+  it("reconciles lost retirement and target-manifest acknowledgements without replacing original clocks", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    clock.now = 6000;
+    store.loseRetirementAck = true;
+    store.loseProtocolAck = true;
+    const next = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
+    expect(next.protocol.frozenAt).toBe(6000);
+    expect((await next.export(first.protocol.experimentId)).retirement?.cutoffAt).toBe(6000);
+    expect(
+      [...store.state.keys()].filter((key) => key.startsWith("forward-runtime-retirement-v1:")),
+    ).toHaveLength(1);
+    clock.now = 8000;
+    const restarted = await create(store, clock, SOURCE_B).initialize();
+    expect(restarted.protocol).toEqual(next.protocol);
+    expect((await restarted.export(first.protocol.experimentId)).retirement?.cutoffAt).toBe(6000);
+  });
+
+  it("recovers an ambiguously acknowledged retirement on a later restart without resetting its target window", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    clock.now = 6000;
+    store.loseRetirementAck = true;
+    store.loseRetirementRecoveryRead = true;
+    await expect(create(store, clock, SOURCE_B, COMMIT, true).initialize()).rejects.toThrow(
+      "RETIREMENT_READ_ACK_LOST",
+    );
+    const original = (await store.get(
+      forwardRetirementStateKey(first.protocol.experimentId),
+    )) as any;
+    expect(store.protocols.size).toBe(1);
+    clock.now = 9000;
+    const next = await create(store, clock, SOURCE_B, "d".repeat(40), true).initialize();
+    expect(next.protocol).toEqual(original.targetProtocol);
+    expect(next.protocol.frozenAt).toBe(6000);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toEqual(
+      original,
+    );
+  });
+
+  it("does not use a malformed source-bearing pointer to bypass retirement authorization", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    await store.save(FORWARD_ACTIVE_STATE_KEY, {
+      version: 1,
+      experimentId: first.protocol.experimentId,
+      runtimeSourceVersion: SOURCE_A,
+    });
+    await expect(create(store, clock, SOURCE_B).initialize()).rejects.toThrow(
+      "ACTIVE_POINTER_INVALID",
+    );
+    expect(store.protocols.size).toBe(1);
+    expect(await store.get(forwardRetirementStateKey(first.protocol.experimentId))).toBeNull();
+  });
+
+  it("fails closed when an external writer changes journal bytes behind a retirement fingerprint", async () => {
+    const store = new MemoryStore(),
+      clock = { now: 1000 };
+    const first = await create(store, clock).initialize();
+    clock.now = 5000;
+    await first.collector.considerProbe(probe());
+    clock.now = 6000;
+    const next = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
+    const row = [...store.records.values()][0];
+    store.records.set(row.id, { ...row, data: { ...row.data, externalMutation: true } });
+    await expect(next.export(first.protocol.experimentId)).rejects.toThrow(
+      "RETIRED_JOURNAL_CHANGED",
+    );
+    await expect(next.history()).rejects.toThrow("RETIRED_JOURNAL_CHANGED");
+  });
+
   it("reuses the original manifest, commit and closed enrollment on same-source restart", async () => {
     const store = new MemoryStore(),
       clock = { now: 1000 };
@@ -231,7 +459,7 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
     await a.collector.considerProbe(probe());
     const oldExport = await a.export();
     clock.now = 6000;
-    const b = await create(store, clock, SOURCE_B).initialize();
+    const b = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
     expect(b.protocol.experimentId).not.toBe(a.protocol.experimentId);
     expect((await b.history()).map((p) => p.active)).toEqual([false, true]);
     expect((await b.export(a.protocol.experimentId)).records).toEqual(oldExport.records);
@@ -272,7 +500,7 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
     const first = await create(store, clock).initialize();
     await enrollmentAndIntent(store, first, clock);
     clock.now = 38000;
-    const current = await create(store, clock, SOURCE_B).initialize();
+    const current = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
     const writes = store.writes;
     const result = await current.export(first.protocol.experimentId);
     expect(result.records.map((r) => r.phase)).toEqual(["ENROLLMENT", "ENTRY_REQUEST"]);
@@ -330,7 +558,9 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
         experimentId: id,
       }),
     );
-    await expect(create(store, clock, SOURCE_B).initialize()).rejects.toThrow("SOURCE_MISMATCH");
+    await expect(create(store, clock, SOURCE_B, COMMIT, true).initialize()).rejects.toThrow(
+      "SOURCE_MISMATCH",
+    );
     await expect(first.collector.nextQuoteWindow()).rejects.toThrow("SUPERSEDED");
     expect(store.protocols.size).toBe(2);
   });
@@ -365,7 +595,7 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
     });
     await entered;
     let switched = false;
-    const initializing = create(store, clock, SOURCE_B)
+    const initializing = create(store, clock, SOURCE_B, COMMIT, true)
       .initialize()
       .then((b) => {
         switched = true;
@@ -373,12 +603,19 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
       });
     await Promise.resolve();
     expect(switched).toBe(false);
+    expect(await store.get(forwardRetirementStateKey(a.protocol.experimentId))).toBeNull();
+    clock.now = 38000;
     release();
     await tick;
     const b = await initializing;
     expect(b.protocol.runtimeSourceVersion).toBe(SOURCE_B);
     await expect(a.collector.nextQuoteWindow()).rejects.toThrow("SUPERSEDED");
     expect((await b.export(a.protocol.experimentId)).records).toHaveLength(3);
+    expect((await b.export(a.protocol.experimentId)).retirement).toMatchObject({
+      cutoffAt: 38000,
+      journalRecordCount: 3,
+      journalCanonicalSha256: forwardHash((await b.export(a.protocol.experimentId)).records),
+    });
   });
 
   it("uses real fenced temporary PGlite SQL and preserves manifests/history across close and reopen", async () => {
@@ -401,10 +638,22 @@ describe("durable forward runtime (synthetic contract fixtures)", () => {
       const restarted = await create(store, clock).initialize();
       expect(restarted.protocol).toEqual(protocol);
       expect((await restarted.export()).records).toHaveLength(1);
-      const changed = await create(store, clock, SOURCE_B).initialize();
+      const changed = await create(store, clock, SOURCE_B, COMMIT, true).initialize();
       expect(await changed.history()).toHaveLength(2);
       expect((await changed.export(protocol.experimentId)).records).toHaveLength(1);
       expect(await store.get("ledger")).toEqual({ cashLamports: "17", syntheticSentinel: true });
+      const retirement = (await changed.export(protocol.experimentId)).retirement;
+      const target = changed.protocol;
+      await store.close();
+      store = undefined;
+      clock.now += 1000;
+      store = await new Store().open(undefined, dir, true);
+      const resumed = await create(store, clock, SOURCE_B).initialize();
+      expect(resumed.protocol).toEqual(target);
+      expect((await resumed.export(protocol.experimentId)).retirement).toEqual(retirement);
+      await expect(create(store, clock, SOURCE_A, COMMIT, true).initialize()).rejects.toThrow(
+        "EPOCH_RETIRED",
+      );
     } finally {
       await store?.close();
       // Delete only the exact dedicated mkdtemp child created by this test.

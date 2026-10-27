@@ -175,7 +175,50 @@ export class QuoteResearchCollector {
       forwardReservationDeferrals: this.forwardDeferrals,
       recoveredForwardProbes: this.recoveredForwardProbes,
       scope: "QUOTE_ONLY_NO_LEDGER_OR_TRADE_AUTHORITY",
+      externalTurnReserved: this.externalTurnReserved,
     };
+  }
+  private externalTurnReserved = false;
+  private externalIdle: Promise<void> | null = null;
+  /** Share the existing durable research turn budget; never jump an upcoming cohort turn. */
+  async externalTurn<T>(
+    maximumDurationMs: number,
+    work: (deadlineAt: number) => Promise<T>,
+  ): Promise<{ reserved: true; value: T } | { reserved: false }> {
+    if (
+      !Number.isSafeInteger(maximumDurationMs) ||
+      maximumDurationMs < 1 ||
+      maximumDurationMs > 60_000
+    )
+      throw Error("EXTERNAL_RESEARCH_TURN_BUDGET_INVALID");
+    if (this.active || this.externalTurnReserved) return { reserved: false };
+    // Acquire synchronously before the first await so sample/tick cannot race this reservation.
+    this.externalTurnReserved = true;
+    let release!: () => void;
+    this.externalIdle = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await this.initialize();
+      await this.recoverForwardProbes();
+      const window = await this.forwardWindow(),
+        now = Date.now();
+      if (
+        !this.canResearch() ||
+        !this.eligible(now) ||
+        this.due(now) ||
+        (window && now + Math.max(this.intervalMs, maximumDurationMs) >= window.dueAt)
+      )
+        return { reserved: false };
+      await this.reserve(now);
+      const deadlineAt = now + maximumDurationMs;
+      if (Date.now() >= deadlineAt) return { reserved: false };
+      return { reserved: true, value: await work(deadlineAt) };
+    } finally {
+      this.externalTurnReserved = false;
+      release();
+      this.externalIdle = null;
+    }
   }
   /** Only explicitly tagged prospective probes are recovered. Old untagged history
    * is never enrolled. Expired probes become explicit rejections, not new entries. */
@@ -259,7 +302,8 @@ export class QuoteResearchCollector {
   }
   /** Existing baseline sampling API. Due horizons take priority over adding new watches. */
   sample(event: ChainEvent, provider: QuoteProvider, amount = 10_000_000n) {
-    if (this.active || event.mint === WSOL || event.quoteMint !== WSOL) return;
+    if (this.active || this.externalTurnReserved || event.mint === WSOL || event.quoteMint !== WSOL)
+      return;
     return this.start(async () => {
       await this.initialize();
       await this.recoverForwardProbes();
@@ -289,7 +333,7 @@ export class QuoteResearchCollector {
   }
   /** Process one due horizon per call, using the original hypothetical baseline quantity. */
   async tick(provider: QuoteProvider): Promise<void> {
-    if (this.active) return;
+    if (this.active || this.externalTurnReserved) return;
     await this.start(async () => {
       await this.initialize();
       await this.recoverForwardProbes();
@@ -535,6 +579,7 @@ export class QuoteResearchCollector {
   }
   async idle() {
     await this.active;
+    await this.externalIdle;
     await this.forward?.idle();
   }
 }

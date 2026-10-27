@@ -1,0 +1,13 @@
+# Forward source-epoch retirement
+
+This is a future-runtime contract. It does not deploy or restart a worker, approve paper entries, or change any ledger, trading policy, existing protocol, enrollment, journal record, or outcome.
+
+`ForwardRuntime` defaults `retireInterruptedEpoch` to `false`. A different source from the durable active pointer is refused before creating the target manifest or initializing its collector. Same-source restarts reuse the original manifest and enrollment window without retirement. A rejected replacement also supersedes the old in-memory owner, preserving the existing fail-closed ownership behavior.
+
+Explicit `retireInterruptedEpoch: true` records the old epoch as `INCOMPLETE` with reason `SOURCE_CHANGED`. The immutable record lives in `phantom_state` under `forward-runtime-retirement-v1:<old experiment ID>` and uses `INSERT ... ON CONFLICT DO NOTHING` followed by exact read verification. It contains the original enrollment bounds, source/configuration identities, cutoff, canonical old-journal SHA-256 and row count, and the frozen target protocol. The hash checks consistency of saved local evidence; it is not provider attestation or evidence of complete market coverage.
+
+The shared Store-object lane waits for existing runtime quote work before taking the cutoff. All runtime consumers must use that same fenced Store object and the guarded collector facade. The retirement marker precedes target-manifest creation and active-pointer replacement. A retry after an ambiguous write adopts the original marker and target protocol, including commit and enrollment window. If the old pointer remains, retrying the source change still requires the explicit option. An alternate target is refused. A retired epoch can never be activated or initialized to recover, retry, or backfill its old quote requests.
+
+`history()` and `export()` expose an optional `retirement` object. A retired history entry has `active: false`, even if a failed transition left the old pointer. Its manifest, journal and existing outcomes remain unchanged; interrupted requests remain interrupted. Historical reads verify the original journal count/hash and refuse changed evidence. New-source recovery never constructs an old-source collector.
+
+The marker is immutable through this runtime API, not against an external writer with database privileges. Future Engine integration must preserve the default closed option, worker fencing, publication barriers and source provenance. The synthetic tests use isolated temporary PGlite; they do not establish provider performance or authorize a live rollout.

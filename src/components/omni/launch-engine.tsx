@@ -21,6 +21,7 @@ import {
 import { WSOL } from "@/lib/desk/schema";
 import type { TerminalToken } from "@/lib/desk/terminal-market";
 import { MarketChart } from "./market-chart";
+import { ExperimentalPaperBook } from "./experimental-paper-book";
 
 const short = (v: string) => v.slice(0, 6) + "…" + v.slice(-5);
 const age = (at: number | null | undefined, now: number) =>
@@ -148,7 +149,10 @@ export function LaunchEngine({
           <h1>
             Watch the chain<span>.</span>
           </h1>
-          <p>Observed chain activity, recorded signals, and a separate paper account.</p>
+          <p>
+            Observed chain activity, recorded signals, and distinct strict-policy and experimental
+            paper books.
+          </p>
         </div>
         <div className="omni-live-heading-right">
           <span className={"omni-live-status " + (status === "live" ? "running" : "waiting")}>
@@ -177,12 +181,12 @@ export function LaunchEngine({
           <p>{count(health?.backfillGaps)} reported coverage gaps</p>
         </div>
         <div>
-          <span>Launch-engine positions</span>
+          <span>Strict-policy paper positions</span>
           <strong>
             {count(state?.positionCount)}
             <small> open · {count(state?.pendingCount)} queued</small>
           </strong>
-          <p>Simulated inventory · separate SOL account</p>
+          <p>Strict-policy SOL book · simulated inventory</p>
         </div>
         <div>
           <span>Completed position net</span>
@@ -210,6 +214,13 @@ export function LaunchEngine({
           </span>
         </div>
       )}
+      <ExperimentalPaperBook
+        book={display?.researchPaper}
+        availability={display?.researchPaperStatus}
+        fresh={fresh && !frozen}
+        now={state && receivedAt ? state.now + Math.max(0, now - receivedAt) : now}
+        onSelect={onSelect}
+      />
       <div className="omni-live-layout">
         <section className="omni-bot-feed omni-launch-feed" aria-label="Launch engine activity">
           <div className="omni-feed-heading">
@@ -627,7 +638,7 @@ export function LaunchEngine({
           </section>
           <section className="omni-launch-health">
             <div className="omni-launch-card-heading">
-              <h2>Launch-engine paper account</h2>
+              <h2>Strict-policy SOL paper book</h2>
               <ShieldCheck size={13} />
             </div>
             <dl>

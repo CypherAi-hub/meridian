@@ -71,6 +71,362 @@ function sample() {
     limitations: ["Synthetic contract fixture"],
   };
 }
+/** Entirely synthetic experimental monitoring contract, not a market or execution fixture. */
+function experimental() {
+  return {
+    status: "ACTIVE",
+    account: {
+      bookId: "synthetic-experiment",
+      mode: "RESEARCH_PAPER",
+      strictPolicyEligible: false,
+      liveApproved: false,
+      associationScope: "UNKNOWN_ASSOCIATIONS_ACCEPTED_FOR_PAPER",
+      cashLamports: "1000000000",
+      reservedLamports: "0",
+      availableCashLamports: "1000000000",
+      equityLamports: "1000000000",
+      realizedPnlLamports: "0",
+      modeledSettledFeesLamports: "0",
+      openPositions: 0,
+      pendingEntries: 0,
+      pendingExits: 0,
+      sourceHash: "a".repeat(64),
+      policyHash: "b".repeat(64),
+      runHash: "c".repeat(64),
+      ledgerVersion: 1,
+      suspended: false,
+    },
+    manifest: {
+      kind: "RESEARCH_PAPER_RUN_V1",
+      mode: "RESEARCH_PAPER",
+      strictPolicyEligible: false,
+      liveApproved: false,
+      bookId: "synthetic-experiment",
+      enrollmentStart: T - 120000,
+      enrollmentEnd: T + 3600000,
+      manifestHash: "c".repeat(64),
+      economicProfileHash: "d".repeat(64),
+      exitProfileHash: "e".repeat(64),
+      settlementScope: "QUOTE_MINIMUM_MODEL_NOT_ATTAINABLE_FILL_CERTIFICATION",
+      feeScope: "10000_LAMPORTS_PER_SETTLED_LEG_MODEL_NOT_MEASURED",
+      priorityFeeScope: "INCLUDED_IN_FIXED_NETWORK_FEE_MODEL_NOT_MEASURED",
+      rentScope: "NO_TOKEN_ACCOUNT_CREATED_RENT_EXCLUDED_FROM_PAPER_MODEL",
+      failedAttemptScope: "NO_TRANSACTION_SUBMITTED_NO_ONCHAIN_FAILURE_FEE_MODELED",
+      policy: {
+        kind: "RESEARCH_PAPER_POLICY_V1",
+        version: 1,
+        strategy: "momentum_breakout",
+        associationScope: "UNKNOWN_ASSOCIATIONS_ACCEPTED_FOR_PAPER",
+        strictPolicyEligible: false,
+        liveApproved: false,
+        sourceHash: "a".repeat(64),
+        manifestHash: "b".repeat(64),
+        frozenAt: T - 180000,
+        entryLamports: "10000000",
+        initialCapitalLamports: "1000000000",
+        maximumPositions: 1,
+        networkFeePerLegLamports: "10000",
+        maximumQuoteAgeMs: 5000,
+        minimumEntryDelayMs: 2000,
+        maximumExecutionCostBps: 150,
+        slippageBps: 25,
+        sourceUniverse: "LEGACY_SPL_SOL_PAIRS_JUPITER_AGGREGATOR_QUOTES",
+      },
+    },
+    positions: [],
+    pending: [],
+    pendingExits: [],
+    journal: [],
+    trades: [],
+    completedPositions: [],
+    limitations: ["Synthetic monitoring fixture only"],
+  };
+}
+function researchState(book: unknown = experimental()) {
+  return { ...sample(), researchPaper: book };
+}
+function positionBook(): Record<string, any> {
+  const r: Record<string, any> = experimental();
+  r.account.cashLamports = "989990000";
+  r.account.availableCashLamports = "989990000";
+  r.account.openPositions = 1;
+  r.account.equityLamports = "998990000";
+  r.account.modeledSettledFeesLamports = "10000";
+  r.positions = [
+    {
+      id: "research:synthetic-experiment:capture:0",
+      mint,
+      strategy: "momentum_breakout",
+      quantityRaw: "1000",
+      costLamports: "10000000",
+      openedAt: T - 10000,
+      markLamports: "9000000",
+      markAt: T - 100,
+      entryFeeLamports: "10000",
+    },
+  ];
+  return r;
+}
+
+test("experimental paper is optional and legacy/null absence never becomes a zero-valued account", () => {
+  for (const value of [sample(), researchState(null)]) {
+    const r = parsePhantomState(value, T);
+    assert.equal(r.connection, "connected");
+    assert.equal(r.state!.researchPaperStatus, "absent");
+    assert.equal(r.state!.researchPaper, null);
+    assert.equal(r.state!.cashLamports, "1000000000");
+  }
+});
+
+test("experimental account has separate SOL balances, explicit non-approval and bounded frozen identities", () => {
+  const report = parsePhantomState(researchState(), T),
+    book = report.state!.researchPaper!;
+  assert.equal(report.state!.researchPaperStatus, "available");
+  assert.equal(book.account.mode, "RESEARCH_PAPER");
+  assert.equal(book.account.liveApproved, false);
+  assert.equal(book.account.strictPolicyEligible, false);
+  assert.equal(book.account.associationScope, "UNKNOWN_ASSOCIATIONS_ACCEPTED_FOR_PAPER");
+  assert.equal(book.account.equityLamports, "1000000000");
+  assert.equal(book.account.runHash, book.manifest.manifestHash);
+  const pending: Record<string, any> = experimental();
+  pending.pending = [
+    {
+      id: "research:synthetic-experiment:capture:0",
+      mint,
+      strategy: "momentum_breakout",
+      amountLamports: "10000000",
+      createdAt: T - 1500,
+      readyAt: T + 500,
+      eventId: "event:0",
+      slippageBps: 25,
+    },
+  ];
+  pending.account.pendingEntries = 1;
+  pending.account.reservedLamports = "10010000";
+  pending.account.availableCashLamports = "989990000";
+  assert.equal(
+    parsePhantomState(researchState(pending), T).state!.researchPaper!.account.reservedLamports,
+    "10010000",
+  );
+  // The strict-policy book remains independent of the experimental reservation.
+  assert.equal(parsePhantomState(researchState(pending), T).state!.cashLamports, "1000000000");
+});
+
+test("experimental unknown, stale, future or contradictory marks cannot certify fresh equity", () => {
+  assert.equal(
+    parsePhantomState(researchState(positionBook()), T).state!.researchPaper!.account
+      .equityLamports,
+    "998990000",
+  );
+  for (const change of [
+    { markLamports: null },
+    { markAt: null },
+    { markAt: T - 5001 },
+    { markAt: T + 1 },
+  ]) {
+    const r = positionBook();
+    Object.assign(r.positions[0], change);
+    const book = parsePhantomState(researchState(r), T).state!.researchPaper!;
+    assert.equal(book.account.equityLamports, null);
+    assert.equal(book.positions[0].markLamports, null);
+  }
+  const contradictory = positionBook();
+  contradictory.account.equityLamports = "999999999";
+  assert.equal(
+    parsePhantomState(researchState(contradictory), T).state!.researchPaper!.account.equityLamports,
+    null,
+  );
+  const unknown: Record<string, any> = experimental();
+  unknown.account.equityLamports = null;
+  assert.equal(
+    parsePhantomState(researchState(unknown), T).state!.researchPaper!.account.equityLamports,
+    null,
+  );
+});
+
+test("experimental malformed mode or identity is unavailable without poisoning the legacy strict account", () => {
+  for (const mutate of [
+    (r: any) => {
+      r.account.mode = "PAPER";
+    },
+    (r: any) => {
+      r.manifest.mode = "LIVE";
+    },
+    (r: any) => {
+      r.account.liveApproved = true;
+    },
+    (r: any) => {
+      r.manifest.policy.strictPolicyEligible = true;
+    },
+    (r: any) => {
+      r.account.bookId = "other-book";
+    },
+    (r: any) => {
+      r.account.sourceHash = "f".repeat(64);
+    },
+    (r: any) => {
+      r.account.policyHash = "f".repeat(64);
+    },
+    (r: any) => {
+      r.account.runHash = "f".repeat(64);
+    },
+    (r: any) => {
+      r.account.runHash = "not-a-hash";
+    },
+    (r: any) => {
+      r.account.associationScope = "VERIFIED";
+    },
+    (r: any) => {
+      r.manifest.policy.version = 2;
+    },
+  ]) {
+    const input = experimental();
+    mutate(input);
+    const parsed = parsePhantomState(researchState(input), T);
+    assert.equal(parsed.connection, "connected");
+    assert.equal(parsed.state!.researchPaperStatus, "invalid");
+    assert.equal(parsed.state!.researchPaper, null);
+    assert.equal(parsed.state!.cashLamports, "1000000000");
+    assert(parsed.state!.discardedRows > 0);
+  }
+});
+
+test("experimental raw amounts reject numeric coercion, decimals, exponents, signs and noncanonical zeros", () => {
+  for (const value of [1, "1.2", "1e9", "01", "+1", "-1", "9".repeat(41)]) {
+    const input: Record<string, any> = experimental();
+    input.account.cashLamports = value;
+    assert.equal(parsePhantomState(researchState(input), T).state!.researchPaperStatus, "invalid");
+  }
+  for (const value of ["-0", "-01", "1.2", 0]) {
+    const input: Record<string, any> = experimental();
+    input.account.realizedPnlLamports = value;
+    assert.equal(parsePhantomState(researchState(input), T).state!.researchPaperStatus, "invalid");
+  }
+  const large: Record<string, any> = experimental();
+  for (const key of ["cashLamports", "availableCashLamports", "equityLamports"])
+    large.account[key] = "18446744073709551615";
+  large.account.realizedPnlLamports = String(18446744073709551615n - 1000000000n);
+  assert.equal(
+    parsePhantomState(researchState(large), T).state!.researchPaper!.account.cashLamports,
+    "18446744073709551615",
+  );
+});
+
+test("experimental reservations, counts, identities and bounded journal must reconcile", () => {
+  for (const mutate of [
+    (r: any) => {
+      r.account.availableCashLamports = "999999999";
+    },
+    (r: any) => {
+      r.account.reservedLamports = "1";
+      r.account.availableCashLamports = "999999999";
+    },
+    (r: any) => {
+      r.account.openPositions = 1;
+    },
+    (r: any) => {
+      r.account.pendingExits = 1;
+    },
+    (r: any) => {
+      r.account.realizedPnlLamports = "1";
+    },
+    (r: any) => {
+      r.manifest.policy.maximumQuoteAgeMs = 30000;
+    },
+    (r: any) => {
+      r.journal = [
+        { sequence: 1, at: T, bookId: "other-book", kind: "ENTRY_INTENT", entryId: "entry:0" },
+      ];
+    },
+    (r: any) => {
+      r.journal = Array.from({ length: 201 }, (_, i) => ({
+        sequence: i + 1,
+        at: T,
+        bookId: r.account.bookId,
+        kind: "ENTRY_INTENT",
+        entryId: `entry:${i}`,
+      }));
+    },
+    (r: any) => {
+      r.positions = [positionBook().positions[0]];
+      r.positions[0].mint = "malformed";
+      r.account.openPositions = 1;
+    },
+  ]) {
+    const input = experimental();
+    mutate(input);
+    assert.equal(parsePhantomState(researchState(input), T).state!.researchPaperStatus, "invalid");
+  }
+});
+
+test("experimental realized legs remain modeled P&L and malformed accounting is refused", () => {
+  const input: Record<string, any> = experimental();
+  input.account.realizedPnlLamports = "-1020000";
+  input.account.cashLamports =
+    input.account.availableCashLamports =
+    input.account.equityLamports =
+      "998980000";
+  input.account.modeledSettledFeesLamports = "20000";
+  const trade = {
+    id: "exit:synthetic:0",
+    positionId: "research:synthetic-experiment:capture:0",
+    isFinalExit: true,
+    mint,
+    strategy: "momentum_breakout",
+    openedAt: T - 10000,
+    closedAt: T - 100,
+    costLamports: "10000000",
+    proceedsLamports: "9000000",
+    feesLamports: "20000",
+    pnlLamports: "-1020000",
+    quantityRaw: "1000",
+    reason: "STOP_LOSS",
+  };
+  input.trades = [trade];
+  input.completedPositions = [{ ...trade, exitLegs: 1, finalReason: "STOP_LOSS" }];
+  const parsed = parsePhantomState(researchState(input), T).state!.researchPaper!;
+  assert.equal(parsed.account.realizedPnlLamports, "-1020000");
+  assert.equal(parsed.completedPositions.length, 1);
+  input.trades[0].pnlLamports = "1";
+  assert.equal(parsePhantomState(researchState(input), T).state!.researchPaperStatus, "invalid");
+});
+
+test("experimental monitoring strips raw quote/config/transaction payloads and sanitizes visible limitations", () => {
+  const input: Record<string, any> = experimental();
+  input.account.apiKey = "DO_NOT_FORWARD";
+  input.manifest.secret = "DO_NOT_FORWARD";
+  input.manifest.policy.rpcUrl = "https://provider.invalid/?api-key=DO_NOT_FORWARD";
+  input.limitations = ["authorization=DO_NOT_FORWARD https://provider.invalid/private"];
+  input.journal = [
+    {
+      sequence: 1,
+      at: T,
+      bookId: input.account.bookId,
+      kind: "MARK_OBSERVED",
+      entryId: "research:synthetic-experiment:capture:0",
+      mark: {
+        quote: { route: ["DO_NOT_FORWARD"], transaction: "DO_NOT_FORWARD" },
+        feeLamports: "10000",
+      },
+    },
+  ];
+  const serialized = JSON.stringify(parsePhantomState(researchState(input), T));
+  assert(!serialized.includes("DO_NOT_FORWARD"));
+  assert(!serialized.includes("provider.invalid"));
+  assert(!serialized.includes('"mark"'));
+});
+
+test("experimental V2 source universe is explicitly identified and frozen snapshot clocks remain visible", () => {
+  const input = experimental();
+  input.manifest.policy.version = 2;
+  input.manifest.policy.kind = "RESEARCH_PAPER_POLICY_V2";
+  input.manifest.policy.sourceUniverse =
+    "LEGACY_SPL_AND_METADATA_ONLY_TOKEN_2022_SOL_PAIRS_JUPITER_AGGREGATOR_QUOTES";
+  const parsed = parsePhantomState(researchState(input), T + 20000);
+  assert.equal(parsed.status, "stale");
+  assert.equal(parsed.state!.researchPaperStatus, "available");
+  assert.equal(parsed.state!.researchPaper!.manifest.policy.version, 2);
+});
 test("launch bridge preserves degraded typed/full coverage and never counts observed buys as fills", () => {
   const r = parsePhantomState(sample(), T);
   assert.equal(r.connection, "connected");

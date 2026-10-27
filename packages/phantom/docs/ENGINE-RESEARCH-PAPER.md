@@ -1,0 +1,33 @@
+# Engine experimental paper book
+
+This integration is opt-in with `PHANTOM_RESEARCH_PAPER_ENABLED=true`. It has not been rolled out to the running worker. Synthetic operation tests and a production UI build do not establish market profitability or attainable fills. All real-money execution remains disabled.
+
+The enabled analysis path belongs to a separate V2 experimental momentum book. Its fixed entry is 10,000,000 lamports and its requested slippage is 25 basis points, regardless of the strict book's environment settings. Research quotes cannot enqueue strict-book orders. Existing strict inventory and pending orders retain their original accounting and protective management. The experimental exception explicitly accepts unknown creator associations for PAPER only; possible complete position loss, strict eligibility false and live approval false remain visible.
+
+## Prospective identity and original evidence
+
+On first initialization, Engine freezes the actual runtime source fingerprint, complete V2 policy and a separate run manifest before enrollment. Enrollment begins five seconds later and lasts 72 hours. The immutable active-manifest intent is acknowledged before initial book creation. Missing book state, orphan books, changed source identity or conflicting creation records stop initialization; they never create another capital balance. A graceful stop permanently closes that run's entry barrier. Reviewing a later run or source transition is an explicit operation, not removal of a stop file or an automatic capital reset.
+
+Only new full events with original transport receipt, true decode-completion and actual in-memory publication after enrollment may trigger a research decision. Restored events lacking original publication evidence remain in monitoring/history but cannot be newly admitted. This does not repair the separate historical reconstruction limitations of the old mutable trade cache.
+
+Security inspection completes first. Its raw mint request/response/publication timestamps remain unchanged. Engine then observes an actual fresh 25-basis-point buy and an exact-minimum-inventory paired sell, validates their source/router/RFQ/quantity/impact/minimum/freshness contract, and calculates the original decision cost. Original features are frozen after those observations; `costObservedAt` separately retains the sell response time. Delayed quotes never overwrite original features or costs.
+
+Before enrollment, an immutable, hash-linked `research-decision:engine:<sha256>` record retains the original pair, features, security, raw mint capture, receipt/decode/publication clocks and exact source/book/policy/run identities. Engine reads that record back before enrolling. Restore checks every referenced artifact; queued entries recheck theirs before provider work. Missing or contradictory evidence stops admission instead of reconstructing unavailable prices or timestamps. These are local consistency checks, not independent authentication of RPC/provider responses.
+
+## Shared provider scheduling and protection
+
+The runner uses the existing owning Engine Store and quote client. No second client or provider connection is created. `QuoteResearchCollector.externalTurn` synchronously excludes competing baseline/horizon work, spends the existing durable 30-second turn budget, and checks the next forward reservation using the greater of the entire spacing budget and the requested work budget. Shutdown waits for the held external turn. Protective exits retain priority over research work.
+
+A prospective decision turn permits up to four quotes: the original paired cost observation, then the delayed entry pair after the actual two-second minimum delay. This avoids postponing every fast decision until it is already expired. Before delayed work starts, Engine rechecks the deadline _inside_ its serialized book queue and leaves room for both existing six-second client deadlines. A late or interrupted turn cannot invent a fill. Passive marks and later entry attempts are turn-throttled; expired intents remain explicit cancellations.
+
+Every tick first performs the research provider-free protection pass, before either book's new provider work. Stops, max-hold requirements and entry expiration are persisted without waiting for strict-book quotes. Ready protective exits then remain permitted independently of passive/entry quote allowances. Missing exit quotes retain inventory, protective intent and unknown valuation. An enforced Store lease is checked around initial security/quote stages. Detected lease loss prevents further initial research quotes; this does not make an external provider call atomic with a database lease handoff.
+
+The stop callback observes Engine shutdown, kill controls and lease health before enrollment, after provider waits and immediately before entry mutation. Stop latching is synchronous before its first await. Book operations are serialized independently from external reservations. A stop arriving during a quote or the real execution delay cancels entry; clearing an external file does not silently unlatch the durable book.
+
+## Monitoring and verification limits
+
+`/state.researchPaper` and Omni expose the experimental SOL book separately from manual USDC and strict SOL balances: cash, reservations, available cash, fresh-or-unknown equity, modeled realized P&L/fees, inventory, intents, bounded journal/trade tails and source/policy/run hashes. Malformed experimental state becomes unavailable without replacing balances with zero or promoting strict approval. Unknown associations and fee/rent/failure-cost exclusions stay explicit.
+
+Source changes require explicit `PHANTOM_FORWARD_RETIRE_INCOMPLETE=true` for the forward epoch transition. The retirement record preserves the original cutoff, bounds, complete old journal fingerprint and exact target manifest. All old records and incomplete outcomes remain available. No existing frozen epoch was changed during local development.
+
+Engine tests use explicitly synthetic ABI-consistent callbacks, security and quote responses, actual isolated databases and loopback HTTP. They exercise the production Jupiter response validator and serialized one-second lane with advancing clocks and a real execution delay. Their modeled loss is a bookkeeping check, not market evidence. The UI production build and strict monitoring parser have separate checks. Windows visual inspection was blocked by Computer Use's inability to determine the browser URL confidently; it must not be described as verified or bypassed. The temporary, clearly labeled synthetic preview is outside production source.
