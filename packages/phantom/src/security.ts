@@ -33,6 +33,8 @@ type RpcAccount = {
 };
 type ContextValue<T> = { context: { slot: number }; value: T };
 export type SecurityEvidence = TokenSafetyEvidence & {
+  /** Earliest inspection request; publication must not renew the freshness TTL. */
+  evidenceRequestedAt: number;
   creatorAddress: string | null;
   directCreatorConcentrationBps: number | null;
   creatorConcentrationScope: "DIRECT_OWNER_AND_DELEGATE_ONLY";
@@ -48,7 +50,24 @@ export type SecuritySnapshot = {
   curveProgressBps: number | null;
   observedAt: number;
   warnings: string[];
+  /** Original account response, retained for a separate strict research decoder. */
+  mintAccountCapture?: ResearchMintAccountCapture;
 };
+export type ResearchMintAccountCapture = {
+  address: string;
+  owner: string;
+  dataBase64: string;
+  slot: number;
+  requestedAt: number;
+  observedAt: number;
+  publishedAt: number;
+};
+const MAX_CAPTURED_MINT_BYTES = 65_536;
+function captureClock(value: number) {
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0))
+    throw Error("SECURITY_CAPTURE_CLOCK_INVALID");
+  return value;
+}
 type PoolEvidence = {
   vaults: Set<string>;
   liquidityLamports: bigint;
@@ -68,7 +87,7 @@ function context(value: unknown, minSlot = 0): number {
     throw Error("RPC_CONTEXT_SLOT_INVALID_OR_BEHIND");
   return slot;
 }
-function info(account: RpcAccount): AccountInfo<Buffer> {
+function info(account: RpcAccount, maxDataBytes?: number): AccountInfo<Buffer> {
   if (
     !account ||
     typeof account.executable !== "boolean" ||
@@ -80,7 +99,11 @@ function info(account: RpcAccount): AccountInfo<Buffer> {
     typeof account.data[0] !== "string"
   )
     throw Error("INVALID_RPC_ACCOUNT");
+  if (maxDataBytes !== undefined && account.data[0].length > 4 * Math.ceil(maxDataBytes / 3))
+    throw Error("SECURITY_MINT_CAPTURE_TOO_LARGE");
   const data = Buffer.from(account.data[0], "base64");
+  if (maxDataBytes !== undefined && data.length > maxDataBytes)
+    throw Error("SECURITY_MINT_CAPTURE_TOO_LARGE");
   if (data.toString("base64") !== account.data[0]) throw Error("NONCANONICAL_ACCOUNT_BASE64");
   return {
     data,
@@ -104,14 +127,17 @@ export class SecurityReader {
     private readonly rpc: Rpc,
     private readonly clock: () => number = Date.now,
   ) {}
-  private async account(address: PublicKey, minSlot: number) {
+  private async account(address: PublicKey, minSlot: number, maxDataBytes?: number) {
+    const requestedAt = captureClock(this.clock());
     const result = await this.rpc.call<ContextValue<RpcAccount | null>>("getAccountInfo", [
       address.toBase58(),
       { encoding: "base64", commitment: "finalized", minContextSlot: minSlot },
     ]);
+    const observedAt = captureClock(this.clock());
+    if (observedAt < requestedAt) throw Error("SECURITY_CAPTURE_CLOCK_REGRESSED");
     const slot = context(result.context, minSlot);
     if (!result.value) throw Error("SECURITY_ACCOUNT_MISSING");
-    return { account: info(result.value), slot };
+    return { account: info(result.value, maxDataBytes), slot, requestedAt, observedAt };
   }
   private async accounts(addresses: PublicKey[], minSlot: number) {
     const result = await this.rpc.call<ContextValue<(RpcAccount | null)[]>>("getMultipleAccounts", [
@@ -334,10 +360,12 @@ export class SecurityReader {
     event: ChainEvent,
     sellRoute: { available: boolean; at: number } | null,
   ): Promise<SecuritySnapshot> {
-    const observedAt = this.clock();
+    const mintAddress = key(event.mint);
+    const inspectionStartedAt = captureClock(this.clock());
     const e: SecurityEvidence = {
-      mint: event.mint,
-      observedAt,
+      mint: mintAddress.toBase58(),
+      observedAt: inspectionStartedAt,
+      evidenceRequestedAt: inspectionStartedAt,
       mintAuthority: undefined,
       freezeAuthority: undefined,
       tokenProgram: "unknown",
@@ -363,10 +391,15 @@ export class SecurityReader {
       liquiditySlot: null,
     };
     const warnings: string[] = [];
-    const result = await this.account(key(event.mint), event.slot),
+    const result = await this.account(mintAddress, event.slot, MAX_CAPTURED_MINT_BYTES),
       account = result.account;
+    if (result.requestedAt < inspectionStartedAt) throw Error("SECURITY_CAPTURE_CLOCK_REGRESSED");
     e.mintSlot = result.slot;
-    if (!tokenPrograms.includes(account.owner.toBase58()))
+    if (!tokenPrograms.includes(account.owner.toBase58())) {
+      const observedAt = captureClock(this.clock());
+      if (observedAt < result.observedAt || result.requestedAt < inspectionStartedAt)
+        throw Error("SECURITY_CAPTURE_CLOCK_REGRESSED");
+      e.observedAt = observedAt;
       return {
         evidence: e,
         liquidityLamports: null,
@@ -374,7 +407,18 @@ export class SecurityReader {
         observedAt,
         warnings: ["UNSUPPORTED_MINT_OWNER"],
       };
-    const mint = unpackMint(key(event.mint), account, account.owner);
+    }
+    if (account.data.length > MAX_CAPTURED_MINT_BYTES)
+      throw Error("SECURITY_MINT_CAPTURE_TOO_LARGE");
+    const rawMintCapture = {
+      address: mintAddress.toBase58(),
+      owner: account.owner.toBase58(),
+      dataBase64: account.data.toString("base64"),
+      slot: result.slot,
+      requestedAt: result.requestedAt,
+      observedAt: result.observedAt,
+    };
+    const mint = unpackMint(mintAddress, account, account.owner);
     if (!mint.isInitialized) throw Error("MINT_NOT_INITIALIZED");
     e.mintAuthority = mint.mintAuthority?.toBase58() ?? null;
     e.freezeAuthority = mint.freezeAuthority?.toBase58() ?? null;
@@ -467,12 +511,17 @@ export class SecurityReader {
       "LP_WITHDRAWAL_CONTROL_NOT_CERTIFIED",
       "CREATOR_BEHAVIOR_REQUIRES_POINT_IN_TIME_WALLET_GRAPH",
     );
+    const observedAt = captureClock(this.clock());
+    if (observedAt < result.observedAt || result.requestedAt < inspectionStartedAt)
+      throw Error("SECURITY_CAPTURE_CLOCK_REGRESSED");
+    e.observedAt = observedAt;
     return {
       evidence: e,
       liquidityLamports: pool?.liquidityLamports ?? null,
       curveProgressBps: pool?.curveProgressBps ?? null,
       observedAt,
       warnings,
+      mintAccountCapture: Object.freeze({ ...rawMintCapture, publishedAt: observedAt }),
     };
   }
 }

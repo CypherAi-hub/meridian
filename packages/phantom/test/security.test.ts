@@ -292,6 +292,65 @@ function raydiumFixture(reverse = false) {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("finalized mint and holder security with synthetic evidence", () => {
+  it("retains exact original mint response with distinct request, response and inspection clocks", async () => {
+    const f = baseFixture(), call = f.rpc.call.getMockImplementation()!;
+    const originalData = f.accounts.get(f.mint.toBase58())!.data[0];
+    f.rpc.call.mockImplementation(async (method, params) => {
+      const response = await call(method, params);
+      if (method === "getAccountInfo" && params[0] === f.mint.toBase58()) f.setClock(2000);
+      if (method === "getProgramAccounts") {
+        // Later work cannot relabel the original response or alter its retained bytes.
+        f.accounts.get(f.mint.toBase58())!.data[0] = "Y2hhbmdlZA==";
+        f.setClock(8000);
+      }
+      return response;
+    });
+    const snapshot = await f.reader().inspect(f.event, { available: true, at: 1000 });
+    expect(snapshot.mintAccountCapture).toEqual({
+      address: f.mint.toBase58(), owner: TOKEN_PROGRAM_ID.toBase58(), dataBase64: originalData,
+      slot: 100, requestedAt: 1000, observedAt: 2000, publishedAt: 8000,
+    });
+    expect(snapshot.observedAt).toBe(8000);
+    expect(snapshot.evidence.observedAt).toBe(8000);
+    expect(snapshot.evidence.evidenceRequestedAt).toBe(1000);
+    expect(f.rpc.call.mock.calls[0]).toEqual(["getAccountInfo", [f.mint.toBase58(),
+      { encoding: "base64", commitment: "finalized", minContextSlot: 100 }]]);
+    expect(Object.isFrozen(snapshot.mintAccountCapture)).toBe(true);
+  });
+  it("retains Token-2022 original TLV bytes without certifying their separate strict decoding", async () => {
+    const f = baseFixture(), data = Buffer.alloc(166 + 4 + 64);
+    mintData(1000000n).copy(data); data[165] = AccountType.Mint;
+    data.writeUInt16LE(ExtensionType.MetadataPointer, 166); data.writeUInt16LE(64, 168);
+    f.accounts.set(f.mint.toBase58(), account(data, TOKEN_2022_PROGRAM_ID));
+    const snapshot = await f.reader().inspect(f.event, { available: true, at: 1000 });
+    expect(snapshot.mintAccountCapture?.owner).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
+    expect(snapshot.mintAccountCapture?.dataBase64).toBe(data.toString("base64"));
+    expect(snapshot.evidence.extensions).toEqual(["MetadataPointer"]);
+  });
+  it("returns no original mint capture for an unsupported account owner", async () => {
+    const f = baseFixture(); f.accounts.get(f.mint.toBase58())!.owner = pub().toBase58();
+    const snapshot = await f.reader().inspect(f.event, null);
+    expect(snapshot.mintAccountCapture).toBeUndefined();
+    expect(snapshot.evidence.extensionsVerified).toBe(false);
+    expect(f.rpc.call).toHaveBeenCalledTimes(1);
+  });
+  it("rejects an oversized mint before any pool or holder requests", async () => {
+    const f = baseFixture(); f.accounts.get(f.mint.toBase58())!.data[0] = Buffer.alloc(65_537).toString("base64");
+    await expect(f.reader().inspect(f.event, null)).rejects.toThrow("SECURITY_MINT_CAPTURE_TOO_LARGE");
+    expect(f.rpc.call).toHaveBeenCalledTimes(1);
+  });
+  it("rejects a regressed request/response clock before any controls are returned", async () => {
+    const f = baseFixture(), call = f.rpc.call.getMockImplementation()!;
+    f.rpc.call.mockImplementation(async (method, params) => {
+      const response = await call(method, params); f.setClock(999); return response;
+    });
+    await expect(f.reader().inspect(f.event, null)).rejects.toThrow("SECURITY_CAPTURE_CLOCK_REGRESSED");
+  });
+  it.each([NaN, Infinity, -1, -0, 1.5])("rejects invalid capture clock %s", async (invalid) => {
+    const f = baseFixture(); f.setClock(invalid);
+    await expect(f.reader().inspect(f.event, null)).rejects.toThrow("SECURITY_CAPTURE_CLOCK_INVALID");
+    expect(f.rpc.call).not.toHaveBeenCalled();
+  });
   it("validates owner/state and reconciles full supply while excluding only the verified protocol vault", async () => {
     const f = baseFixture(),
       snapshot = await f.reader().inspect(f.event, { available: true, at: 1000 });
@@ -407,7 +466,7 @@ describe("finalized mint and holder security with synthetic evidence", () => {
       "INVALID_RPC_ACCOUNT",
     );
   });
-  it("rejects holder context older than the mint snapshot and preserves earliest evidence time", async () => {
+  it("rejects older holder context and preserves original freshness despite later publication", async () => {
     const f = baseFixture();
     f.setHolderSlot(99);
     expect(
@@ -422,8 +481,10 @@ describe("finalized mint and holder security with synthetic evidence", () => {
       return response;
     });
     const snapshot = await g.reader().inspect(g.event, { available: true, at: 1000 });
-    expect(snapshot.observedAt).toBe(1000);
-    expect(snapshot.evidence.observedAt).toBe(1000);
+    expect(snapshot.observedAt).toBe(50000);
+    expect(snapshot.evidence.observedAt).toBe(50000);
+    expect(snapshot.evidence.evidenceRequestedAt).toBe(1000);
+    expect(snapshot.mintAccountCapture).toMatchObject({ requestedAt: 1000, observedAt: 1000, publishedAt: 50000 });
     expect(checkTokenSafety(snapshot.evidence, undefined, 50000).reasons).toContain(
       "SECURITY_EVIDENCE_STALE_OR_FUTURE",
     );
