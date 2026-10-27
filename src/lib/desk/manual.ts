@@ -1,6 +1,7 @@
 import { SNIPER_CONFIG, quoteValid, type QuoteAdapter, type SwapRequest } from "./sniper.ts";
 import { USDC } from "./schema.ts";
 import type { QuoteObs } from "./schema.ts";
+import { manualValuation } from "./terminal-view.ts";
 export type ManualPosition = {
   mint: string;
   symbol: string;
@@ -84,6 +85,15 @@ export type ManualOrderIntent = {
 /** A retry must resolve from the saved intent, even when providers are unavailable. */
 export function isManualOrderRetry(book: ManualBook, input: ManualOrderIntent): boolean {
   if (!/^[\w-]{8,100}$/.test(input.requestId)) throw Error("A valid request ID is required");
+  // The server calls this before mint/provider lookup, including for a new intent.
+  if (input.side === "BUY") {
+    const amount = BigInt(usdAtomic(input.amountUsdc ?? ""));
+    if (amount < 1000000n || amount > 250000000n)
+      throw Error("Paper buys must be between 1 and 250 USDC");
+  } else if (input.side === "SELL") {
+    if (!Number.isInteger(input.percent) || input.percent! < 1 || input.percent! > 100)
+      throw Error("Sell percentage must be 1–100");
+  } else throw Error("Unsupported manual paper side");
   const existing = book.orders.find((o) => o.requestId === input.requestId);
   if (!existing) return false;
   if (
@@ -291,11 +301,6 @@ export async function advanceManual(
   return s;
 }
 export function manualMetrics(s: ManualBook, now: number) {
-  const fresh = s.positions.filter((p) => p.markedAt && now - p.markedAt <= 45000);
-  const marked = fresh.reduce(
-    (n, p) => n + (BigInt(p.markAtomic ?? "0") > 0n ? BigInt(p.markAtomic!) : 0n),
-    0n,
-  );
   const realized = s.fills.reduce((n, f) => n + BigInt(f.pnlAtomic), 0n);
   const reserved = s.orders
     .filter((o) => o.side === "BUY" && o.status === "PENDING")
@@ -303,9 +308,8 @@ export function manualMetrics(s: ManualBook, now: number) {
   return {
     cashUsdc: Number(s.cashAtomic) / 1e6,
     availableUsdc: Number(BigInt(s.cashAtomic) - reserved) / 1e6,
-    equityUsdc: Number(BigInt(s.cashAtomic) + marked) / 1e6,
+    ...manualValuation(s, now),
     realizedUsdc: Number(realized) / 1e6,
-    unvaluedPositions: s.positions.length - fresh.length,
     pending: s.orders.filter((o) => o.status === "PENDING").length,
   };
 }

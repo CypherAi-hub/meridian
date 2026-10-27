@@ -27,13 +27,20 @@ import type { TerminalToken } from "@/lib/desk/terminal-market";
 import type { ManualBook } from "@/lib/desk/manual";
 import type { DeskSnapshot } from "@/lib/desk/types";
 import { WSOL } from "@/lib/desk/schema";
+import {
+  freshManualMark,
+  manualValuation,
+  recentTimestamp,
+  toggleWatchlist,
+  watchlistForView,
+} from "@/lib/desk/terminal-view";
 
 type ManualReport = {
   state: ManualBook;
   metrics: {
     cashUsdc: number;
     availableUsdc: number;
-    equityUsdc: number;
+    equityUsdc: number | null;
     realizedUsdc: number;
     unvaluedPositions: number;
     pending: number;
@@ -134,6 +141,7 @@ function SolanaIcon() {
   );
 }
 export function OmniApp() {
+  const [now, setNow] = useState(Date.now);
   const manual = useFeed<ManualReport>("/api/terminal", 4000),
     desk = useFeed<DeskSnapshot>("/api/desk", 10000);
   const [page, setPage] = useState<"live" | "terminal" | "automations" | "settings" | "research">(
@@ -157,12 +165,18 @@ export function OmniApp() {
     [lastRequest, setLastRequest] = useState(""),
     [copied, setCopied] = useState(false),
     [sidebar, setSidebar] = useState(false),
-    [localWatch, setLocalWatch] = useState<string[]>([]);
+    [localWatch, setLocalWatch] = useState<string[] | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const retryRequest = useRef<{ key: string; id: string } | null>(null);
   const book = manual.data?.state,
-    metrics = manual.data?.metrics,
+    metrics = manual.data
+      ? { ...manual.data.metrics, ...manualValuation(manual.data.state, now) }
+      : undefined,
     readOnly = manual.readOnly;
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -261,7 +275,7 @@ export function OmniApp() {
   }
   async function watch(mint: string) {
     if (readOnly) {
-      setLocalWatch((a) => (a.includes(mint) ? a.filter((x) => x !== mint) : [...a, mint]));
+      setLocalWatch((a) => toggleWatchlist(a ?? book?.watchlist ?? [WSOL], mint));
       return;
     }
     try {
@@ -301,10 +315,13 @@ export function OmniApp() {
       setSubmitting(false);
     }
   }
-  const watched = [...new Set([...(book?.watchlist ?? [WSOL]), ...localWatch])],
+  const watched = watchlistForView(book?.watchlist, localWatch, readOnly),
     position = book?.positions.find((p) => p.mint === selected),
     pendingSelected = book?.orders.some((o) => o.mint === selected && o.status === "PENDING"),
-    alive = !!desk.data?.worker.lastTickAt && Date.now() - desk.data.worker.lastTickAt < 90000;
+    alive =
+      !desk.error &&
+      desk.data?.worker.status === "live" &&
+      recentTimestamp(desk.data.worker.lastTickAt, now, 90000);
   const submitted = book?.orders.find((o) => o.requestId === lastRequest);
   const orderNotice = submitted
     ? submitted.status === "FILLED"
@@ -455,7 +472,13 @@ export function OmniApp() {
       <div className="omni-status-strip">
         <span className="omni-market-live">
           <i className={alive ? "status-dot" : "status-dot warn"} />
-          {alive ? "DATA CONNECTED" : "CONNECTING DATA"}
+          {alive
+            ? "COLLECTOR ONLINE"
+            : desk.error
+              ? "COLLECTOR UNAVAILABLE"
+              : desk.data?.worker.lastTickAt
+                ? "COLLECTOR STALE"
+                : "CONNECTING COLLECTOR"}
         </span>
         <span>
           SOL <b>{price(desk.data?.solPrice || null)}</b>
@@ -627,7 +650,7 @@ export function OmniApp() {
             </div>
             <MarketChart
               pair={token?.pair ?? ""}
-              symbol={token?.symbol ?? "SOL"}
+              symbol={token?.symbol ?? (selected === WSOL ? "SOL" : "TOKEN")}
               mint={selected}
               pending={!token && !tokenError}
             />
@@ -674,36 +697,35 @@ export function OmniApp() {
                   </thead>
                   <tbody>
                     {bottom === "positions" &&
-                      book?.positions.map((p) => (
-                        <tr key={p.mint}>
-                          <td>
-                            <button onClick={() => choose(p.mint)}>{p.symbol}</button>
-                          </td>
-                          <td>
-                            {qty(p.rawQty, p.decimals).toLocaleString(undefined, {
-                              maximumFractionDigits: 5,
-                            })}
-                          </td>
-                          <td>{money(Number(p.costAtomic) / 1e6)}</td>
-                          <td>
-                            {p.markedAt && Date.now() - p.markedAt < 45000
-                              ? money(Number(p.markAtomic) / 1e6)
-                              : "Awaiting quote"}
-                          </td>
-                          <td>
-                            <button
-                              className="omni-table-sell"
-                              onClick={() => {
-                                choose(p.mint);
-                                setSide("SELL");
-                                setSellPct(100);
-                              }}
-                            >
-                              Sell
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      book?.positions.map((p) => {
+                        const mark = freshManualMark(p, now);
+                        return (
+                          <tr key={p.mint}>
+                            <td>
+                              <button onClick={() => choose(p.mint)}>{p.symbol}</button>
+                            </td>
+                            <td>
+                              {qty(p.rawQty, p.decimals).toLocaleString(undefined, {
+                                maximumFractionDigits: 5,
+                              })}
+                            </td>
+                            <td>{money(Number(p.costAtomic) / 1e6)}</td>
+                            <td>{mark !== null ? money(Number(mark) / 1e6) : "Awaiting quote"}</td>
+                            <td>
+                              <button
+                                className="omni-table-sell"
+                                onClick={() => {
+                                  choose(p.mint);
+                                  setSide("SELL");
+                                  setSellPct(100);
+                                }}
+                              >
+                                Sell
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     {bottom === "orders" &&
                       book?.orders
                         .slice()
@@ -944,7 +966,7 @@ export function OmniApp() {
                   <dd>{money(metrics?.cashUsdc)}</dd>
                 </div>
                 <div>
-                  <dt>Conservative equity</dt>
+                  <dt>Liquidation equity</dt>
                   <dd>{money(metrics?.equityUsdc)}</dd>
                 </div>
                 <div>

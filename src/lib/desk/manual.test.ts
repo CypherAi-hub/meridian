@@ -81,6 +81,23 @@ test("filled order retries resolve their saved intent and reject changed details
   assert.throws(() => isManualOrderRetry(s, buy("request-0001", "50")), /different order/);
   assert.equal(isManualOrderRetry(s, buy("request-new-0001")), false);
 });
+test("new invalid order intents fail before the server proceeds to provider lookup", () => {
+  const s = newManualBook(T);
+  for (const value of ["1e2", "0", "0.5", "251", "NaN"])
+    assert.throws(() => isManualOrderRetry(s, buy("request-invalid-0001", value)));
+  for (const percent of [0, 101, 1.5, NaN])
+    assert.throws(() =>
+      isManualOrderRetry(s, {
+        requestId: "request-invalid-sell",
+        side: "SELL",
+        mint: "TOKEN",
+        percent,
+      }),
+    );
+  assert.equal(isManualOrderRetry(s, buy("request-valid-new", "1")), false);
+  assert.equal(isManualOrderRetry(s, buy("request-valid-upper", "250")), false);
+  assert.equal(s.orders.length, 0);
+});
 test("partial sells use exact raw quantity and proportional entry costs", async () => {
   let s = await entered();
   s = queueManualOrder(
@@ -135,7 +152,7 @@ test("stale, pre-delay, future, and wrong-mint quotes cannot fill a manual order
 });
 test("missing exit marks are conservative and full sell removes only its position", async () => {
   let s = await entered();
-  assert.equal(manualMetrics(s, T + 100000).equityUsdc, Number(s.cashAtomic) / 1e6);
+  assert.equal(manualMetrics(s, T + 100000).equityUsdc, null);
   s = queueManualOrder(
     s,
     {
