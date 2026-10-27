@@ -179,6 +179,26 @@ function fixture(
 const admission = (e = fixture(), now = NOW) => evaluateResearchPaperAdmission(policy(), e, now);
 
 describe("separate immutable V2 raw-mint paper policy", () => {
+  it.each([freezeResearchPaperPolicy, freezeResearchPaperPolicyV2])(
+    "detaches source/clock getters before validation and manifest construction",
+    (construct) => {
+      let sourceReads = 0,
+        clockReads = 0;
+      const p = construct({
+        get sourceHash() {
+          return ++sourceReads === 1 ? SOURCE : "invalid";
+        },
+        get frozenAt() {
+          return ++clockReads === 1 ? 90000 : NaN;
+        },
+      });
+      expect(sourceReads).toBe(1);
+      expect(clockReads).toBe(1);
+      expect(p.sourceHash).toBe(SOURCE);
+      expect(p.frozenAt).toBe(90000);
+      expect(validateResearchPaperPolicy(p)).toEqual(p);
+    },
+  );
   it("requires raw capture for a statically known V2 policy as well as at runtime", () => {
     function missingCapture(value: ResearchPaperDecisionEvidence) {
       // @ts-expect-error V2 requires original raw mint capture; V1 evidence is insufficient.

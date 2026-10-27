@@ -13,6 +13,7 @@ import {
   reconcileResearchPaper,
   type ResearchPaperDecision,
   type ResearchBookEnvelope,
+  type ResearchRunnerControls,
 } from "../src/research-paper-runner.ts";
 import { PaperLedger, type QuoteProvider } from "../src/paper.ts";
 import { RiskGovernor, RESEARCH_PAPER_RISK_LIMITS, type SafetyVerdict } from "../src/risk.ts";
@@ -128,7 +129,7 @@ async function open(dir?: string) {
   stores.push(store);
   return { store, dir };
 }
-async function fixture() {
+async function fixture(controls: ResearchRunnerControls = {}) {
   const f = await open();
   let at = 94000;
   const calls: { input: Parameters<QuoteProvider["quote"]>[0]; at: number }[] = [];
@@ -156,7 +157,13 @@ async function fixture() {
       return script.shift()?.(input) ?? quote(input);
     },
   };
-  const runner = await ResearchPaperRunner.create(f.store, provider, manifest(), () => at);
+  const runner = await ResearchPaperRunner.create(
+    f.store,
+    provider,
+    manifest(),
+    () => at,
+    controls,
+  );
   return {
     ...f,
     runner,
@@ -180,6 +187,201 @@ async function enter(f: Awaited<ReturnType<typeof fixture>>) {
 const saved = (value: unknown) => JSON.parse(json(value));
 
 describe("separate durable prospective research PAPER runner", () => {
+  it.each(["passive", "partial"])(
+    "observes callback-only stop during %s quote and replaces the old quote with full emergency intent",
+    async (kind) => {
+      let stopped = false;
+      const f = await fixture({ stopRequested: () => stopped });
+      await enter(f);
+      if (kind === "partial") {
+        f.time(100000);
+        f.script.push((i) => f.quote(i, 16000000n));
+        await f.runner.step();
+        expect(f.runner.snapshot().ledger.pendingExits[0].quantityRaw).toBe(498750n);
+      }
+      f.time(kind === "partial" ? 102000 : 100000);
+      f.script.push((i) => {
+        stopped = true;
+        return f.quote(i, kind === "partial" ? 8000000n : 16000000n);
+      });
+      await f.runner.step();
+      const s = f.runner.snapshot();
+      expect(s.ledger.killSwitch).toBe(true);
+      expect(s.ledger.trades).toEqual([]);
+      expect(s.ledger.positions[0].quantityRaw).toBe(997500n);
+      expect(s.ledger.pendingExits[0].reason).toBe("EMERGENCY_SHUTDOWN");
+      expect(s.ledger.pendingExits[0].quantityRaw).toBe(997500n);
+      expect(s.ledger.pendingExits[0].readyAt).toBe((kind === "partial" ? 102000 : 100000) + 2000);
+      expect(reconcileResearchPaper(s).openPositions).toBe(1);
+    },
+  );
+  it("closes entry authority when a stop arrives during the buy await and retains the latch after restart", async () => {
+    let stopped = false;
+    const f = await fixture({ stopRequested: () => stopped });
+    f.time(97000);
+    await f.runner.enroll(decision());
+    let release!: () => void;
+    f.script.push(
+      (input) =>
+        new Promise<Quote>((resolve) => {
+          release = () => resolve(f.quote(input));
+        }),
+    );
+    f.time(99000);
+    const stepping = f.runner.step();
+    stopped = true;
+    release();
+    await stepping;
+    let s = f.runner.snapshot();
+    expect(f.calls).toHaveLength(1);
+    expect(s.ledger.cashLamports).toBe(1000000000n);
+    expect(s.ledger.positions).toEqual([]);
+    expect(s.ledger.pending).toEqual([]);
+    expect(s.ledger.killSwitch).toBe(true);
+    expect(s.entries[0].status).toBe("REJECTED");
+    expect(s.journal.filter((j) => j.kind === "EMERGENCY_STOP")).toHaveLength(1);
+    stopped = false;
+    const restored = await ResearchPaperRunner.restore(f.store, f.provider, manifest(), f.now, {
+      stopRequested: () => stopped,
+    });
+    expect(restored.accountState().emergencyStopLatched).toBe(true);
+    expect(await restored.enroll(decision("after-file-clear"))).toBe(false);
+    s = restored.snapshot();
+    expect(reconcileResearchPaper(s).settledEntries).toBe(0);
+  });
+  it("checks the stop again after the paired sell before any entry settlement", async () => {
+    let stopped = false;
+    const f = await fixture({ stopRequested: () => stopped });
+    f.time(97000);
+    await f.runner.enroll(decision());
+    f.script.push(
+      (i) => f.quote(i),
+      (i) => {
+        stopped = true;
+        return f.quote(i);
+      },
+    );
+    f.time(99000);
+    await f.runner.step();
+    expect(f.calls).toHaveLength(2);
+    expect(f.runner.snapshot().ledger.positions).toEqual([]);
+    expect(f.runner.snapshot().ledger.cashLamports).toBe(1000000000n);
+  });
+  it("latches emergency intent synchronously during a mark await, discards the old quote and still permits full exit", async () => {
+    const f = await fixture();
+    await enter(f);
+    f.time(100000);
+    let release!: () => void;
+    f.script.push(
+      (input) =>
+        new Promise<Quote>((resolve) => {
+          release = () => resolve(f.quote(input, 16000000n));
+        }),
+    );
+    const stepping = f.runner.step();
+    const stopping = f.runner.latchEmergencyStop("USER_STOP");
+    const stoppingAgain = f.runner.latchEmergencyStop("USER_STOP");
+    let s = f.runner.snapshot();
+    expect(s.ledger.killSwitch).toBe(true);
+    expect(s.ledger.pendingExits[0].reason).toBe("EMERGENCY_SHUTDOWN");
+    expect(s.ledger.pendingExits[0].quantityRaw).toBe(997500n);
+    release();
+    await Promise.all([stepping, stopping, stoppingAgain]);
+    s = f.runner.snapshot();
+    expect(s.ledger.positions[0].markLamports).toBeNull();
+    expect(s.journal.filter((j) => j.kind === "EMERGENCY_STOP")).toHaveLength(1);
+    expect(s.ledger.trades).toEqual([]);
+    expect(reconcileResearchPaper(s).openPositions).toBe(1);
+    f.time(102000);
+    f.script.push((input) => f.quote(input, 8000000n));
+    await f.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    s = f.runner.snapshot();
+    expect(s.ledger.positions).toEqual([]);
+    expect(s.ledger.trades).toHaveLength(1);
+    expect(s.ledger.trades[0].reason).toBe("EMERGENCY_SHUTDOWN");
+    expect(s.ledger.cashLamports).toBe(997980000n);
+  });
+  it("retains earlier profit intent history when emergency supersedes it with a full delayed exit", async () => {
+    const f = await fixture();
+    await enter(f);
+    f.time(100000);
+    f.script.push((input) => f.quote(input, 16000000n));
+    await f.runner.step();
+    expect(f.runner.snapshot().ledger.pendingExits[0].quantityRaw).toBe(498750n);
+    f.time(100500);
+    await f.runner.latchEmergencyStop("USER_STOP");
+    const s = f.runner.snapshot();
+    expect(s.journal.filter((j) => j.kind === "EXIT_INTENT")).toHaveLength(2);
+    expect(s.ledger.pendingExits[0].quantityRaw).toBe(997500n);
+    expect(s.ledger.pendingExits[0].readyAt).toBe(102500);
+    expect(reconcileResearchPaper(s).openPositions).toBe(1);
+    const restored = await ResearchPaperRunner.restore(f.store, f.provider, manifest(), f.now);
+    expect(restored.accountState().emergencyStopLatched).toBe(true);
+  });
+  it("respects shared-lane entry/mark turns while expiring intents and serving ready exits without those allowances", async () => {
+    const f = await fixture();
+    f.time(97000);
+    await f.runner.enroll(decision());
+    f.time(99000);
+    await f.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    expect(f.calls).toHaveLength(0);
+    expect(f.runner.snapshot().ledger.pending).toHaveLength(1);
+    f.time(127001);
+    await f.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    expect(f.calls).toHaveLength(0);
+    expect(f.runner.snapshot().entries[0].status).toBe("EXPIRED");
+    const second = await fixture();
+    await enter(second);
+    const before = second.calls.length;
+    second.time(100000);
+    await second.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    expect(second.calls).toHaveLength(before);
+    second.time(399000);
+    await second.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    expect(second.calls).toHaveLength(before);
+    expect(second.runner.snapshot().ledger.pendingExits).toHaveLength(1);
+    second.time(401000);
+    second.script.push((input) => second.quote(input, 8000000n));
+    await second.runner.step({ allowEntryQuotes: false, allowPassiveMarks: false });
+    expect(second.calls).toHaveLength(before + 1);
+    expect(second.calls.at(-1)?.input.priority).toBe("protective_exit");
+    expect(reconcileResearchPaper(second.runner.snapshot()).realizedLegs).toBe(1);
+  });
+  it("cannot mutate the enrollment barrier through the caller manifest while creation awaits the store", async () => {
+    const f = await open();
+    const caller = structuredClone(manifest()) as any;
+    const get = f.store.get.bind(f.store);
+    let quoteCalls = 0;
+    f.store.get = async (id) => {
+      caller.enrollmentStart = 100000;
+      return get(id);
+    };
+    const provider: QuoteProvider = {
+      async quote() {
+        quoteCalls++;
+        throw Error("UNEXPECTED_PROVIDER");
+      },
+    };
+    await expect(
+      ResearchPaperRunner.create(f.store, provider, caller, () => 97000),
+    ).rejects.toThrow("BEFORE_ENROLLMENT");
+    expect(await get("research-paper:synthetic-runner")).toBeNull();
+    expect(quoteCalls).toBe(0);
+  });
+  it("reads each run-constructor field once before validation and freezing", () => {
+    let endReads = 0;
+    const input = {
+      bookId: "getter-run",
+      policy: policy(),
+      enrollmentStart: 94000,
+      get enrollmentEnd() {
+        return ++endReads === 1 ? 180000 : 93000;
+      },
+    };
+    const run = freezeResearchPaperRun(input);
+    expect(endReads).toBe(1);
+    expect(run.enrollmentEnd).toBe(180000);
+  });
   it("uses one economic settlement clock even when every Date.now-style read advances", async () => {
     const f = await open();
     let at = 94000;

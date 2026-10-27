@@ -96,6 +96,7 @@ export function freezeResearchPaperPolicy(input: {
   sourceHash: string;
   frozenAt: number;
 }): ResearchPaperPolicyV1 {
+  input = structuredClone(input);
   if (
     !input ||
     Object.keys(input).sort().join(",") !== "frozenAt,sourceHash" ||
@@ -117,13 +118,14 @@ export function freezeResearchPaperPolicyV2(input: {
   frozenAt: number;
 }): ResearchPaperPolicyV2 {
   // Reuse the unchanged V1 constructor's identity/schema validation only.
-  freezeResearchPaperPolicy(input);
-  const body = structuredClone({ ...FIXED_V2, sourceHash: input.sourceHash, frozenAt: input.frozenAt });
+  const identity = freezeResearchPaperPolicy(input);
+  const body = structuredClone({ ...FIXED_V2, sourceHash: identity.sourceHash, frozenAt: identity.frozenAt });
   return immutable({ ...body, manifestHash: hash(body) });
 }
 
 /** Saved manifests must match the complete, exact V1 or V2 contract. */
 export function validateResearchPaperPolicy(value: unknown): ResearchPaperPolicy {
+  value = structuredClone(value);
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw Error("RESEARCH_POLICY_INVALID");
   const p = value as Record<string, unknown>;

@@ -58,6 +58,7 @@ const RUN_FIXED = {
   failedAttemptScope: "NO_TRANSACTION_SUBMITTED_NO_ONCHAIN_FAILURE_FEE_MODELED",
   providerAllocation: "SHARED_JUPITER_LANE_PROTECTIVE_EXITS_FIRST",
   maximumQuoteCallsPerStep: 2,
+  stopScope: "IRREVERSIBLE_BOOK_ENTRY_BARRIER_PROTECTIVE_EXITS_REMAIN_AVAILABLE",
   entryQuoteFailures: "CANCEL_ENTRY_WITHOUT_FILL_NO_AUTOMATIC_RESUBMISSION",
   exitQuoteFailures: "RETAIN_INVENTORY_AND_INTENT_WITH_UNKNOWN_MARK",
   observedUntil: "ENROLLMENT_END_THEN_CONTINUE_PROTECTIVE_EXITS",
@@ -78,6 +79,7 @@ export function freezeResearchPaperRun(input: {
   enrollmentStart: number;
   enrollmentEnd: number;
 }): ResearchRunManifest {
+  input = structuredClone(input);
   if (
     !input ||
     Object.keys(input).sort().join(",") !== "bookId,enrollmentEnd,enrollmentStart,policy"
@@ -102,6 +104,7 @@ export function freezeResearchPaperRun(input: {
   return freeze({ ...body, manifestHash: hash(body) });
 }
 function validateRun(value: ResearchRunManifest) {
+  value = structuredClone(value);
   const expected = freezeResearchPaperRun({
     bookId: value.bookId,
     policy: value.policy,
@@ -139,8 +142,10 @@ type JournalRecord = {
     | "EXIT_UNAVAILABLE"
     | "EXIT_SETTLED"
     | "MARK_UNAVAILABLE"
-    | "MARK_OBSERVED";
+    | "MARK_OBSERVED"
+    | "EMERGENCY_STOP";
   entryId: string;
+  reason?: string;
   intent?: PendingExit;
   mark?: { quote: Quote; feeLamports: string };
   exit?: {
@@ -159,6 +164,14 @@ export interface ResearchBookEnvelope {
   entries: EntryRecord[];
   journal: JournalRecord[];
 }
+export interface ResearchRunnerControls {
+  stopRequested?: () => boolean;
+}
+export interface ResearchStepControls {
+  allowEntryQuotes?: boolean;
+  allowPassiveMarks?: boolean;
+}
+
 type RunnerStore = Pick<
   Store,
   | "get"
@@ -224,6 +237,7 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
   const ledger = restoreLedger(envelope.ledger)!;
   let cash = BigInt(policy.initialCapitalLamports),
     previousAt = -1;
+  let killed = false;
   const positions = new Map<
     string,
     {
@@ -254,6 +268,7 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
     "EXIT_SETTLED",
     "MARK_UNAVAILABLE",
     "MARK_OBSERVED",
+    "EMERGENCY_STOP",
   ]);
   let sequence = 1;
   for (const j of envelope.journal) {
@@ -266,6 +281,17 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
     )
       throw Error("RESEARCH_JOURNAL_IDENTITY_SEQUENCE_OR_TIME_MISMATCH");
     previousAt = j.at;
+    if (j.kind === "EMERGENCY_STOP") {
+      if (
+        killed ||
+        j.entryId !== "" ||
+        typeof j.reason !== "string" ||
+        !/^[A-Z0-9_]{1,80}$/.test(j.reason)
+      )
+        throw Error("RESEARCH_EMERGENCY_JOURNAL_INVALID");
+      killed = true;
+      continue;
+    }
     const e = entries.get(j.entryId);
     if (!e) throw Error("RESEARCH_JOURNAL_ENTRY_MISSING");
     if (j.kind === "ENTRY_INTENT") {
@@ -291,6 +317,7 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
       cancelled.add(e.id);
     }
     if (j.kind === "ENTRY_SETTLED") {
+      if (killed) throw Error("RESEARCH_ENTRY_AFTER_EMERGENCY_STOP");
       if (!e.fill || e.status !== "FILLED" || consumed.has(e.id) || cancelled.has(e.id))
         throw Error("RESEARCH_DUPLICATE_OR_MISSING_FILL");
       const evidence = reviveEvidence(e.fill.evidence),
@@ -394,7 +421,7 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
         throw Error("RESEARCH_EXIT_INTENT_IDENTITY_DELAY_OR_PROFILE_INVALID");
       const quantity = rawAmount(x.quantityRaw);
       let expected: { reason: string; bps: number } | null = null;
-      if (ledger.killSwitch) expected = { reason: "EMERGENCY_SHUTDOWN", bps: 10000 };
+      if (killed) expected = { reason: "EMERGENCY_SHUTDOWN", bps: 10000 };
       else if (j.at - p.openedAt >= PAPER_EXIT_RULES.maximumHoldMs)
         expected = { reason: "MAX_HOLD", bps: 10000 };
       else if (
@@ -504,6 +531,7 @@ export function reconcileResearchPaper(envelope: ResearchBookEnvelope) {
     )
       throw Error("RESEARCH_INVENTORY_RECONCILIATION_FAILED");
   }
+  if (ledger.killSwitch !== killed) throw Error("RESEARCH_KILL_STATE_RECONCILIATION_FAILED");
   const expectedCompleted = new Set([...consumed, ...realizedIds]);
   if (
     expectedCompleted.size !== ledger.completedOrderIds.length ||
@@ -555,6 +583,10 @@ export class ResearchPaperRunner {
   #version: number;
   #suspended = false;
   #busy = false;
+  #idleWaiters: (() => void)[] = [];
+  #entryBarrierClosed = false;
+  #stopDirty = false;
+  #stopRequested: () => boolean;
   #quoteCalls = 0;
   private constructor(
     private store: RunnerStore,
@@ -562,7 +594,12 @@ export class ResearchPaperRunner {
     manifest: ResearchRunManifest,
     private now: () => number,
     saved?: ResearchBookEnvelope,
+    controls: ResearchRunnerControls = {},
   ) {
+    const callback = controls.stopRequested;
+    if (callback !== undefined && typeof callback !== "function")
+      throw Error("RESEARCH_STOP_CALLBACK_INVALID");
+    this.#stopRequested = callback ?? (() => false);
     this.manifest = validateRun(manifest);
     this.#entries = saved ? saved.entries.map(reviveEntry) : [];
     this.#journal = structuredClone(saved?.journal ?? []);
@@ -571,26 +608,30 @@ export class ResearchPaperRunner {
       throw Error("RESEARCH_LEDGER_VERSION_INVALID");
     const governor = new RiskGovernor(
       { ...RESEARCH_PAPER_RISK_LIMITS },
-      { bookId: manifest.bookId, policy: manifest.policy },
+      { bookId: this.manifest.bookId, policy: this.manifest.policy },
     );
     this.#ledger = new PaperLedger(
-      BigInt(manifest.policy.initialCapitalLamports),
+      BigInt(this.manifest.policy.initialCapitalLamports),
       governor,
       saved?.ledger,
     );
+    this.#entryBarrierClosed = this.#ledger.state.killSwitch;
+    if (this.#entryBarrierClosed) governor.kill();
   }
   static async create(
     store: RunnerStore,
     provider: QuoteProvider,
     manifest: ResearchRunManifest,
     now = Date.now,
+    controls: ResearchRunnerControls = {},
   ) {
-    const runner = new ResearchPaperRunner(store, provider, manifest, now);
+    const runner = new ResearchPaperRunner(store, provider, manifest, now, undefined, controls);
     runner.assertLease();
     if (await store.get(runner.key)) throw Error("RESEARCH_BOOK_ALREADY_EXISTS_USE_RESTORE");
     const at = runner.time();
-    if (at < manifest.policy.frozenAt || at > manifest.enrollmentStart)
+    if (at < runner.manifest.policy.frozenAt || at > runner.manifest.enrollmentStart)
       throw Error("RESEARCH_RUN_MUST_BE_FROZEN_BEFORE_ENROLLMENT");
+    runner.observeEntryStop();
     await runner.checkpoint();
     return runner;
   }
@@ -599,7 +640,9 @@ export class ResearchPaperRunner {
     provider: QuoteProvider,
     manifest: ResearchRunManifest,
     now = Date.now,
+    controls: ResearchRunnerControls = {},
   ) {
+    const frozenControls = { stopRequested: controls.stopRequested };
     const expected = validateRun(manifest);
     if (!store.workerLeaseEnforced) throw Error("RESEARCH_WORKER_LEASE_REQUIRED");
     store.assertWorkerLease();
@@ -610,7 +653,8 @@ export class ResearchPaperRunner {
     if (saved.schemaVersion !== 1 || canonical(saved.manifest) !== canonical(expected))
       throw Error("RESEARCH_BOOK_IDENTITY_MISMATCH");
     reconcileResearchPaper(saved);
-    const runner = new ResearchPaperRunner(store, provider, expected, now, saved);
+    const runner = new ResearchPaperRunner(store, provider, expected, now, saved, frozenControls);
+    runner.observeEntryStop();
     // PaperLedger invalidates all current marks on restart. Checkpoint that durable fact.
     await runner.checkpoint();
     return runner;
@@ -650,6 +694,7 @@ export class ResearchPaperRunner {
       sourceHash: this.manifest.policy.sourceHash,
       policyHash: this.manifest.policy.manifestHash,
       runHash: this.manifest.manifestHash,
+      emergencyStopLatched: this.#entryBarrierClosed,
       ledgerVersion: this.#version,
       suspended: this.#suspended,
     };
@@ -689,6 +734,7 @@ export class ResearchPaperRunner {
     at = this.time(),
     intent?: PendingExit,
     mark?: JournalRecord["mark"],
+    reason?: string,
   ) {
     clock(at);
     this.#journal.push({
@@ -700,6 +746,7 @@ export class ResearchPaperRunner {
       ...(exit ? { exit } : {}),
       ...(intent ? { intent: structuredClone(intent) } : {}),
       ...(mark ? { mark: structuredClone(mark) } : {}),
+      ...(reason ? { reason } : {}),
     });
   }
   private async checkpoint() {
@@ -719,6 +766,7 @@ export class ResearchPaperRunner {
       if (!changed) throw Error("RESEARCH_BOOK_VERSION_CONFLICT");
       this.assertLease();
       this.#version = next.ledgerVersion;
+      if (next.ledger.killSwitch) this.#stopDirty = false;
     } catch {
       this.#suspended = true;
       throw Error(
@@ -728,12 +776,73 @@ export class ResearchPaperRunner {
       );
     }
   }
+  private finishWork() {
+    this.#busy = false;
+    for (const resolve of this.#idleWaiters.splice(0)) resolve();
+  }
+  private closeEntryBarrier(reason: string) {
+    if (this.#entryBarrierClosed) return;
+    this.#entryBarrierClosed = true;
+    this.#ledger.governor.kill();
+    this.#ledger.state.killSwitch = true;
+    this.#stopDirty = true;
+    const at = this.time();
+    this.append("EMERGENCY_STOP", "", undefined, at, undefined, undefined, reason);
+    for (const order of this.#ledger.state.pending) {
+      const entry = this.#entries.find((e) => e.id === order.id)!;
+      entry.status = "REJECTED";
+      entry.reasons = ["BOOK_EMERGENCY_STOP"];
+      this.append("ENTRY_CANCELLED", order.id, undefined, at);
+    }
+    this.#ledger.state.pending = [];
+    for (const position of this.#ledger.state.positions) {
+      const previous = this.#ledger.state.pendingExits.find((e) => e.positionId === position.id);
+      const intent = this.#ledger.queueRequiredExit(
+        position,
+        at,
+        this.manifest.policy.minimumEntryDelayMs,
+      );
+      if (intent && intent !== previous)
+        this.append("EXIT_INTENT", position.id, undefined, at, intent);
+    }
+  }
+  private observeEntryStop() {
+    let stop = false;
+    if (!this.#entryBarrierClosed) {
+      try {
+        const value = this.#stopRequested();
+        stop = typeof value !== "boolean" || value;
+      } catch {
+        stop = true;
+      }
+    }
+    if (stop) this.closeEntryBarrier("EXTERNAL_STOP_REQUESTED");
+    return this.#entryBarrierClosed;
+  }
+  /** Closes entry authority synchronously before its first await; exits remain available. */
+  async latchEmergencyStop(reason: string) {
+    if (typeof reason !== "string" || !/^[A-Z0-9_]{1,80}$/.test(reason))
+      throw Error("RESEARCH_STOP_REASON_INVALID");
+    this.closeEntryBarrier(reason);
+    while (this.#busy) await new Promise<void>((resolve) => this.#idleWaiters.push(resolve));
+    this.#busy = true;
+    try {
+      this.assertLease();
+      if (this.#stopDirty) await this.checkpoint();
+    } finally {
+      this.finishWork();
+    }
+  }
   /** Persist the original decision and intent before any provider I/O. */
   async enroll(input: ResearchPaperDecision): Promise<boolean> {
     if (this.#busy) throw Error("RESEARCH_RUN_ALREADY_BUSY");
     this.#busy = true;
     try {
       this.assertLease();
+      if (this.observeEntryStop()) {
+        await this.checkpoint();
+        return false;
+      }
       const at = this.time(),
         p = this.manifest.policy,
         d = structuredClone(input);
@@ -769,18 +878,31 @@ export class ResearchPaperRunner {
       this.#entries.push({ id, decision: d, status: "QUEUED", reasons: [] });
       this.append("ENTRY_INTENT", id, undefined, at);
       await this.checkpoint();
+      if (this.observeEntryStop()) {
+        await this.checkpoint();
+        return false;
+      }
       return true;
     } finally {
-      this.#busy = false;
+      this.finishWork();
     }
   }
   private async quote(input: Parameters<QuoteProvider["quote"]>[0]): Promise<Quote> {
     this.assertLease();
+    if (input.priority === "entry" && this.observeEntryStop())
+      throw Error("RESEARCH_ENTRY_STOPPED");
     if (++this.#quoteCalls > this.manifest.maximumQuoteCallsPerStep)
       throw Error("RESEARCH_STEP_QUOTE_BUDGET_EXCEEDED");
-    const calledAt = this.time(),
+    const calledAt = this.time();
+    let supplied: Quote;
+    try {
       supplied = await this.provider.quote(input);
-    this.assertLease();
+    } finally {
+      this.assertLease();
+      this.observeEntryStop();
+    }
+    if (input.priority === "entry" && this.#entryBarrierClosed)
+      throw Error("RESEARCH_ENTRY_STOPPED");
     // Read untrusted provider fields once; accessors or later mutation cannot change a checked quote.
     const q = structuredClone(supplied);
     const returnedAt = this.time();
@@ -793,12 +915,21 @@ export class ResearchPaperRunner {
       throw Error("RESEARCH_PROVIDER_REQUEST_OR_RETURN_CLOCK_INVALID");
     return q;
   }
-  async step() {
+  async step(controls: ResearchStepControls = {}) {
+    const options = structuredClone(controls);
+    const allowEntryQuotes =
+      options.allowEntryQuotes === undefined ? true : options.allowEntryQuotes;
+    const allowPassiveMarks =
+      options.allowPassiveMarks === undefined ? true : options.allowPassiveMarks;
+    if (typeof allowEntryQuotes !== "boolean" || typeof allowPassiveMarks !== "boolean")
+      throw Error("RESEARCH_STEP_CONTROLS_INVALID");
     if (this.#busy) throw Error("RESEARCH_RUN_ALREADY_BUSY");
     this.#busy = true;
     this.#quoteCalls = 0;
     try {
       this.assertLease();
+      this.observeEntryStop();
+      if (this.#stopDirty) await this.checkpoint();
       const p = this.manifest.policy,
         fee = BigInt(p.networkFeePerLegLamports);
       // Persist protective intent before even a mark request. One research position maximum.
@@ -814,16 +945,28 @@ export class ResearchPaperRunner {
           await this.checkpoint();
         }
         const pending = this.#ledger.state.pendingExits.find((e) => e.positionId === position.id);
+        if (!pending && !allowPassiveMarks) continue;
         if (pending && this.time() < pending.readyAt) continue;
         let q: Quote;
         try {
           q = await this.quote({
-            priority: "protective_exit",
+            priority: pending ? "protective_exit" : "research",
             inputMint: position.mint,
             outputMint: WSOL,
             amount: pending?.quantityRaw ?? position.quantityRaw,
             slippageBps: p.slippageBps,
           });
+          const currentIntent = this.#ledger.state.pendingExits.find(
+            (e) => e.positionId === position.id,
+          );
+          if (currentIntent?.id !== pending?.id) {
+            position.markLamports = null;
+            position.markAt = null;
+            this.#ledger.recordEquity(this.time());
+            this.append(currentIntent ? "EXIT_UNAVAILABLE" : "MARK_UNAVAILABLE", position.id);
+            await this.checkpoint();
+            continue;
+          }
           if (pending) {
             const settlementAt = this.time();
             this.#ledger.close(
@@ -881,6 +1024,11 @@ export class ResearchPaperRunner {
       }
       for (const order of [...this.#ledger.state.pending]) {
         const entry = this.#entries.find((e) => e.id === order.id)!;
+        if (this.observeEntryStop()) {
+          await this.checkpoint();
+          continue;
+        }
+        if (entry.status !== "QUEUED") continue;
         if (this.time() - entry.decision.decisionAt > p.maximumDecisionAgeMs) {
           entry.status = "EXPIRED";
           entry.reasons = ["ORIGINAL_DECISION_EXPIRED"];
@@ -890,6 +1038,7 @@ export class ResearchPaperRunner {
           continue;
         }
         if (this.time() < order.readyAt) continue;
+        if (!allowEntryQuotes) continue;
         let buy: Quote, sell: Quote;
         try {
           buy = await this.quote({
@@ -909,6 +1058,10 @@ export class ResearchPaperRunner {
         } catch (error) {
           if (this.#suspended) throw error;
           this.assertLease();
+          if (this.observeEntryStop()) {
+            await this.checkpoint();
+            continue;
+          }
           entry.status = "ENTRY_QUOTE_FAILED";
           entry.reasons = ["PROVIDER_QUOTE_UNAVAILABLE_NO_FILL"];
           this.#ledger.state.pending = this.#ledger.state.pending.filter((x) => x.id !== order.id);
@@ -949,6 +1102,10 @@ export class ResearchPaperRunner {
         };
         try {
           this.assertLease();
+          if (this.observeEntryStop()) {
+            await this.checkpoint();
+            continue;
+          }
           const settlementAt = this.time();
           const authorization = this.#ledger.fillResearch(order, buy, evidence, settlementAt);
           entry.reasons = [...authorization.reasons];
@@ -982,7 +1139,7 @@ export class ResearchPaperRunner {
         await this.checkpoint();
       }
     } finally {
-      this.#busy = false;
+      this.finishWork();
     }
   }
 }
